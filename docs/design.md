@@ -24,7 +24,7 @@ drive a binary range coder (format.md §4).
 | model shape | table/MLP split chosen heuristically per input, not fixed |
 | weight formats (profile 1) | F16 and INT8 (Q8) from the start |
 | SIMD | scalar reference + AVX2/F16C and AVX-512 paths (ideas: ~/ucas, ~/q2_kernel kernels) |
-| GPU | the encoder may use a GPU for fitting, as a hybrid; decoders never use a GPU |
+| GPU | the encoder may use a GPU for fitting, as a hybrid. Decoders are CPU by default and may opt in to a GPU (hybrid or fully). A CPU decoder is always available and is never dropped |
 
 ## Encoder pipeline
 
@@ -93,6 +93,9 @@ can run in parallel later.
 - Specify profile 1 (`F32_STRICT_MIX`): feature hashing, the heuristic
   for table vs. MLP shape within the budget, the squash formula, and the
   F16/Q8 weight layout.
+- Optional GPU decoding path: opt-in only, and it must reproduce the CPU
+  reference bit for bit (no contraction, e.g. SPIR-V `NoContraction`, and
+  the same squash formula), since the probabilities have to match exactly.
 - Optional GPU fitting path for the encoder. Its results only have to be
   good, not reproducible, because the quantized weights are what get coded.
 - The size heuristic and the level → effort mapping.
