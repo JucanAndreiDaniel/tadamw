@@ -911,6 +911,8 @@ static void cnet_step(cnet *t, const sample *smp)
 			acc += w[j] * v[u][j];
 		z[u] = acc;
 		act[u] = acc > -lim && acc < lim;
+		z[u] = acc;
+		act[u] = acc > -lim && acc < lim;
 		prev = acc < -lim ? -lim : acc > lim ? lim : acc;
 	}
 	const float p = (float)p1_squash((int32_t)(prev * 256.0f)) *
@@ -1058,11 +1060,12 @@ static const uint8_t csel0[] = {P1_SEL_NONE, P1_SEL_BITPOS};
 static const uint8_t csel1[] = {P1_SEL_NONE, P1_SEL_BITPOS, P1_SEL_C0};
 static const uint8_t csel2[] = {P1_SEL_NONE, P1_SEL_BITPOS, P1_SEL_C0};
 
-/* Measurements on the bench corpus: a 42-weight chain with no selectors is
- * already stronger than the fitted MLP, and larger weight tables cost more
- * than they save (fitting is sample-limited, not capacity-limited). The
- * prior therefore strongly favours small rows; final selection still uses
- * the measured cost including model bytes. */
+/* Retuned after upstream's bit-position sampler and stronger profile 1
+ * prior. Measured on the bench corpus: a small chain with a bit-position
+ * selector on its final unit is consistently better than a selector-free
+ * one, while C0-selector tables cost more than they save. The prior
+ * therefore favours small rows with sel2 = BITPOS. Final selection still
+ * uses the measured cost including model bytes. */
 static double cprior(const ccand *c, size_t n)
 {
 	double target = (double)n / 20000.0 + 16.0;
@@ -1072,6 +1075,8 @@ static double cprior(const ccand *c, size_t n)
 	double pr = -(r < 0 ? -r : r);
 	if (c->s.sel[0] == P1_SEL_BITPOS)
 		pr += 0.8;
+	if (c->s.sel[2] == P1_SEL_BITPOS)
+		pr += 2.0;
 	if (c->quant == TAW_QUANT_Q8)
 		pr += 0.3;
 	return pr;
@@ -1129,7 +1134,7 @@ static size_t cenumerate(const p1_shape *geo, uint64_t budget, int quant_pref,
 					 * tables never repaid their bytes on the
 					 * bench, and the biased sample estimator
 					 * preferred them at high effort. */
-					const uint64_t cap_bytes = 256;
+					const uint64_t cap_bytes = 512;
 					if (c.size <= budget && c.size <= cap_bytes &&
 					    k < cap)
 						out[k++] = c;
@@ -1198,10 +1203,28 @@ static taw_status chain_fit_source(const taw_source *in, uint64_t unit,
 		return TAW_E_ARG;
 	const int lv = p->level;
 	const unsigned threads = p->threads ? p->threads : 1;
+	/* The tiny chain has few weights but needs more fitting steps than
+	 * the level's default to converge; fitting is encoder-only. Extra
+	 * knobs exist for experiments (TAW_CHAIN_EPOCHS / ..._SAMPLES). */
+	int epochs = effort[lv].epochs > 12 ? effort[lv].epochs : 12;
+	const char *ep = getenv("TAW_CHAIN_EPOCHS");
+	if (ep) {
+		int v = atoi(ep);
+		if (v > 0 && v <= 100)
+			epochs = v;
+	}
+	uint64_t want = effort[lv].samples;
+	if (want < (1u << 19))
+		want = 1u << 19;
+	const char *sp = getenv("TAW_CHAIN_SAMPLES");
+	if (sp) {
+		unsigned v = (unsigned)atoi(sp);
+		if (v > 0 && v <= 20)
+			want = 1ull << v;
+	}
 	sample *sm;
 	size_t ns;
-	taw_status st = collect(in, unit, &geo1, effort[lv].samples, threads,
-	    &sm, &ns);
+	taw_status st = collect(in, unit, &geo1, want, threads, &sm, &ns);
 	if (st != TAW_OK)
 		return st;
 	const char *dbg = getenv("TAW_FIT_DEBUG");
@@ -1210,7 +1233,7 @@ static taw_status chain_fit_source(const taw_source *in, uint64_t unit,
 		tries = ncand;
 	if (tries > ncand)
 		tries = ncand;
-	cfit_job F = {.cs = cs, .sm = sm, .ns = ns, .epochs = effort[lv].epochs};
+	cfit_job F = {.cs = cs, .sm = sm, .ns = ns, .epochs = epochs};
 	F.model = calloc(tries, sizeof *F.model);
 	F.bpb = calloc(tries, sizeof *F.bpb);
 	F.st = calloc(tries, sizeof *F.st);
