@@ -135,7 +135,9 @@ cheaper mixer, or AVX-512 scatter for the write-back.
    full sweeps on the bench corpus: the best models cost n/1100 to n/220
    bytes, and the top shapes are within ~0.5% of each other. So the prior
    favours models near n/500 bytes, with a hidden layer, Q8 weights and a
-   bit-position selector.
+   bit-position selector. The target is capped at 128 KiB: on a 1.3 GB XCI
+   the uncapped prior chose a 1.8 MB model with a 4096-set selector, whose
+   weights fall out of cache, and decoding ran about 3x slower.
 5. Fit the top candidates with AdamW (batch 256, lr 0.02 → 0.001
    linearly, β = 0.9/0.999, weight decay 1e-5, lazy updates of only the
    weight sets a batch touches). The first `max(1, epochs/5)` epochs train

@@ -600,11 +600,16 @@ static const uint8_t sel2_opts_0[] = {P1_SEL_NONE, P1_SEL_BITPOS,
 /* Prior preference (higher = fitted first), from full candidate sweeps over
  * text, a word list, roff, and ELF binaries: the best models cost about
  * n/1100 to n/220 bytes, and the top few shapes are within ~0.5% of each
- * other. Shapes near n/500 bytes with a hidden layer, Q8 weights and a
- * bit-position selector win most often. */
+ * other. Shapes near n/500 bytes (at most 128 KiB) with a hidden layer, Q8
+ * weights and a bit-position selector win most often. */
 static double prior(const cand *c, size_t n)
 {
-	const double target = (double)n / 500.0 + 96.0;
+	/* Capped: past ~128 KiB the weight tables (a 4096-set selector is
+	 * megabytes of floats) fall out of cache and decoding slows down; a
+	 * 1.3 GB dump decoded about 3x slower with a 1.8 MB model. */
+	double target = (double)n / 500.0 + 96.0;
+	if (target > 131072.0)
+		target = 131072.0;
 	double r = dlog2((double)c->size / target);
 	double pr = -(r < 0 ? -r : r);
 	if (c->s.hidden)
