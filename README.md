@@ -7,9 +7,12 @@ variants:
 - `.aw`: a single compressed stream
 - `.awseek`: fixed-size blocks plus a seek table for random access
 
-Status: scaffold. The container, range coder and seeking work, but the
-predictor is still an integer order-0 placeholder (arith profile 0). The
-AdamW mixer comes next. See `docs/`.
+Status: working draft. The container, range coder, seeking and both
+arithmetic profiles work: profile 0 is an integer order-0 placeholder, and
+profile 1 (`F32_STRICT_MIX`) is the fitted mixer. Adaptive integer
+context models feed a small MLP that the encoder fits with AdamW and
+stores as F16 or Q8. The decoder has scalar, AVX2/F16C and AVX-512 paths
+that produce identical bits. See `docs/`.
 
 ## Build
 
@@ -25,6 +28,7 @@ Sanitizer build: `cmake -S . -B build-san -DTAW_SANITIZE=ON -DTAW_WERROR=ON`.
 
 ```sh
 taw c [-l 1..9] in out.aw              # stream
+taw c -p mix -w q8 in out.aw           # force the mixer, Q8 weights
 taw c [-B block_size] in out.awseek    # seekable (or -s)
 taw d archive out
 taw x archive.awseek OFFSET LENGTH out # random-access range

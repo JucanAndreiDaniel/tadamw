@@ -1,7 +1,9 @@
 # tar_aw container format, version 1
 
-Status: draft. Normative for everything implemented; reserved values are
-listed so that decoders can refuse them.
+Status: draft. Normative for everything implemented (profiles 0 and 1);
+reserved values are listed so that decoders can refuse them.
+`tests/test_p1.c` pins profile 1 with golden vectors: a change that breaks
+them changes the format.
 
 All integers are unsigned and little-endian unless stated otherwise.
 `crc32c` is CRC-32C (Castagnoli, reflected polynomial `0x82F63B78`, init
@@ -48,7 +50,7 @@ identical probabilities for every bit.
 | id | name            | model section | status |
 |----|-----------------|---------------|--------|
 | 0  | `INT_ORDER0`    | empty (`model_size = 0`, `quant = 0`) | implemented, placeholder |
-| 1  | `F32_STRICT_MIX`| bitwise mixer weights, §5 | reserved, not yet specified |
+| 1  | `F32_STRICT_MIX`| mixer shape and weights, §5.1; quant `F16` or `Q8` | implemented |
 | 2..255 | — | — | reserved, refuse |
 
 ### 2.1 Profile 0: `INT_ORDER0`
@@ -64,6 +66,245 @@ coder and seeking can be tested before the AdamW model lands.
 - After coding `bit`: if `bit == 1`, `p += (65536 - p) >> 4`; otherwise
   `p -= p >> 4`. (`p` stays inside `[15, 65521]`.)
 
+### 2.2 Profile 1: `F32_STRICT_MIX`
+
+Adaptive integer context models turn the history into 25 stretched
+probabilities. A small frozen MLP, whose shape and weights are in the
+model section (§5.1), mixes them in binary32 with a fixed operation order.
+An integer squash and two adaptive APM stages produce the final 16-bit
+probability. Everything except the MLP is integer arithmetic. The weights
+never change while coding.
+
+Arithmetic conventions: integers wrap modulo 2^32 unless stated otherwise,
+`>>` is a logical shift of a non-negative value, and products that may
+exceed 32 bits are computed in 64 bits. Binary32 operations round to
+nearest even, one operation at a time: no fused multiply-add and no
+reassociation. (Subnormals never arise: every non-zero product and sum is
+at least 2^-102 in magnitude, so flush-to-zero modes cannot change a
+result.)
+
+#### 2.2.1 Integer functions
+
+`squash(t)` maps a stretch-domain value `t` (units of 1/256) to
+`P(1) * 65536`:
+
+```
+K[0..32] = 22 36 60 98 162 267 439 720 1179 1921 3108 4971 7812 11955
+           17625 24743 32768 40793 47911 53581 57724 60565 62428 63615
+           64357 64816 65097 65269 65374 65438 65476 65500 65514
+squash(t): t = clamp(t, -2047, 2047); u = t + 2048
+           j = u >> 7; w = u & 127
+           return (K[j] * (128 - w) + K[j + 1] * w + 64) >> 7
+```
+
+(`K[k]` is `65536 / (1 + e^-(k-16)/2)` rounded, but the table is the
+definition.)
+
+`stretch[0..4095]` is the inverse table, built as:
+
+```
+pi = 0
+for t = -2047 .. 2047: v = squash(t) >> 4; stretch[pi..v] = t; pi = v + 1
+stretch[pi..4095] = 2047
+```
+
+`R[n] = floor(2^17 / (2n + 3))` for `n = 0..1023` (an update rate of
+`1/(n + 1.5)` in 16-bit fixed point).
+
+#### 2.2.2 Coding-unit state
+
+All of the following is reset at the start of every coding unit (the
+whole stream for aw, every block for awseek), and carries across aw
+chunks. `L`, `HB` and `MB` are `lines_log2`, `hist_log2` and `match_log2`
+from the model head.
+
+| state | initial value |
+|-------|---------------|
+| `c0` partial byte with a leading 1, `bitpos` 0..7, `nib` (§2.2.4) | `1`, `0`, `1` |
+| `c4`, `c8`: the last 4 bytes and the 4 before them, newest in the low byte | `0`, `0` |
+| `word` (§2.2.5), `pos` (bytes coded in this unit, mod 2^32) | `0`, `0` |
+| `hist[2^HB]` byte ring, `MT[2^MB]` u32 match table | all `0` |
+| `mlen`, `mptr` (§2.2.6) | `0`, `0` |
+| context slots (§2.2.3) in `O0[256]`, `O1[65536]`, `T_k[2^L][16]` | `ps = 32768, h = 1, n = 0`; line tags `0` |
+| history maps `HM_k[256]`, k = 0..11 | `p = 2^21, n = 0` |
+| match counters `SM[16]` | as a context slot |
+| APM tables `A1[256][33]`, `A2[65536][33]` (u16) | `A[c][j] = squash(128 * (j - 16))` |
+
+`c1` below means `c4 & 0xFF`.
+
+#### 2.2.3 Counters
+
+A **context slot** holds `ps` (16 bits, P(1) * 65536), `h` (8 bits, the
+last up to 7 bits seen in this slot behind a leading 1) and `n` (update
+count). Each of the 12 context models `k` gives two inputs:
+
+```
+st[k]      = stretch[ps >> 4]                  direct estimate
+st[12 + k] = stretch[HM_k[h].p >> 10]          indirect: history -> P(1)
+```
+
+After the bit `b` is known, with `r = R[n]`:
+
+```
+slot:  if b: ps += ((65535 - ps) * r) >> 16   else: ps -= (ps * r) >> 16
+       h = (h >= 128) ? 128 | ((2h + b) & 127) : 2h + b
+       n = min(n + 1, 30)                       (match counters: 63)
+HM_k[h_old]:  p is 22 bits, n is 10 bits, r = R[n]
+       if b: p += ((4194303 - p) * r) >> 16   else: p -= (p * r) >> 16
+       n = min(n + 1, 1023)
+```
+
+`HM_k` is indexed with the slot's `h` from before the update.
+
+#### 2.2.4 Context models and hashed tables
+
+```
+H(a, b, k): x = a * 0x9E3779B1 + b * 0x85EBCA77 + k * 0xC2B2AE3D
+            x ^= x >> 15; x *= 0x2C1B3C6D; x ^= x >> 12
+            x *= 0x297A2D39; x ^= x >> 15; return x
+```
+
+| k | model | slot |
+|---|-------|------|
+| 0 | o0 | `O0[c0]` |
+| 1 | o1 | `O1[c1 * 256 + c0]` |
+| 2..11 | hashed | `T_k[line_k][nib]` |
+
+The hashed models have byte-level hashes `g_k`, computed after every byte
+(and at the unit start):
+
+| k | name | `g_k` |
+|---|------|-------|
+| 2 | o2 | `H(c4 & 0xFFFF, 0, 2)` |
+| 3 | o3 | `H(c4 & 0xFFFFFF, 0, 3)` |
+| 4 | o4 | `H(c4, 0, 4)` |
+| 5 | o6 | `H(c4, c8 & 0xFFFF, 6)` |
+| 6 | sparse 2,3 | `H((c4 >> 8) & 0xFFFF, 0, 8)` |
+| 7 | word | `H(word, c1, 9)` |
+| 8 | sparse 3,4 | `H(c4 & 0xFFFF0000, 0, 11)` |
+| 9 | sparse 2,4 | `H(c4 & 0xFF00FF00, 0, 12)` |
+| 10 | sparse 1,4 | `H(c4 & 0xFF0000FF, 0, 13)` |
+| 11 | sparse 1,2,7,8 | `H(c4 & 0xFFFF, c8 & 0xFFFF0000, 14)` |
+
+A line is 16 slots; slot 0 holds a tag, slots 1..15 serve the 15 nodes of
+one nibble's bit tree. At `bitpos` 0 (with `q = 0`) and at `bitpos` 4
+(with `q = c0`, then 16..31), every hashed model selects a line:
+
+```
+x = H(g_k, q, 0); line_k = x >> (32 - L); tag = (x & 0xFFFF) | 0x10000
+if T_k[line_k][0] != tag: reset slots 1..15 to their initial value,
+                          T_k[line_k][0] = tag
+```
+
+`nib` is `1` at `bitpos` 0 and 4 and becomes `2 * nib + b` after each bit,
+so it is 1..15 within a nibble.
+
+#### 2.2.5 Byte end
+
+After the 8th bit of a byte `ch = c0 & 0xFF`, in this order:
+
+1. `hist[pos mod 2^HB] = ch`; `pos += 1`; `c8 = (c8 << 8) | (c4 >> 24)`;
+   `c4 = (c4 << 8) | ch`.
+2. `word`: if `((ch | 32) - 97) mod 2^32 < 26` then
+   `word = (word ^ (ch | 32)) * 0x01000193`, else `word = 0`.
+3. Match model update (§2.2.6).
+4. `c0 = 1`, `bitpos = 0`, `nib = 1`; recompute every `g_k`; select lines
+   with `q = 0`; set `mexp = hist[mptr mod 2^HB]` if `mlen > 0`, otherwise
+   no expected byte.
+
+#### 2.2.6 Match model
+
+```
+if mlen > 0:
+    if mexp == ch: mptr += 1; mlen = min(mlen + 1, 65535)
+    else: mlen = 0
+i = H(c4, c8 & 0xFF, 10) & (2^MB - 1)
+if mlen == 0 and MT[i] != 0:
+    e = MT[i]; d = pos - e                       (mod 2^32)
+    if 1 <= d <= 2^HB - 1:
+        k = 0
+        while k < 32 and k < e and
+              hist[(e - 1 - k) mod 2^HB] == hist[(pos - 1 - k) mod 2^HB]: k += 1
+        if k >= 5: mlen = k; mptr = e
+MT[i] = pos
+```
+
+For each bit, the match is **active** if there is an expected byte and
+`(mexp | 256) >> (8 - bitpos) == c0`. Then:
+
+```
+msel = min(floor(log2(mlen)) - 1, 7)            (1..7)
+eb   = (mexp >> (7 - bitpos)) & 1
+st[24] = stretch[SM[2 * msel + eb].ps >> 4]     and that counter is updated
+```
+
+Otherwise `msel = 0`, `st[24] = 0`, and no match counter is updated.
+
+#### 2.2.7 Selectors
+
+A selector picks one weight set per bit:
+
+| id | name | sets | value |
+|----|------|------|-------|
+| 0 | `NONE` | 1 | 0 |
+| 1 | `BITPOS` | 8 | `bitpos` |
+| 2 | `MATCH` | 8 | `msel` |
+| 3 | `C0` | 256 | `c0` |
+| 4 | `C1` | 256 | `c1` |
+| 5 | `C0C1HI` | 4096 | `(c1 >> 4) * 256 + c0` |
+
+#### 2.2.8 Mixer
+
+Inputs: `x[i] = st[i] / 256` for `i = 0..24` (exact in binary32), and
+`x[25] = 1`. `F = 26`. Dot products have a fixed shape:
+
+```
+dot4(w, v, n): s0 = s1 = s2 = s3 = +0
+               for i = 0 .. n-1: s[i mod 4] = s[i mod 4] + w[i] * v[i]
+               return (s0 + s1) + (s2 + s3)
+```
+
+With `H = hidden`, `W1`/`W2` the dequantized weights (§5.1), `a = sel1`'s
+value and `c = sel2`'s value:
+
+```
+if H > 0:
+    for j = 0 .. H-1:  h[j] = min(max(dot4(W1[a][j], x, 26), -8), 8)
+    z = dot4(W2[c], h, H) + W2[c][H]
+else:
+    z = dot4(W2[c], x, 26)
+z = min(max(z, -2047/256), 2047/256)
+t = trunc(z * 256)                    (toward zero; exact, |t| <= 2047)
+p_mix = squash(t)
+```
+
+The order of hidden units is free (they are independent); the order inside
+each `dot4` is not.
+
+#### 2.2.9 APM stages and the coded probability
+
+```
+s  = stretch[p_mix >> 4] + 2048;  lo = s >> 7;  w = s & 127
+q1 = (A1[c0][lo] * (128 - w) + A1[c0][lo + 1] * w) >> 7
+q2 = (A2[c1 * 256 + c0][lo] * (128 - w) + A2[...][lo + 1] * w) >> 7
+p  = (2 * p_mix + q1 + q2) >> 2                (always in [11, 65524])
+```
+
+`p` is `P(bit = 1)` for the range coder. After the bit, `A1[c0][lo + (w >> 6)]`
+and the same `A2` entry are updated: `e += (65535 - e) >> 6` if `b`, else
+`e -= e >> 6`.
+
+#### 2.2.10 Per-bit sequence
+
+1. Compute `st[0..24]` and the selector values from the current state.
+2. Mixer, APM, `p`; code the bit.
+3. Update the APM entries, every context slot and its history map, and
+   the match counter if the match was active. (These touch disjoint
+   state, so their order does not matter.)
+4. `c0 = 2 * c0 + b`, `nib = 2 * nib + b`, `bitpos += 1`. At `bitpos` 4:
+   `nib = 1` and select lines with `q = c0`. At `bitpos` 8: byte end
+   (§2.2.5).
+
 ## 3. Quantization formats
 
 The format in which model weights are stored. Encoders may pick any format
@@ -75,7 +316,7 @@ the profile allows. F16 is the standard format.
 | 1  | `F16`  | IEEE 754 binary16 |
 | 2  | `BF16` | bfloat16 (upper 16 bits of binary32) |
 | 3  | `F32`  | IEEE 754 binary32 |
-| 4  | `Q8`   | int8 rows with one F16 scale per row (layout TBD with profile 1) |
+| 4  | `Q8`   | int8 rows with one F16 scale per row (§5.1) |
 | 5..255 | — | reserved, refuse |
 
 ## 4. Binary range coder
@@ -111,6 +352,47 @@ whole input and is shared by every chunk or block.
 
 Constraint: `model_size <= floor(raw_size / 32)`. Encoders that cannot
 beat profile 0 inside that budget use profile 0.
+
+### 5.1 Profile 1 model
+
+An 8-byte head, then the weight payload:
+
+| off | size | field | valid range |
+|-----|------|-------|-------------|
+| 0 | 1 | `lines_log2` (L) | 8..22 |
+| 1 | 1 | `hist_log2` (HB) | 12..26 |
+| 2 | 1 | `match_log2` (MB) | 10..24 |
+| 3 | 1 | `sel1`, layer-1 selector (§2.2.7) | 0..5; `0` if `hidden = 0` |
+| 4 | 1 | `sel2`, output-layer selector | 0..5 |
+| 5 | 1 | `hidden` (H) | 0..32 |
+| 6 | 2 | reserved | `0` |
+
+The payload is a sequence of rows of weights:
+
+1. Layer 1, only if `H > 0`: for each set `a` of `sel1`, for each hidden
+   unit `j = 0..H-1`, one row of 26 weights `W1[a][j][0..25]` in input
+   order.
+2. Output layer: for each set `c` of `sel2`, one row `W2[c]` of `H + 1`
+   weights (hidden units, then the bias), or of 26 weights (input order)
+   if `H = 0`.
+
+Row encodings:
+
+- `F16`: each weight is a little-endian binary16. It must be finite.
+  Converting it to binary32 is exact.
+- `Q8`: a little-endian binary16 `scale` (finite), then one int8 `q` per
+  weight, `q != -128`. The weight is the binary32 product
+  `float(q) * float(scale)`, rounded once.
+
+`model_size` MUST equal `8` plus the payload size exactly. A decoder MUST
+refuse (format error) any field out of range, non-zero reserved bytes, a
+size mismatch, a non-finite F16 value or scale, or a Q8 value of -128.
+Profile 1 accepts `quant` `F16` and `Q8` only; other quant values are
+unsupported.
+
+A decoder needs about `10 * 2^L * 64 + 2^HB + 4 * 2^MB` bytes of tables
+plus about 4.6 MB fixed (o1 table and APM), and resets them per coding
+unit.
 
 ## 6. aw body (kind 0)
 
