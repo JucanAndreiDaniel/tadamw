@@ -498,6 +498,130 @@ static void adam_rows(optcfg *o, float *w, float *m, float *v, const float *g,
 	}
 }
 
+/* ---- C2 / C3 / NC9 AdamW stabilizers (encoder only, opt-in) ------------------
+ * C2: coordinatewise epsilon eps_i = c * (bias-corrected v_i)^alpha, floored.
+ * C3: sign-consistency gate g_i = |sign_EMA_i|^p, either mean-preserving
+ *     (renormalized by the row mean) or shrink-only.
+ * NC9: both. Default TAW_EPS_MODE=none: upstream's optimizers are untouched.
+ * These wrap only AdamW-style vector updates (m/v second moment); Muon and
+ * MALT/MALTER W1 paths keep their own state and are never modified. */
+
+enum { EPS_NONE = 0, EPS_C2, EPS_C3, EPS_NC9 };
+enum { SCOPE_ALL = 0, SCOPE_COLD, SCOPE_WARM };
+
+typedef struct {
+	int mode;
+	float alpha, c, floor;      /* C2 */
+	float beta, p;              /* C3 */
+	bool mean_pres;             /* C3: mean-preserving vs shrink-only */
+	int layers;                 /* bit 0: layer 1 (AdamW path), bit 1: layer 2 */
+	int scope;                  /* SCOPE_* (touch-count stratification) */
+	bool per_set;               /* C2: row-mean second moment instead of v_i */
+	bool debug;
+} eps_cfg;
+
+static eps_cfg eps_config(void)
+{
+	eps_cfg c = {.mode = EPS_NONE, .alpha = 0.5f, .c = 1e-3f,
+		.floor = 1e-8f, .beta = 0.9f, .p = 1.0f, .mean_pres = true,
+		.layers = 2, .scope = SCOPE_ALL, .per_set = false};
+	const char *m = getenv("TAW_EPS_MODE");
+	if (m) {
+		if (!strcmp(m, "c2")) c.mode = EPS_C2;
+		else if (!strcmp(m, "c3")) c.mode = EPS_C3;
+		else if (!strcmp(m, "nc9")) c.mode = EPS_NC9;
+	}
+	c.alpha = fit_env_float("TAW_EPS_ALPHA", c.alpha);
+	c.c = fit_env_float("TAW_EPS_C", c.c);
+	c.floor = fit_env_float("TAW_EPS_FLOOR", c.floor);
+	c.beta = fit_env_float("TAW_SIGN_BETA", c.beta);
+	c.p = fit_env_float("TAW_GATE_P", c.p);
+	const char *g = getenv("TAW_GATE_MODE");
+	if (g && !strcmp(g, "shrink")) c.mean_pres = false;
+	const char *l = getenv("TAW_EPS_LAYERS");
+	if (l) {
+		c.layers = 0;
+		if (strchr(l, '1')) c.layers |= 1;
+		if (strchr(l, '2')) c.layers |= 2;
+	}
+	const char *sc = getenv("TAW_EPS_SCOPE");
+	if (sc) {
+		if (!strcmp(sc, "cold")) c.scope = SCOPE_COLD;
+		else if (!strcmp(sc, "warm")) c.scope = SCOPE_WARM;
+	}
+	const char *gr = getenv("TAW_EPS_GRAN");
+	if (gr && !strcmp(gr, "set")) c.per_set = true;
+	c.debug = getenv("TAW_EPS_DEBUG") != nullptr;
+	return c;
+}
+
+static inline float fabs_(float x) { return x < 0.0f ? -x : x; }
+
+/* Per-set diagnostics for the touch-count stratification. */
+typedef struct {
+	double touches, sum_vh, sum_sqrt_vh, sum_eps, sum_gate;
+} eps_stats;
+
+/* Stabilized AdamW vector update. sig is the sign-EMA state (C3), one float
+ * per weight, mirrored from set 0 at un-tie like m/v. Gradients are cleared
+ * by the caller, as for adam_rows. */
+static void adam_rows_adv(optcfg *o, float *w, float *m, float *v,
+    const float *g, float *sig, size_t len, float scale, float lr, float wd,
+    float mix, const eps_cfg *cfg, eps_stats *st)
+{
+	const float c1 = 1.0f / (1.0f - o->b1t), c2 = 1.0f / (1.0f - o->b2t);
+	const bool use_eps = cfg->mode == EPS_C2 || cfg->mode == EPS_NC9;
+	const bool use_gate = cfg->mode == EPS_C3 || cfg->mode == EPS_NC9;
+	float gate[P1_HMAX * P1_F + 1]; /* len <= row1 <= H*P1_F */
+	float row_v = 0.0f, gsum = 0.0f;
+	for (size_t k = 0; k < len; k++) {
+		float gk = g[k] * scale;
+		m[k] = o->b1 * m[k] + (1.0f - o->b1) * gk;
+		v[k] = o->b2 * v[k] + (1.0f - o->b2) * gk * gk;
+		float vh = v[k] * c2;
+		row_v += vh;
+		if (use_gate) {
+			const float sg = gk > 0.0f ? 1.0f : gk < 0.0f ? -1.0f : 0.0f;
+			sig[k] = cfg->beta * sig[k] + (1.0f - cfg->beta) * sg;
+			const float a = fabs_(sig[k]);
+			gate[k] = cfg->p == 2.0f ? a * a : a;
+			gsum += gate[k];
+		}
+		if (st) {
+			st->sum_vh += vh;
+			st->sum_sqrt_vh += fsqrt(vh);
+		}
+	}
+	if (st)
+		st->touches += 1.0;
+	/* Mean-preserving: renormalize by the row mean (reallocate trust without
+	 * changing the tensor's total step size). Zero/very small mean = the
+	 * sign EMA is not established yet, so apply no gating. */
+	float gmean = (use_gate && cfg->mean_pres) ? gsum / (float)len : 1.0f;
+	if (gmean < 1e-12f)
+		gmean = 1.0f;
+	const float row_vh = row_v / (float)len;
+	for (size_t k = 0; k < len; k++) {
+		const float vh = v[k] * c2;
+		float eps = o->eps;
+		if (use_eps) {
+			const float x = cfg->per_set ? row_vh : vh;
+			eps = cfg->c * (cfg->alpha == 1.0f ? x : fsqrt(x));
+			if (eps < cfg->floor)
+				eps = cfg->floor;
+		}
+		float upd = (m[k] * c1) / (fsqrt(vh) + eps) + wd * w[k];
+		if (use_gate)
+			upd *= cfg->mean_pres ? gate[k] / gmean : gate[k];
+		w[k] -= mix * lr * upd;
+		if (st) {
+			st->sum_eps += eps;
+			st->sum_gate += (cfg->mean_pres ? gate[k] / gmean : gate[k])
+			    / (float)len;
+		}
+	}
+}
+
 /* Muon on a row-major rows x cols matrix. Largest shape here is
  * P1_HMAX x P1_F = 32 x 26, so scratch fits on the stack. */
 static void muon_rows(const optcfg *o, float *w, float *m, const float *g,
@@ -698,6 +822,42 @@ static const char *fit_env_str(const char *name, const char *def)
 	return s && *s ? s : def;
 }
 
+/* Median of the positive entries of a[] (0 if none), for the cold/warm
+ * touch-count split. Frequencies come from the sample selector values, so
+ * the split is a rule of the data, not of the training order. */
+static size_t positive_median(const size_t *a, size_t n)
+{
+	size_t *v = malloc((n ? n : 1) * sizeof *v);
+	if (!v)
+		return 0;
+	size_t m = 0;
+	for (size_t i = 0; i < n; i++)
+		if (a[i])
+			v[m++] = a[i];
+	if (!m) {
+		free(v);
+		return 0;
+	}
+	for (size_t i = 1; i < m; i++) { /* insertion sort; n <= 4096 */
+		size_t x = v[i], j = i;
+		while (j && v[j - 1] > x) {
+			v[j] = v[j - 1];
+			j--;
+		}
+		v[j] = x;
+	}
+	size_t med = v[m / 2];
+	free(v);
+	return med;
+}
+
+static inline bool in_scope(int scope, size_t freq, size_t med)
+{
+	if (scope == SCOPE_ALL || !freq)
+		return scope == SCOPE_ALL;
+	return scope == SCOPE_COLD ? freq < med : freq >= med;
+}
+
 /* Train on samples for the given epochs. Batches touch few weight sets, so
  * only those rows are updated ("lazy" optimizer state). With no environment
  * overrides this is the shipped AdamW fitter, bit for bit. */
@@ -705,6 +865,7 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
     uint64_t seed)
 {
 	enum { BATCH = FIT_BATCH };
+	const eps_cfg ecfg = eps_config();
 	const char *hs = fit_env_str("TAW_HYBRID", "adam");
 	hyb_mode mode = HYB_ADAM;
 	if (!strcmp(hs, "muon"))
@@ -810,9 +971,44 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 	const unsigned H = t->s.hidden;
 	const int warm = fit_warm_epochs(epochs);
 	t->tied = t->s1 > 1 || t->s2 > 1;
+
+	/* C3 sign-EMA state, one float per weight; allocated only when gating. */
+	const size_t np = t->n1 + t->n2;
+	const bool use_gate = ecfg.mode == EPS_C3 || ecfg.mode == EPS_NC9;
+	float *sig = use_gate ? calloc(np, sizeof *sig) : nullptr;
+	eps_stats *st1 = ecfg.debug && H ? calloc(t->s1 + 1, sizeof *st1) : nullptr;
+	eps_stats *st2 = ecfg.debug ? calloc(t->s2 ? t->s2 : 1, sizeof *st2) : nullptr;
+
+	/* Touch-count stratification: expected selector frequencies from one
+	 * pass over the samples; cold = below median, warm = at/above. */
+	size_t *f1 = (H && ecfg.scope != SCOPE_ALL)
+	    ? calloc(t->s1 + 1, sizeof *f1) : nullptr;
+	size_t *f2 = ecfg.scope != SCOPE_ALL ? calloc(t->s2 ? t->s2 : 1,
+	    sizeof *f2) : nullptr;
+	size_t med1 = 0, med2 = 0;
+	if (f1 || f2) {
+		for (size_t i = 0; i < ns; i++) {
+			const p1_sel_ctx sc = sample_sc(&sm[i]);
+			if (f2)
+				f2[p1_sel_value(t->s.sel2, &sc)]++;
+			if (f1)
+				f1[p1_sel_value(t->s.sel1, &sc)]++;
+		}
+		med1 = f1 ? positive_median(f1, t->s1 + 1) : 0;
+		med2 = f2 ? positive_median(f2, t->s2) : 0;
+	}
 	for (int ep = 0; ep < epochs; ep++) {
-		if (t->tied && ep >= warm)
+		if (t->tied && ep >= warm) {
 			tnet_untie(t);
+			if (sig) { /* mirror the seed set's sign state like m/v */
+				for (size_t set = 1; set < t->s1; set++)
+					memcpy(sig + set * t->row1, sig,
+					    t->row1 * sizeof *sig);
+				for (size_t set = 1; set < t->s2; set++)
+					memcpy(sig + t->n1 + set * t->row2,
+					    sig + t->n1, t->row2 * sizeof *sig);
+			}
+		}
 		const uint64_t stride = fit_stride(ns);
 		uint64_t pos = rng_next(&rs) % (ns ? ns : 1);
 		for (size_t done = 0; done < ns;) {
@@ -863,10 +1059,21 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 				if (t->tied && warm_adam)
 					muon = false;
 				if (mode == HYB_ADAM) {
-					/* The shipped path, using the original m/v. */
-					adam_rows(&o, t->w + off, t->m + off,
-					    t->v + off, t->g + off, t->row1,
-					    scale, o.lrvec, o.vecwd, 1.0f);
+					/* The shipped path, using the original m/v.
+					 * C2/C3 may wrap this AdamW vector update; the
+					 * Muon / MALT / MALTER W1 paths are untouched. */
+					if (ecfg.mode != EPS_NONE && (ecfg.layers & 1) &&
+					    in_scope(ecfg.scope, f1 ? f1[set] : 1, med1))
+						adam_rows_adv(&o, t->w + off, t->m + off,
+						    t->v + off, t->g + off,
+						    sig ? sig + off : nullptr,
+						    t->row1, scale, o.lrvec, o.vecwd,
+						    1.0f, &ecfg,
+						    st1 ? &st1[set] : nullptr);
+					else
+						adam_rows(&o, t->w + off, t->m + off,
+						    t->v + off, t->g + off, t->row1,
+						    scale, o.lrvec, o.vecwd, 1.0f);
 				} else if (malty && !(t->tied && warm_adam)) {
 					malt_rows(&o, t->w + off, t->m + off,
 					    t->malt_l + set * H,
@@ -893,11 +1100,20 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 				t->touched1[set] = 0;
 			}
 			for (size_t k = 0; k < n2; k++) {
-				size_t off = t->n1 + t->list2[k] * t->row2;
-				adam_rows(&o, t->w + off, t->m + off, t->v + off,
-				    t->g + off, t->row2, scale, o.lrvec,
-				    o.vecwd, 1.0f);
-				t->touched2[t->list2[k]] = 0;
+				const size_t s2 = t->list2[k];
+				size_t off = t->n1 + s2 * t->row2;
+				if (ecfg.mode != EPS_NONE && (ecfg.layers & 2) &&
+				    in_scope(ecfg.scope, f2 ? f2[s2] : 1, med2))
+					adam_rows_adv(&o, t->w + off, t->m + off,
+					    t->v + off, t->g + off,
+					    sig ? sig + off : nullptr, t->row2,
+					    scale, o.lrvec, o.vecwd, 1.0f, &ecfg,
+					    st2 ? &st2[s2] : nullptr);
+				else
+					adam_rows(&o, t->w + off, t->m + off,
+					    t->v + off, t->g + off, t->row2, scale,
+					    o.lrvec, o.vecwd, 1.0f);
+				t->touched2[s2] = 0;
 			}
 			memset(t->g, 0, (t->n1 + t->n2) * sizeof(float));
 		}
@@ -923,6 +1139,47 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 		    lmin, lmax, lsum / (float)(H ? H : 1), rmin, rmax,
 		    rsum / (float)P1_F, t->malt_nu[0]);
 	}
+	if (ecfg.debug) {
+		fprintf(stderr, "[eps] mode=%d alpha=%.3g c=%.3g floor=%.3g "
+			"beta=%.3g p=%.3g gate=%s layers=%d scope=%d gran=%s\n",
+			ecfg.mode, ecfg.alpha, ecfg.c, ecfg.floor, ecfg.beta,
+			ecfg.p, ecfg.mean_pres ? "mean" : "shrink", ecfg.layers,
+			ecfg.scope, ecfg.per_set ? "set" : "coord");
+		const char *ln[2] = {"layer1", "layer2"};
+		for (int L = 0; L < 2; L++) {
+			const eps_stats *s = L ? st2 : st1;
+			const size_t nset = L ? t->s2 : (H ? t->s1 : 0);
+			if (!s || !nset)
+				continue;
+			size_t nt = 0;
+			double tmin = 1e300, tmax = 0, tsum = 0, vsum = 0,
+			       rsum = 0, esum = 0, gsum = 0;
+			for (size_t i = 0; i < nset; i++) {
+				if (!s[i].touches)
+					continue;
+				nt++;
+				double tv = s[i].touches;
+				if (tv < tmin) tmin = tv;
+				if (tv > tmax) tmax = tv;
+				tsum += tv;
+				vsum += s[i].sum_vh / tv;
+				rsum += s[i].sum_sqrt_vh / tv;
+				esum += s[i].sum_eps / tv;
+				gsum += s[i].sum_gate / tv;
+			}
+			fprintf(stderr, "[eps] %s: touched=%zu min/med/max touches="
+				"%.0f/%.0f/%.0f mean_vh=%.4g mean_sqrt_vh=%.4g "
+				"mean_eps=%.4g mean_gate=%.4g\n",
+				ln[L], nt, tmin, nt ? tsum / nt : 0.0, tmax,
+				nt ? vsum / nt : 0.0, nt ? rsum / nt : 0.0,
+				nt ? esum / nt : 0.0, nt ? gsum / nt : 0.0);
+		}
+	}
+	free(sig);
+	free(st1);
+	free(st2);
+	free(f1);
+	free(f2);
 }
 
 /* ---- quantization / serialization -------------------------------------------- */
@@ -1033,6 +1290,11 @@ static size_t enumerate(const p1_shape *geo, uint64_t budget, int quant_pref,
 		TAW_QUANT_Q4, TAW_QUANT_Q2, TAW_QUANT_FP8, TAW_QUANT_NVFP4,
 		TAW_QUANT_IQ8, TAW_QUANT_IQ4, TAW_QUANT_IQ2};
 	const uint8_t want = taw_quant_from_weights((taw_weights)quant_pref);
+	/* Diagnostic only: force a selector shape (touch-count stratification). */
+	const char *fs1 = getenv("TAW_FORCE_SEL1");
+	const char *fs2 = getenv("TAW_FORCE_SEL2");
+	const int force1 = fs1 ? atoi(fs1) : -1;
+	const int force2 = fs2 ? atoi(fs2) : -1;
 	for (size_t qi = 0; qi < sizeof quants; qi++) {
 		uint8_t q = quants[qi];
 		if (want != TAW_QUANT_NONE && q != want)
@@ -1047,6 +1309,9 @@ static size_t enumerate(const p1_shape *geo, uint64_t budget, int quant_pref,
 					c.s.hidden = H;
 					c.s.sel1 = H ? sel1_opts[a] : P1_SEL_NONE;
 					c.s.sel2 = H ? sel2_opts_h[b] : sel2_opts_0[b];
+					if ((force1 >= 0 && c.s.sel1 != force1) ||
+					    (force2 >= 0 && c.s.sel2 != force2))
+						continue;
 					c.size = P1_MODEL_HEAD + p1_weights_size(&c.s, q);
 					if (c.size <= budget && k < cap)
 						out[k++] = c;

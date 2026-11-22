@@ -172,3 +172,201 @@ the leader's small W2 LR.
   implemented there. Memory overhead is `O(m+n)` extra floats per matrix,
   plus one scalar for MALTER; compute is one NS pass plus row/column sums,
   i.e. essentially Muon's cost.
+
+
+---
+
+# C2 / C3 / NC9 AdamW stabilizers (branch `exp/eps-gate`)
+
+> **Rebase note (2026-11-23):** this branch is rebased onto upstream `1aa3dd7`
+> (merged PRs #3 MALTER and #4 Muon). Upstream's optimizer code is preserved
+> unchanged: the C2/C3 delta wraps **only AdamW vector updates** that carry an
+> `(m, v)` second moment, so the Muon, MALT and MALTER W1 paths are never
+> touched. Knob-off output is byte-identical to the new upstream baseline on
+> all four cells (181557 / 179166 / 379197 / 375291), and the tuned-AdamW C3
+> numbers below reproduce exactly after the rebase (tuned control
+> 179913 / 178886 / 373887 / 371894; tuned + C3 shrink
+> 180047 / 178687 / 372296 / 368712; decode byte-identical). Upstream's
+> merged MALTER leader totals 1,093,945 B, which is stronger than
+> tuned-AdamW + C3 (1,099,742 B); C3 shrink is therefore an **AdamW-specific
+> add-on**, not a new overall leader.
+
+**Bottom line:** the *specified* NC9 recipe (per-coordinate ε **plus a mean-preserving
+sign gate**) is **harmful** here (+678…+1060 B vs the tuned control on text1m L5).
+The useful ingredient is the **shrink-only** sign-consistency gate (C3) applied to
+**layer 2 only**: `TAW_EPS_MODE=c3 TAW_SIGN_BETA=0.9 TAW_GATE_P=1 TAW_GATE_MODE=shrink`.
+On top of the strong tuned-AdamW control (`exp/lr-baseline` 9a08442) it gives
+**−4,838 B total (−0.438%)** over the four benchmark cells and **−15,469 B
+(−1.387%)** vs the shipped baseline. C2 alone gives a small, fragile −474 B.
+None of this appears to be a cold-set effect: the gains are largest on hot sets.
+
+## Method
+
+Encoder-only change in `src/fit.c`; format and decoder untouched.
+
+* **C2** — replace the scalar `eps = 1e-6` in the lazy AdamW update by
+  `eps_i = max(c · (v_i/(1-β₂ᵗ))^α, 1e-8)`. Bias-corrected second moment;
+  `α ∈ {½, 1}`, `c ∈ {1e-3, 1e-2}` (plus 3e-4/5e-4 probes). `TAW_EPS_GRAN=set`
+  uses the row-mean second moment instead of `v_i`. Default off.
+* **C3** — keep one sign-EMA per weight, `s_i ← β s_i + (1-β) sign(g_i)`, and
+  multiply the AdamW coordinate update by `|s_i|^p`. Two variants:
+  **mean-preserving** (divide by the row mean of the gate, so the tensor's
+  total step magnitude is unchanged — the NC9 paper's recipe) and
+  **shrink-only** (multiply directly). `β ∈ {0.9, 0.95}`, `p ∈ {1, 2}`.
+  The sign state is mirrored from set 0 at un-tie, like `w/m/v`. Default off.
+* **NC9** — both at once (`TAW_EPS_MODE=nc9`).
+* Scope knobs: `TAW_EPS_LAYERS=1|2|12` (default **2**), `TAW_EPS_SCOPE=all|cold|warm`
+  (cold/warm split by the median expected selector frequency over the samples).
+* Control knobs: `TAW_LR0`, `TAW_LR1`, `TAW_B1`, `TAW_B2`, `TAW_WD` — defaults
+  0.02 / 0.001 / 0.9 / 0.999 / 1e-5, so **the default build is unchanged**
+  (verified byte-identical on all four cells).
+* Diagnostic only: `TAW_FORCE_SEL1`, `TAW_FORCE_SEL2` filter the candidate
+  shapes; `TAW_EPS_DEBUG=1` prints per-layer touch counts, mean `v`, `sqrt(v)`,
+  `eps` and gate.
+
+All archives were written under `/tmp/opencode/eps-gate-bench/`; the read-only
+benchmark corpus directory was never written to. Build: clang Release;
+`ctest` 12/12 after the final edit. Decode was checked byte-identical to the
+sources for every finalist (`taw d` + `cmp`) on text1m L5 and libc1m L5.
+
+## Sweep
+
+Sizes are compressed archive bytes (1 MiB inputs), `-p mix`; Δ in parentheses.
+
+### Baselines and controls
+
+| configuration | text L1 | text L5 | libc L1 | libc L5 | total Δ |
+|---|---|---|---|---|---|
+| shipped baseline `e64cc83` | 181557 | 179166 | 379197 | 375291 | — |
+| original control `lr 0.003→6e-5` | 183686 (+2129) | 179165 (−1) | 378209 (−988) | 374221 (−1070) | **+70** |
+| **tuned AdamW control** (0.055→0.00055, β₁=0.95, WD=1e-3) | 179913 (−1644) | 178886 (−280) | 373887 (−5310) | 371894 (−3397) | **−10631** |
+
+The 0.003 control is essentially neutral on the new base; the 9a08442 control
+is the one that matters, so all stabilizer arms are reported both ways.
+
+### Finalists, four cells
+
+| arm | text L1 | text L5 | libc L1 | libc L5 | Δ vs baseline | Δ vs tuned control |
+|---|---|---|---|---|---|---|
+| C2 (α=½, c=1e-3) | 181544 (−13) | 179180 (+14) | 379197 (0) | 375372 (+81) | **+82** | — |
+| C3 shrink (β=.9, p=1) | 180645 (−912) | 180050 (+884) | 379082 (−115) | 372601 (−2690) | **−2833** | — |
+| NC9 shrink (C2 above + C3 shrink) | 180560 (−997) | 179574 (+408) | 379087 (−110) | 373466 (−1825) | **−2524** | — |
+| C2 **on tuned** | 179999 (+86) | 178759 (−127) | 373561 (−326) | 371787 (−107) | −10105 | **−474** |
+| **C3 shrink on tuned** | 180047 (+134) | 178687 (−199) | 372296 (−1591) | 368712 (−3182) | **−15469** | **−4838** |
+| NC9 shrink on tuned | 180169 (+256) | 178555 (−331) | 372482 (−1405) | 368748 (−3146) | −15257 | −4626 |
+
+### Parameter sweep, tuned control, text1m L5 (base = 178886)
+
+| variant | size (Δ) |
+|---|---|
+| C2 α=½, c=3e-4 | 179377 (+491) |
+| C2 α=½, c=5e-4 | 178970 (+84) |
+| **C2 α=½, c=1e-3** | **178759 (−127)** |
+| C2 α=½, c=1e-2 | 179348 (+462) |
+| C2 α=1, c=1e-3 | 179416 (+530) |
+| C2 α=1, c=1e-2 | 179358 (+472) |
+| C3 mean β=.9 p=1 | 179519 (+633) |
+| C3 mean β=.9 p=2 | 180443 (+1557) |
+| C3 mean β=.95 p=1 | 179713 (+827) |
+| C3 mean β=.95 p=2 | 181208 (+2322) |
+| **C3 shrink β=.9 p=1** | **178687 (−199)** |
+| C3 shrink β=.9 p=2 | 179001 (+115) |
+| C3 shrink β=.95 p=1 | 178895 (+9) |
+| C3 shrink β=.95 p=2 | 179542 (+656) |
+| NC9 mean α=½,c=1e-3,β=.9,p=1 | 179792 (+906) |
+| NC9 mean α=½,c=1e-2,β=.9,p=1 | 179564 (+678) |
+| NC9 mean α=1,c=1e-2,β=.9,p=1 | 179946 (+1060) |
+| **NC9 shrink (α=½,c=1e-3,β=.9,p=1)** | **178555 (−331)** |
+
+The C2 optimum is narrow and its overall effect is at the noise floor; α=1
+(the "variance-proportional" choice) is consistently worse. The mean-preserving
+gate is uniformly harmful; shrink-only with β=.9, p=1 is the only gate setting
+that helps. β=0.9 beats 0.95 and p=1 beats p=2 throughout (the latter shrinks
+too aggressively in our very short schedule).
+
+### Layer scope, tuned control, L5
+
+| gate placement | text L5 | libc L5 |
+|---|---|---|
+| layer 2 only | **178687** | **368712** |
+| layer 1 only | 181701 | 377388 |
+| layers 1 + 2 | 178891 | 371521 |
+
+Applying the gate to layer 1 is strongly harmful and cancels the layer-2 gain:
+the layer-1 set has one shared 416-weight row driving every hidden unit, so
+shrinking its coordinates is equivalent to an uncontrolled lr reduction.
+
+### Touch-count stratification (forced `sel2=C0`, 256 output sets, text1m L5)
+
+The shipped L1/L5 shapes have `sel1=NONE, sel2=BITPOS`: one hot layer-1 set and
+only 8 hot output sets (~20k touches each) — **no cold sets**. To test the
+hypothesis I forced `sel2=C0`, giving 110 touched sets out of 256, with
+10 / 8,000 / 20,480 min / median / max touches per set (`TAW_EPS_DEBUG=1`).
+
+| arm (forced shape, tuned control) | size (Δ vs 187511) |
+|---|---|
+| no stabilizer | 187511 |
+| C2 (α=½, c=1e-2) | 187527 (+16) |
+| C3 mean p=1 | 187514 (+3) |
+| NC9 mean | 187415 (−96) |
+| C3 shrink, all sets | 186812 (−699) |
+| C3 shrink, **cold** sets only | 187078 (−433) |
+| C3 shrink, **warm** sets only | **186758 (−753)** |
+| NC9 shrink, cold sets only | 187072 (−439) |
+| NC9 shrink, warm sets only | **186736 (−775)** |
+
+Both cold and warm strata benefit, warm slightly more. The claimed cold-set
+mechanism is **not** supported: the sign gate behaves as a general
+sign-stability/adaptive-lr regularizer on the hot output rows.
+
+### Mechanism check
+
+On libc1m L5 the chosen candidate stays `H=16, sel1=NONE, sel2=BITPOS, fp8`
+for both base and C3-shrink; the fp8 candidate's bpc improves 2.8692 → 2.8374
+(−0.0318 bpc ≈ −3,182 B). The gain is from the fit itself, not from switching
+candidates or quantizers.
+
+## Verdict
+
+* **Adopt?** C3 shrink-only (β=0.9, p=1) on layer 2 is a real incremental gain
+  **only in combination with the tuned high-LR / high-WD control**: −4,838 B
+  there, but on the shipped baseline it is a wash overall (−2,833 B, driven by
+  libc L5, with a +884 B regression on text L5). It is cheaper than further LR
+  tuning and does not touch the decoder, so it is a reasonable add-on to the
+  tuned control, **not** a replacement for it.
+* **Reject NC9 as specified.** The mean-preserving gate makes text1m L5 worse
+  in every tested (β, p) combination, and in combination with C2 as well. The
+  paper's mean-preserving rationale does not transfer to a 17-parameter output
+  row trained for 6–8 epochs: dividing by the row mean pushes *more* step into
+  sign-unstable coordinates, which the high LR then amplifies.
+* **C2 alone is not worth shipping** — a single narrow setting gives −474 B on
+  the tuned control, comparable to sweep noise, and is neutral on the raw base.
+* **Layer scope matters:** layer 2 only. Layer 1 must be left on plain AdamW.
+* **Cold-set targeting is unsubstantiated** in the benchmark shapes; the
+  forced cold-set diagnostic shows warm sets benefit at least as much.
+
+## Caveats / reproduction
+
+* One seed per cell; no error bars. Effects below ~100 B are within
+  candidate-selection and quantization noise (the C2 arms all live there).
+* The gate starts at `|s|≈0`; with shrink-only this damps the first few touches
+  of a set. Cold sets with <10 touches never build a reliable sign EMA — one
+  reason cold-only gating is weaker.
+* `eps_i` statistics are taken from the same short gradient history used for
+  the update, exactly as in C2; β₂=0.999 bias correction is applied.
+* The big C3 gain is concentrated on libc1m; the text1m L1 cell regresses
+  slightly (+134 B). Portfolio-level total is still strongly positive, but a
+  per-corpus regression guard may be warranted.
+* All experiments used `-p mix`, CPU fitter (`-g off`), 1 MiB corpora, clang
+  Release. Rebuild + run:
+  ```sh
+  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang
+  cmake --build build -j1 && ctest --test-dir build --output-on-failure
+  LEVELS="1 5" CORPORA="text1m libc1m" ./sweep_eps.sh tune_base tune_c3_b09_p1s
+  ```
+  Reproduce the winning arm directly:
+  ```sh
+  TAW_LR0=0.055 TAW_LR1=0.00055 TAW_B1=0.95 TAW_B2=0.999 TAW_WD=1e-3 \
+  TAW_EPS_MODE=c3 TAW_SIGN_BETA=0.9 TAW_GATE_P=1 TAW_GATE_MODE=shrink \
+  build/tools/taw c -l 5 -p mix corpus input.aw
+  ```
