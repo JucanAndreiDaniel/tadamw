@@ -51,7 +51,7 @@ static void roundtrip_p(const uint8_t *src, size_t n, uint32_t bs,
 	void *dec;
 	size_t dec_n;
 	CHECK(taw_decompress(arc, arc_n, &dec, &dec_n) == TAW_OK);
-	CHECK(dec_n == n && memcmp(src, dec, n) == 0);
+	CHECK(dec_n == n && (n == 0 || memcmp(src, dec, n) == 0));
 	free(dec);
 	free(arc);
 }
@@ -59,6 +59,41 @@ static void roundtrip_p(const uint8_t *src, size_t n, uint32_t bs,
 static void roundtrip(const uint8_t *src, size_t n, uint32_t bs)
 {
 	roundtrip_p(src, n, bs, TAW_PREDICTOR_ORDER0);
+}
+
+/* Opt-in dynamic blocks; target 0 uses block_size, threshold 0 is ratio mode. */
+static void *compress_seek_dyn(const uint8_t *src, size_t n, uint32_t bs,
+    uint32_t target, uint32_t threshold, taw_predictor pred, size_t *arc_n)
+{
+	taw_params p = {.seekable = true, .block_size = bs, .predictor = pred,
+		.level = pred == TAW_PREDICTOR_MIX ? 1 : 0,
+		.dyn_blocks = true, .chunk_target = target,
+		.change_threshold = threshold};
+	void *arc;
+	REQUIRE(taw_compress(src, n, &p, &arc, arc_n) == TAW_OK);
+	return arc;
+}
+
+/* Index invariants of a dynamic archive (20-byte entries). */
+static void dyn_index_stats(const uint8_t *arc, size_t arc_n,
+    uint32_t *nblocks, uint64_t *sum, uint32_t *minlen, uint32_t *maxlen)
+{
+	const uint64_t ix = taw_rd64(arc + arc_n - 16);
+	const uint32_t nb = taw_rd32(arc + ix + 4);
+	*nblocks = nb;
+	*sum = 0;
+	*minlen = UINT32_MAX;
+	*maxlen = 0;
+	for (uint32_t i = 0; i < nb; i++) {
+		const uint8_t *e = arc + ix + 16 + 20 * (size_t)i;
+		const uint32_t rl = taw_rd32(e + 16);
+		CHECK(rl != 0 && taw_rd32(e + 8) <= rl);
+		*sum += rl;
+		if (rl < *minlen)
+			*minlen = rl;
+		if (rl > *maxlen)
+			*maxlen = rl;
+	}
 }
 
 /* Profile 1: one shared model, history reset per block. */
@@ -284,8 +319,206 @@ static void random_access(void)
 	free(src);
 }
 
+/* The default (flag off) path must be byte-identical to origin/main. */
+static void default_unchanged(void)
+{
+	static const uint32_t crc[TD_KINDS] = {0x2f4c13cc, 0x3f6480cc,
+		0x525c32a5, 0xa35c2865};
+	static const size_t sizes[TD_KINDS] = {914, 100464, 54968, 26977};
+	for (int kind = 0; kind < TD_KINDS; kind++) {
+		uint8_t src[100000];
+		td_fill(src, sizeof src, kind, 1234 + (uint64_t)kind);
+		size_t n;
+		void *arc = compress_seek_p(src, sizeof src, 4096,
+		    TAW_PREDICTOR_ORDER0, &n);
+		CHECK(n == sizes[kind]);
+		CHECK(taw_crc32c(0, arc, n) == crc[kind]);
+		taw_info info;
+		CHECK(taw_read_info(arc, n, &info) == TAW_OK &&
+		    !info.has_dyn_blocks);
+		free(arc);
+	}
+}
+
+static void dynamic_blocks(void)
+{
+	/* Roundtrips and index sums for every data kind and edge size. */
+	static const size_t sizes[] = {0, 1, 4095, 4096, 4097, 100000,
+		(1u << 20) + 123};
+	for (size_t k = 0; k < sizeof sizes / sizeof *sizes; k++) {
+		uint8_t *src = malloc(sizes[k] ? sizes[k] : 1);
+		REQUIRE(src);
+		for (int kind = 0; kind < TD_KINDS; kind++) {
+			td_fill(src, sizes[k], kind, 17 + (size_t)kind);
+			size_t arc_n;
+			void *arc = compress_seek_dyn(src, sizes[k], 4096, 4096, 0,
+			    TAW_PREDICTOR_ORDER0, &arc_n);
+			taw_info info;
+			CHECK(taw_read_info(arc, arc_n, &info) == TAW_OK);
+			CHECK(info.kind == TAW_KIND_SEEKABLE &&
+			    info.has_dyn_blocks && info.block_size == 4096);
+			uint32_t nb, mn, mx;
+			uint64_t sum;
+			dyn_index_stats(arc, arc_n, &nb, &sum, &mn, &mx);
+			CHECK(sum == sizes[k]);
+			/* variable, but never below min_len = target/4 nor
+			 * above max_len = 4*target */
+			CHECK(nb <= (sizes[k] ? (uint32_t)((sizes[k] + 1023) / 1024) : 0));
+			CHECK(nb >= (sizes[k] ? (uint32_t)((sizes[k] + 16383) / 16384) : 0));
+			void *dec;
+			size_t dec_n;
+			CHECK(taw_decompress(arc, arc_n, &dec, &dec_n) == TAW_OK);
+			CHECK(dec_n == sizes[k] &&
+			    memcmp(dec, src, sizes[k]) == 0);
+			free(dec);
+			free(arc);
+		}
+		free(src);
+	}
+
+	/* Boundaries grow over homogeneous content and shrink at changes. */
+	{
+		enum { SEG = 32768, N = 4 * SEG };
+		uint8_t *src = malloc(N);
+		REQUIRE(src);
+		td_fill(src, SEG, TD_TEXT, 1);
+		td_fill(src + SEG, 2 * SEG, TD_ZERO, 2);
+		td_fill(src + 3 * SEG, SEG, TD_RANDOM, 3);
+		size_t arc_n;
+		void *arc = compress_seek_dyn(src, N, 1u << 16, 32768, 0,
+		    TAW_PREDICTOR_ORDER0, &arc_n);
+		uint32_t nb, mn, mx;
+		uint64_t sum;
+		dyn_index_stats(arc, arc_n, &nb, &sum, &mn, &mx);
+		CHECK(sum == N);
+		CHECK(nb < (uint32_t)(N / 16384)); /* fewer than 8 fixed blocks */
+		CHECK(mx >= 2 * SEG);              /* the zero run is one block */
+		void *dec;
+		size_t dec_n;
+		CHECK(taw_decompress(arc, arc_n, &dec, &dec_n) == TAW_OK);
+		CHECK(dec_n == N && memcmp(dec, src, N) == 0);
+		free(dec);
+		free(arc);
+		free(src);
+	}
+
+	/* Profile 1: random access, serial and parallel, over variable blocks. */
+	{
+		enum { N = 600000, BS = 1 << 16 };
+		uint8_t *src = malloc(N), *buf = malloc(3 * BS);
+		REQUIRE(src && buf);
+		td_fill(src, N / 2, TD_TEXT, 21);
+		td_fill(src + N / 2, N - N / 2, TD_SKEWED, 22);
+		size_t arc_n;
+		void *arc = compress_seek_dyn(src, N, BS, 16384, 0,
+		    TAW_PREDICTOR_MIX, &arc_n);
+		taw_source mem;
+		taw_source_memory(&mem, arc, arc_n);
+		taw_seek *s;
+		REQUIRE(taw_seek_open(&mem, &s) == TAW_OK);
+		uint64_t r = 1234;
+		for (int t = 0; t < 120; t++) {
+			taw_seek_set_threads(s, t < 40 ? 1 : t < 80 ? 3 : 8);
+			uint64_t off = td_next(&r) % N;
+			size_t len = (size_t)(td_next(&r) % (2 * BS));
+			if (len > N - off)
+				len = N - off;
+			REQUIRE(taw_seek_read(s, off, buf, len) == TAW_OK);
+			CHECK(memcmp(buf, src + off, len) == 0);
+		}
+		taw_seek_close(s);
+		void *dec;
+		size_t dec_n;
+		CHECK(taw_decompress_mt(arc, arc_n, 4, &dec, &dec_n) == TAW_OK);
+		CHECK(dec_n == N && memcmp(dec, src, N) == 0);
+		free(dec);
+		free(arc);
+		free(buf);
+		free(src);
+	}
+
+	/* Directory, threshold mode, thread independence and index damage. */
+	{
+		enum { N = 200000, BS = 1 << 15 };
+		uint8_t *src = malloc(N);
+		REQUIRE(src);
+		td_fill(src, N / 2, TD_TEXT, 31);
+		td_fill(src + N / 2, N - N / 2, TD_SKEWED, 32);
+		const taw_file f[] = {{"/head", 0, N / 2},
+		    {"/tail", N / 2, N / 2 - 10}, {"/.meta", N - 10, 10}};
+		taw_params p = {.block_size = BS, .level = 1,
+			.predictor = TAW_PREDICTOR_MIX, .dyn_blocks = true,
+			.chunk_target = 8192, .threads = 1};
+		taw_buf a, b;
+		REQUIRE(encode_files(src, N, &p, f, 3, &a) == TAW_OK);
+		p.threads = 6;
+		REQUIRE(encode_files(src, N, &p, f, 3, &b) == TAW_OK);
+		CHECK(a.n == b.n && memcmp(a.p, b.p, a.n) == 0);
+		taw_buf_free(&b);
+
+		taw_source in;
+		taw_source_memory(&in, a.p, a.n);
+		taw_seek *s;
+		REQUIRE(taw_seek_open(&in, &s) == TAW_OK);
+		const taw_file *got;
+		CHECK(taw_seek_files(s, &got) == 3);
+		CHECK(taw_seek_find(s, "/.meta") == 2);
+		for (size_t i = 0; i < 3; i++) {
+			uint8_t *out = malloc((size_t)got[i].size);
+			REQUIRE(out);
+			CHECK(taw_seek_read(s, got[i].offset, out,
+			    (size_t)got[i].size) == TAW_OK);
+			CHECK(memcmp(out, src + got[i].offset, got[i].size) == 0);
+			free(out);
+		}
+		taw_seek_close(s);
+
+		/* Change-spike mode is deterministic and roundtrips too. */
+		p.threads = 1;
+		p.change_threshold = 250;
+		REQUIRE(encode_files(src, N, &p, f, 3, &b) == TAW_OK);
+		void *dec;
+		size_t dec_n;
+		CHECK(taw_decompress(b.p, b.n, &dec, &dec_n) == TAW_OK);
+		CHECK(dec_n == N && memcmp(dec, src, N) == 0);
+		free(dec);
+		taw_buf_free(&b);
+
+		/* A bogus raw_len (with the index CRC fixed up) is refused. */
+		const uint64_t ix = taw_rd64(a.p + a.n - 16);
+		uint8_t *e = a.p + ix + 16 + 20 * 3;
+		const uint32_t save = taw_rd32(e + 16);
+		taw_wr32(e + 16, save + 1);
+		taw_wr32(a.p + a.n - 8,
+		    taw_crc32c(0, a.p + ix, a.n - 16 - ix));
+		taw_source_memory(&in, a.p, a.n);
+		CHECK(taw_seek_open(&in, &s) == TAW_E_FORMAT);
+		taw_wr32(e + 16, save);
+		taw_wr32(a.p + a.n - 8,
+		    taw_crc32c(0, a.p + ix, a.n - 16 - ix));
+		CHECK(taw_seek_open(&in, &s) == TAW_OK);
+		taw_seek_close(s);
+		taw_buf_free(&a);
+
+		/* Invalid opt-in combinations. */
+		void *o;
+		size_t on;
+		taw_params bad = {.dyn_blocks = true};
+		CHECK(taw_compress(src, 100, &bad, &o, &on) == TAW_E_ARG);
+		bad = (taw_params){.seekable = true, .dyn_blocks = true,
+			.change_threshold = 257};
+		CHECK(taw_compress(src, 100, &bad, &o, &on) == TAW_E_ARG);
+		bad = (taw_params){.seekable = true, .dyn_blocks = true,
+			.chunk_target = 1u << 27};
+		CHECK(taw_compress(src, 100, &bad, &o, &on) == TAW_E_ARG);
+		free(src);
+	}
+}
+
 int main(void)
 {
+	default_unchanged();
+	dynamic_blocks();
 	roundtrip(nullptr, 0, 4096);
 	uint8_t one = 7;
 	roundtrip(&one, 1, 4096);

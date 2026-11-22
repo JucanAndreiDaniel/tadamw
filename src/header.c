@@ -34,9 +34,9 @@ taw_status taw_header_parse(const uint8_t *p, size_t n, taw_header *h)
 		return TAW_E_CHECKSUM;
 	if (p[4] != TAW_FORMAT_VERSION)
 		return TAW_E_UNSUPPORTED;
-	if ((p[9] & ~TAW_FLAG_FILES) || taw_rd16(p + 10) != 0)
+	if ((p[9] & ~TAW_FLAG_ALL) || taw_rd16(p + 10) != 0)
 		return TAW_E_UNSUPPORTED;
-	if ((p[9] & TAW_FLAG_FILES) && p[5] != TAW_KIND_AWSEEK)
+	if ((p[9] & TAW_FLAG_ALL) && p[5] != TAW_KIND_AWSEEK)
 		return TAW_E_UNSUPPORTED;
 	*h = (taw_header){
 		.kind = p[5],
@@ -83,6 +83,9 @@ taw_status taw_params_resolve(const taw_params *in, taw_params *out)
 	if (out->seekable &&
 	    (!is_pow2(out->block_size) || out->block_size < TAW_BLOCK_MIN ||
 		out->block_size > TAW_BLOCK_MAX))
+		return TAW_E_ARG;
+	if (out->dyn_blocks && (!out->seekable || out->chunk_target > TAW_CHUNK_MAX ||
+	    out->change_threshold > 256))
 		return TAW_E_ARG;
 	return TAW_OK;
 }

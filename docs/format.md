@@ -14,7 +14,7 @@ Two variants share one header and one model section:
 | extension | kind | purpose |
 |-----------|------|---------|
 | `.aw`     | 0    | stream: chunks are decoded strictly in order |
-| `.awseek` | 1    | seekable: independent fixed-size blocks + seek index |
+| `.awseek` | 1    | seekable: independent fixed-size or content-aligned blocks + seek index |
 
 ## 1. File header (32 bytes)
 
@@ -26,7 +26,7 @@ Two variants share one header and one model section:
 | 6   | 1    | arith_profile  | §2 |
 | 7   | 1    | quant          | §3 |
 | 8   | 1    | level          | encoder effort 1..9, informational |
-| 9   | 1    | flags          | bit 0: the awseek index has a file directory (§7.1); other bits `0` |
+| 9   | 1    | flags          | bit 0: awseek index has a file directory (§7.1); bit 1: awseek has variable-length blocks (§7.2); other bits `0` |
 | 10  | 2    | reserved       | must be `0` |
 | 12  | 4    | block_size     | awseek: raw bytes per block; aw: `0` |
 | 16  | 8    | model_size     | bytes in the model section |
@@ -34,12 +34,14 @@ Two variants share one header and one model section:
 | 28  | 4    | header_crc     | crc32c of bytes 0..27 |
 
 A decoder MUST refuse a file if any of these hold: wrong magic, unknown
-version or kind, a flag bit other than bit 0 (or bit 0 on an aw stream),
-non-zero reserved bytes, bad `header_crc` or
+version or kind, a flag bit other than 0 or 1 (or either flag bit on an aw
+stream), non-zero reserved bytes, bad `header_crc` or
 `model_crc`, or an unsupported `(arith_profile, quant)` pair. Decoders never
 fall back to a different arithmetic: an archive decodes exactly or not at all.
 
-For awseek, `block_size` MUST be a power of two in `[2^12, 2^30]`.
+For awseek, `block_size` MUST be a power of two in `[2^12, 2^30]`. With flag
+bit 1 it is the *nominal* block size used for fitting and for length bounds;
+actual block lengths are in the index (§7.2).
 
 ## 2. Arithmetic profiles
 
@@ -522,3 +524,44 @@ Rules (a decoder MUST refuse a directory that breaks one):
 - The directory must end exactly where the footer starts.
 
 Bytes outside every file are allowed but carry no name.
+
+### 7.2 Variable-length blocks (flag bit 1)
+
+Flag bit 1 is an **opt-in** extension. A default archive never sets it and is
+byte-identical to the fixed-block layout above. It only changes the container:
+`.aw` and the profile 0/1 arithmetic, model section and range coder are
+unchanged.
+
+With the flag set, the index entries are 20 bytes instead of 16:
+
+| size | field |
+|------|-------|
+| 8 | `u64 coded_offset` (absolute) |
+| 4 | `u32 coded_len` |
+| 4 | `u32 raw_crc` (crc32c of the decoded block) |
+| 4 | `u32 raw_len` (decoded bytes in this block) |
+
+`block_count` is no longer derived from `block_size`; it is the number of
+entries. A decoder MUST refuse an index whose entry sum is not
+`total_raw_len`, or that has an entry with `raw_len == 0`, `raw_len > 2^26`,
+`coded_len > raw_len`, or an out-of-range `coded_offset`. Block `i` covers raw
+bytes `[sum(raw_len[0..i-1]), sum(raw_len[0..i]))`; the same sums drive random
+access, so a seek reads exactly the blocks overlapping the requested range.
+`coded_len == raw_len` still means stored. `block_size` remains a power of two
+and is the nominal size used for model fitting.
+
+**Encoder boundary rule (deterministic).** A first pass computes, for each byte
+`x` with predecessor `c`, an order-1 surprise
+`256 - (((count[c][x]+1)<<16)/(total[c]+256) >> 8)`, where the saturating
+`uint16_t` counts are updated strictly in input order. Only deviations of that
+surprise from its EWMA (1/256), at least 8 on the 0..256 scale, count as
+*change*. A second pass places a boundary whenever the accumulated change
+reaches an equal share of the total (`total_change / ceil(total/target)`), or
+at a `change_threshold` spike when that knob is set, subject to
+`min_len = target/4` and `max_len = min(4*target, 2^26)`. Both passes read the
+source sequentially, so the archive does not depend on `threads`. `target`
+defaults to `block_size`; the CLI switches are `taw c -D -T N -C N` and
+`taw-nx enc -D -T N -C N`.
+
+The extension is a different flag, so a decoder that only knows §7 refuses
+such archives with `TAW_E_UNSUPPORTED` instead of misreading the index.
