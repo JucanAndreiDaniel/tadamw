@@ -1,0 +1,33 @@
+24 jobs
+A_lr0p02                       text1m  L1   190610  3.93s
+A_lr0p02                       libc1m  L1   388792  4.48s
+A_lr0p01                       text1m  L1   190215  3.61s
+A_lr0p02                       text1m  L5   187956  9.27s
+A_lr0p02                       libc1m  L5   385741  9.50s
+A_lr0p01                       libc1m  L1   387040  4.31s
+A_lr0p01                       text1m  L5   188080  8.97s
+A_lr0p005                      text1m  L1   189567  3.50s
+A_lr0p005                      libc1m  L1   385863  4.10s
+A_lr0p01                       libc1m  L5   385405  9.50s
+A_lr0p005                      text1m  L5   188528  9.31s
+A_lr0p003                      text1m  L1   189030  3.81s
+A_lr0p005                      libc1m  L5   385100  9.38s
+A_lr0p003                      libc1m  L1   385687  5.32s
+A_lr0p002                      text1m  L1   188984  4.77s
+A_lr0p003                      text1m  L5   188087  11.71s
+A_lr0p003                      libc1m  L5   384178  10.46s
+A_lr0p002                      libc1m  L1   385592  4.59s
+A_lr0p001                      text1m  L1   189217  3.74s
+A_lr0p002                      text1m  L5   188288  11.09s
+A_lr0p002                      libc1m  L5   384252  9.71s
+A_lr0p001                      libc1m  L1   385424  3.90s
+A_lr0p001                      text1m  L5   188741  9.20s
+A_lr0p001                      libc1m  L5   385007  9.91s
+Traceback (most recent call last):
+  File "/home/andrew/.local/share/opencode/worktree/8500c0/exp-lr-baseline/sweep.py", line 130, in <module>
+    main()
+    ~~~~^^
+  File "/home/andrew/.local/share/opencode/worktree/8500c0/exp-lr-baseline/sweep.py", line 126, in main
+    f.write("\t".join((*key, size, info, delta)) + "\n")
+            ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: sequence item 2: expected str instance, int found

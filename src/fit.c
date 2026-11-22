@@ -728,7 +728,11 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 	/* LR endpoints. Plain AdamW defaults to the shipped schedule; each
 	 * other component has its own knob so the two LRs can be tuned apart. */
 	const float lr0 = fit_env_float("TAW_LR0", 0.02f);
-	const float lr1 = fit_env_float("TAW_LR1", lr0 / 20.0f);
+	/* PR #7 convenience: TAW_LR1=flat keeps LR constant at TAW_LR0. */
+	const char *lr1s = getenv("TAW_LR1");
+	float lr1 = fit_env_float("TAW_LR1", lr0 / 20.0f);
+	if (lr1s && strcmp(lr1s, "flat") == 0)
+		lr1 = lr0;
 	const float vec_lr0 = fit_env_float("TAW_VEC_LR0", lr0);
 	const float vec_lr1 = fit_env_float("TAW_VEC_LR1", lr1);
 	const float m_lr0 = fit_env_float("TAW_MUON_LR0", 0.01f);

@@ -1,0 +1,13 @@
+4 jobs
+E_tuned_L9                     text1m  L9   182242  114.98s
+E_tuned_L9                     libc1m  L9   375602  117.45s
+E_baseline_L9                  text1m  L9   184211  113.58s
+E_baseline_L9                  libc1m  L9   378206  116.65s
+Traceback (most recent call last):
+  File "/home/andrew/.local/share/opencode/worktree/8500c0/exp-lr-baseline/sweep.py", line 143, in <module>
+    main()
+    ~~~~^^
+  File "/home/andrew/.local/share/opencode/worktree/8500c0/exp-lr-baseline/sweep.py", line 137, in main
+    delta = str(int(size) - BASE[key[1]][key[2]])
+                            ~~~~~~~~~~~~^^^^^^^^
+KeyError: 9
