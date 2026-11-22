@@ -181,6 +181,7 @@ typedef struct {
     uint32_t section_num;
     nca_fs_header_t *header;
     int is_decrypted;
+    int reencrypt; /* tadamw: the section's bytes in the file are plain; its raw storage reads them encrypted */
     uint64_t sector_size;
     uint64_t sector_mask;
     aes_ctx_t *aes; /* AES context for the section. */
@@ -223,6 +224,11 @@ typedef struct nca_ctx {
     int is_cli_target;
     int raw_only; /* ScarletNX: nca_process opens each section's raw storage (the decrypted bytes as the file lays
                      them out, an update's tables included) and reads no file system. */
+    /* tadamw: re-encryption (snx_hac_encrypt). header_bytes, when set, is the encrypted header nca_decrypt_header
+       reads instead of the file's (which holds the plain one); with reencrypt the sections in the file are plain
+       and each raw storage reads them as the original encrypted bytes. Needs raw_only. */
+    const unsigned char *header_bytes;
+    int reencrypt;
     enum nca_version format_version;
     validity_t fixed_sig_validity;
     validity_t npdm_sig_validity;

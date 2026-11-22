@@ -140,15 +140,18 @@ static storage_t *nca_section_open_aes_ctr_ex(nca_section_ctx_t *ctx, storage_t 
     }
     if (!bucket_tree_header_verify(header)) return NULL;
     nca_section_upper_iv(ctx, iv, 0, 0);
-    storage_t *tables = nca_section_chain(ctx, storage_sub_new(body, tables_offset, body->size - tables_offset));
-    tables = nca_section_chain(ctx, storage_aes_ctr_new(tables, ctx->aes, iv, ctx->offset + tables_offset));
+    storage_t *plain_tables = nca_section_chain(ctx, storage_sub_new(body, tables_offset, body->size - tables_offset));
+    storage_t *tables = nca_section_chain(ctx, storage_aes_ctr_new(plain_tables, ctx->aes, iv, ctx->offset + tables_offset));
+    /* tadamw: re-encrypting, the file's tables are plain already, so the tree loads from them as they are; AES-CTR
+       being its own inverse, the storages then read the plain bytes as the encrypted ones. */
+    storage_t *tree_source = ctx->reencrypt ? plain_tables : tables;
     storage_t *data = nca_section_chain(ctx, storage_sub_new(body, 0, tables_offset));
     bucket_tree_t *tree;
     if (header->entry_count == 0) {
         /* Ryubing's LibHac: an update may carry no AesCtrEx entries. */
         tree = bucket_tree_empty(0);
     } else {
-        tree = bucket_tree_load(tables, ctr_ex_offset - tables_offset, body->size - ctr_ex_offset, AES_CTR_EX_ENTRY_SIZE, (uint32_t)header->entry_count);
+        tree = bucket_tree_load(tree_source, ctr_ex_offset - tables_offset, body->size - ctr_ex_offset, AES_CTR_EX_ENTRY_SIZE, (uint32_t)header->entry_count);
     }
     if (tree == NULL) return NULL;
     storage_t *ctr_ex = nca_section_chain(ctx, storage_aes_ctr_ex_new(data, ctx->aes, iv, ctx->offset, tree));
@@ -158,6 +161,10 @@ static storage_t *nca_section_open_aes_ctr_ex(nca_section_ctx_t *ctx, storage_t 
 /* The decrypted section, without any update applied. */
 static int nca_section_open_raw(nca_section_ctx_t *ctx) {
     storage_t *body;
+    if (ctx->reencrypt && (ctx->header->sparse_info.generation != 0 || ctx->crypt_type == CRYPT_NCA0)) {
+        fprintf(stderr, "Section %"PRId32" (sparse or NCA0) cannot be re-encrypted!\n", ctx->section_num);
+        return 0;
+    }
     if (ctx->header->sparse_info.generation != 0 && ctx->crypt_type != CRYPT_NCA0) {
         body = nca_section_open_sparse(ctx);
     } else {
@@ -175,7 +182,8 @@ static int nca_section_open_raw(nca_section_ctx_t *ctx) {
         }
         switch (ctx->crypt_type) {
             case CRYPT_XTS:
-                raw = nca_section_chain(ctx, storage_aes_xts_new(body, ctx->aes, 0x200, 0));
+                raw = nca_section_chain(ctx, ctx->reencrypt ? storage_aes_xts_encrypt_new(body, ctx->aes, 0x200, 0)
+                                                             : storage_aes_xts_new(body, ctx->aes, 0x200, 0));
                 break;
             case CRYPT_NCA0:
                 /* NCA0 numbers its XTS sectors from the end of the header. */
@@ -453,6 +461,7 @@ void nca_process(nca_ctx_t *ctx) {
         if (ctx->header.section_entries[i].media_start_offset) { /* Section exists. */
             ctx->section_contexts[i].is_present = 1;
             ctx->section_contexts[i].is_decrypted = ctx->is_decrypted;
+            ctx->section_contexts[i].reencrypt = ctx->reencrypt;
             ctx->section_contexts[i].tool_ctx = ctx->tool_ctx;
             ctx->section_contexts[i].file = ctx->file;
             ctx->section_contexts[i].base_offset = ctx->base_offset;
@@ -594,9 +603,14 @@ void nca_process(nca_ctx_t *ctx) {
 
 /* Decrypt NCA header, left as the file has it: little-endian. */
 static int nca_decrypt_header_le(nca_ctx_t *ctx) {
-    fseeko64(ctx->file, ctx->base_offset, SEEK_SET);
-    
-    size_t read_size = fread(&ctx->header, 1, 0xC00, ctx->file);
+    size_t read_size;
+    if (ctx->header_bytes != NULL) { /* tadamw: the re-encrypted header, the file holding the plain one */
+        memcpy(&ctx->header, ctx->header_bytes, 0xC00);
+        read_size = 0xC00;
+    } else {
+        fseeko64(ctx->file, ctx->base_offset, SEEK_SET);
+        read_size = fread(&ctx->header, 1, 0xC00, ctx->file);
+    }
     
     if (read_size != 0xC00 && read_size != 0xA00) {
         fprintf(stderr, "Failed to read NCA header!\n");

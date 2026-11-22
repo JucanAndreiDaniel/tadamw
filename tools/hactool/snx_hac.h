@@ -101,6 +101,14 @@ int snx_hac_plain(SnxHac* hac, FILE* file, uint64_t offset, uint64_t size, unsig
    (the header's IV, its bytes reversed): 0, or -1 when prod.keys has no xci_header_key */
 int snx_hac_xci_info(SnxHac* hac, const unsigned char iv[16], const unsigned char plain[0x70], unsigned char out[0x70]);
 
+/* tadamw: the inverse of snx_hac_plain (snx_hac.c): the plain NCA at [offset, offset + size) of file, as
+   snx_hac_plain wrote it from an encrypted one, encrypted again into write, in order. 0, else -1 with why in
+   snx_hac_message. The result can differ from the original only for an NCA2 with unused FS headers: compare */
+int snx_hac_encrypt(SnxHac* hac, FILE* file, uint64_t offset, uint64_t size,
+                    int (*write)(const void* bytes, size_t size, void* data), void* data);
+/* tadamw: a ticket's title key (a common ticket's) into the keyset: 1 given, 0 personalized, -1 not a ticket */
+int snx_hac_ticket_key(SnxHac* hac, const unsigned char* data, size_t size);
+
 /* tick(written, data) as hactool writes the extraction, written the bytes so far */
 void snx_hac_progress(void (*tick)(uint64_t written, void* data), void* data);
 /* cleanup(data) before an exit hactool takes on a dump it cannot read, which ends the process */

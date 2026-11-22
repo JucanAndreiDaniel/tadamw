@@ -65,6 +65,8 @@ storage_t *storage_switch_new(storage_t *low, uint64_t split, storage_t *high);
 storage_t *storage_aes_ctr_new(storage_t *base, aes_ctx_t *aes, const unsigned char upper_iv[8], uint64_t counter_offset);
 /* Sector n of the storage is XTS sector first_sector + n. */
 storage_t *storage_aes_xts_new(storage_t *base, aes_ctx_t *aes, uint64_t sector_size, uint64_t first_sector);
+/* tadamw: reads base's plain sectors XTS-encrypted. */
+storage_t *storage_aes_xts_encrypt_new(storage_t *base, aes_ctx_t *aes, uint64_t sector_size, uint64_t first_sector);
 /* The storages below take ownership of their tree. */
 storage_t *storage_aes_ctr_ex_new(storage_t *base, aes_ctx_t *aes, const unsigned char upper_iv[8], uint64_t counter_offset, bucket_tree_t *tree);
 storage_t *storage_indirect_new(storage_t *original, storage_t *patch, bucket_tree_t *tree);

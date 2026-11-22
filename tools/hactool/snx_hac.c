@@ -611,6 +611,45 @@ static int plain_keys(SnxHac *hac, const nca_ctx_t *nca) {
     return 0;
 }
 
+/* the bytes of an NCA after its header, through each section's raw storage where a section lies and as the file
+   has them between (snx_hac_plain and snx_hac_encrypt): 0, or -1 said */
+static int sections_write(nca_ctx_t *nca, FILE *file, uint64_t offset, uint64_t size, unsigned char *buffer,
+                          int (*write)(const void *, size_t, void *), void *data) {
+    uint64_t at = 0xC00;
+    for (;;) { /* the sections in the order they lie, the bytes between them as they are */
+        nca_section_ctx_t *next = NULL;
+        for (unsigned int i = 0; i < 4; i++) {
+            nca_section_ctx_t *s = &nca->section_contexts[i];
+            if (s->is_present && s->offset >= at && (!next || s->offset < next->offset)) next = s;
+        }
+        uint64_t end = next ? next->offset : size;
+        if (end > size) end = size;
+        if (plain_copy(file, offset + at, end - at, buffer, write, data)) return -1;
+        at = end;
+        if (!next) break;
+        if (!next->raw_storage || next->size > size - next->offset) {
+            snx_hac_fprintf(stderr, "Section %"PRIu32" cannot be read\n", next->section_num);
+            return -1;
+        }
+        for (uint64_t done_bytes = 0; done_bytes < next->size;) {
+            uint64_t left = next->size - done_bytes;
+            size_t chunk = left < PLAIN_CHUNK ? (size_t)left : PLAIN_CHUNK;
+            if (!storage_read(next->raw_storage, done_bytes, buffer, chunk)) {
+                snx_hac_fprintf(stderr, "Section %"PRIu32" cannot be read at 0x%"PRIx64"\n", next->section_num,
+                                done_bytes);
+                return -1;
+            }
+            if (write(buffer, chunk, data)) {
+                snx_hac_fprintf(stderr, "Cannot write the plain NCA\n");
+                return -1;
+            }
+            done_bytes += chunk;
+        }
+        at += next->size;
+    }
+    return 0;
+}
+
 int snx_hac_plain(SnxHac *hac, FILE *file, uint64_t offset, uint64_t size, unsigned char *header,
                   int (*write)(const void *, size_t, void *), void *data, int *plain) {
     unsigned char raw[0xC00];
@@ -678,7 +717,6 @@ int snx_hac_plain(SnxHac *hac, FILE *file, uint64_t offset, uint64_t size, unsig
     nca_process(nca); /* the header again, then each section's raw storage */
     {
         nca_header_t copy = nca->header;
-        uint64_t at = 0xC00;
         nca_header_swap(&copy);
         if (!(buffer = malloc(PLAIN_CHUNK))) {
             snx_hac_fprintf(stderr, "Out of memory\n");
@@ -688,37 +726,7 @@ int snx_hac_plain(SnxHac *hac, FILE *file, uint64_t offset, uint64_t size, unsig
             snx_hac_fprintf(stderr, "Cannot write the plain NCA\n");
             goto done;
         }
-        for (;;) { /* the sections in the order they lie, the bytes between them as they are */
-            nca_section_ctx_t *next = NULL;
-            for (unsigned int i = 0; i < 4; i++) {
-                nca_section_ctx_t *s = &nca->section_contexts[i];
-                if (s->is_present && s->offset >= at && (!next || s->offset < next->offset)) next = s;
-            }
-            uint64_t end = next ? next->offset : size;
-            if (end > size) end = size;
-            if (plain_copy(file, offset + at, end - at, buffer, write, data)) goto done;
-            at = end;
-            if (!next) break;
-            if (!next->raw_storage || next->size > size - next->offset) {
-                snx_hac_fprintf(stderr, "Section %"PRIu32" cannot be read\n", next->section_num);
-                goto done;
-            }
-            for (uint64_t done_bytes = 0; done_bytes < next->size;) {
-                uint64_t left = next->size - done_bytes;
-                size_t chunk = left < PLAIN_CHUNK ? (size_t)left : PLAIN_CHUNK;
-                if (!storage_read(next->raw_storage, done_bytes, buffer, chunk)) {
-                    snx_hac_fprintf(stderr, "Section %"PRIu32" cannot be read at 0x%"PRIx64"\n", next->section_num,
-                                    done_bytes);
-                    goto done;
-                }
-                if (write(buffer, chunk, data)) {
-                    snx_hac_fprintf(stderr, "Cannot write the plain NCA\n");
-                    goto done;
-                }
-                done_bytes += chunk;
-            }
-            at += next->size;
-        }
+        if (sections_write(nca, file, offset, size, buffer, write, data)) goto done;
     }
     rc = 0;
 done:
@@ -740,4 +748,112 @@ int snx_hac_xci_info(SnxHac *hac, const unsigned char iv[16], const unsigned cha
     aes_encrypt(aes, out, plain, 0x70);
     free_aes_ctx(aes);
     return 0;
+}
+
+/* ------------------------------------------------------------------ tadamw: an NCA encrypted again */
+
+/* tadamw: the inverse of snx_hac_plain. [offset, offset + size) of file holds a plain NCA as snx_hac_plain wrote it
+   from an encrypted one (not one that was plain already); write takes the encrypted NCA in order. The header is
+   encrypted under header_key the way nca_decrypt_header decrypts it; then hactool derives the section keys from
+   that header as it always does, and each section's raw storage, built over the plain bytes, reads them encrypted:
+   AES-CTR and AES-CTR-EX are their own inverses (an update's tree loads from its plain tables), and XTS sections go
+   through the encrypting XTS storage. An NCA2 header whose unused FS headers decrypt to zeros cannot come back
+   exactly; callers compare against the original (the transcoder does). 0, else -1 with why in snx_hac_message */
+int snx_hac_encrypt(SnxHac *hac, FILE *file, uint64_t offset, uint64_t size,
+                    int (*write)(const void *, size_t, void *), void *data) {
+    unsigned char plain[0xC00], enc[0xC00];
+    unsigned char *buffer = NULL;
+    hactool_ctx_t *tool = NULL;
+    nca_ctx_t *nca = NULL;
+    aes_ctx_t *xts;
+    int rc = -1;
+    io.message[0] = 0;
+    if (size < sizeof plain || fseeko64(file, (int64_t)offset, SEEK_SET) ||
+        fread(plain, 1, sizeof plain, file) != sizeof plain) {
+        snx_hac_fprintf(stderr, "The NCA is shorter than its 0xC00-byte header\n");
+        return -1;
+    }
+    if (!plain_already(plain) || !memcmp(plain + 0x200, "DNCA", 4)) {
+        snx_hac_fprintf(stderr, "Not a plain NCA3 or NCA2\n");
+        return -1;
+    }
+    xts = new_aes_ctx(hac->tool.settings.keyset.header_key, 32, AES_MODE_XTS);
+    if (!memcmp(plain + 0x200, "NCA3", 4)) {
+        aes_xts_encrypt(xts, enc, plain, 0xC00, 0, 0x200);
+    } else { /* NCA2: the FS headers each as sector 0 */
+        aes_xts_encrypt(xts, enc, plain, 0x400, 0, 0x200);
+        for (unsigned int i = 0; i < 4; i++)
+            aes_xts_encrypt(xts, enc + 0x400 + 0x200 * i, plain + 0x400 + 0x200 * i, 0x200, 0, 0x200);
+    }
+    free_aes_ctx(xts);
+    tool = calloc(1, sizeof *tool);
+    nca = calloc(1, sizeof *nca);
+    if (!tool || !nca) {
+        snx_hac_fprintf(stderr, "Out of memory\n");
+        goto done;
+    }
+    tool->settings = hac->tool.settings;
+    tool->action = 0;
+    nca_init(nca);
+    nca->tool_ctx = tool;
+    nca->file = file;
+    nca->base_offset = offset;
+    nca->file_size = (size_t)size;
+    nca->header_bytes = enc;
+    if (!nca_decrypt_header(nca)) {
+        snx_hac_fprintf(stderr, "Its header cannot be read back: prod.keys' header_key is missing or wrong\n");
+        goto done;
+    }
+    for (unsigned int i = 0; i < 4; i++)
+        if (nca->header.section_entries[i].media_start_offset && nca->header.fs_headers[i].sparse_info.generation) {
+            snx_hac_fprintf(stderr, "Section %u is sparse, which has no plain form\n", i);
+            goto done;
+        }
+    if (plain_keys(hac, nca)) goto done;
+    if (!(buffer = malloc(PLAIN_CHUNK))) {
+        snx_hac_fprintf(stderr, "Out of memory\n");
+        goto done;
+    }
+    nca->raw_only = 1;
+    nca->reencrypt = 1;
+    nca_process(nca);
+    if (write(enc, sizeof enc, data)) {
+        snx_hac_fprintf(stderr, "Cannot write the encrypted NCA\n");
+        goto done;
+    }
+    if (sections_write(nca, file, offset, size, buffer, write, data)) goto done;
+    rc = 0;
+done:
+    if (nca) nca_free_section_contexts(nca);
+    if (nca) memset(nca, 0, sizeof *nca); /* its keys */
+    if (tool) memset(tool, 0, sizeof *tool);
+    memset(enc, 0, sizeof enc);
+    free(nca);
+    free(tool);
+    free(buffer);
+    return rc;
+}
+
+/* tadamw: a ticket's title key into the keyset, as ScarletNX's driver reads tickets (container.c): common tickets,
+   whose key is stored as is. 1 when it gave one, 0 for a personalized ticket (its key is RSA-encrypted), -1 for
+   data that is not a ticket */
+int snx_hac_ticket_key(SnxHac *hac, const unsigned char *data, size_t size) {
+    size_t offset;
+    uint32_t sig;
+    if (size < 4) return -1;
+    sig = (uint32_t)data[0] | (uint32_t)data[1] << 8 | (uint32_t)data[2] << 16 | (uint32_t)data[3] << 24;
+    switch (sig) {
+        case 0x10000u:
+        case 0x10003u: offset = 4 + 0x200 + 0x3c; break;
+        case 0x10001u:
+        case 0x10004u: offset = 4 + 0x100 + 0x3c; break;
+        case 0x10002u:
+        case 0x10005u: offset = 4 + 0x3c + 0x40; break;
+        case 0x10006u: offset = 4 + 0x14 + 0x28; break;
+        default: return -1;
+    }
+    if (size < offset + 0x170) return -1;
+    if (data[offset + 0x141]) return 0;
+    snx_hac_add_title_key(hac, data + offset + 0x160, data + offset + 0x40);
+    return 1;
 }

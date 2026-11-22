@@ -450,6 +450,7 @@ typedef struct {
     aes_ctx_t *aes;
     uint64_t sector_size;
     uint64_t first_sector;
+    int encrypt; /* tadamw: read the inner (plain) sectors encrypted */
 } aes_xts_storage_t;
 
 #define XTS_CHUNK 0x100000 /* a multiple of every sector size */
@@ -478,7 +479,10 @@ static int aes_xts_storage_read(storage_t *storage, uint64_t offset, void *buffe
         }
         ok = storage_read(s->inner, start, chunk, length);
         if (!ok) break;
-        aes_xts_decrypt(s->aes, chunk, chunk, length, s->first_sector + sector, s->sector_size);
+        if (s->encrypt)
+            aes_xts_encrypt(s->aes, chunk, chunk, length, s->first_sector + sector, s->sector_size);
+        else
+            aes_xts_decrypt(s->aes, chunk, chunk, length, s->first_sector + sector, s->sector_size);
         uint64_t used = want - skip;
         memcpy(out, chunk + skip, used);
         out += used;
@@ -495,6 +499,17 @@ storage_t *storage_aes_xts_new(storage_t *base, aes_ctx_t *aes, uint64_t sector_
     s->aes = aes;
     s->sector_size = sector_size;
     s->first_sector = first_sector;
+    return &s->base;
+}
+
+/* tadamw: the inverse of storage_aes_xts_new, for re-encrypting plain sectors. */
+storage_t *storage_aes_xts_encrypt_new(storage_t *base, aes_ctx_t *aes, uint64_t sector_size, uint64_t first_sector) {
+    aes_xts_storage_t *s = storage_alloc(sizeof(*s), base->size, aes_xts_storage_read, NULL);
+    s->inner = base;
+    s->aes = aes;
+    s->sector_size = sector_size;
+    s->first_sector = first_sector;
+    s->encrypt = 1;
     return &s->base;
 }
 

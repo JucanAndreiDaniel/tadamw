@@ -1,3 +1,25 @@
+# hactool, as tadamw's taw-nx uses it
+
+Copied from ScarletNX (`src/nx/runtime/driver/hactool` at ScarletNX commit `3f9639452`), which carries SciresM's
+hactool with ScarletNX's changes; ScarletNX's notes follow below. Licenses: hactool's own code is ISC
+([LICENSE](LICENSE)), ConvertUTF is under the Unicode license (notice in its files), `storage.c`/`storage.h` port
+LibHac's storages (MIT, notice in `storage.c`), and ScarletNX's and tadamw's changes are GPL-3.0-or-later, the
+license of tadamw as a whole (`../../LICENSE`).
+
+tadamw's changes, each marked `tadamw:` in the code:
+
+- `snx_hac_encrypt` (`snx_hac.c`): the inverse of `snx_hac_plain`, to give back an encrypted NCA from its plain
+  form. The header is encrypted under `header_key` the way `nca_decrypt_header` decrypts it; hactool then derives
+  the section keys as usual (`nca.c`: `header_bytes`, `reencrypt`), and each section's raw storage, built over the
+  plain bytes, reads them encrypted: AES-CTR and AES-CTR-EX are their own inverses (an update's bucket tree loads
+  from its plain tables), and XTS sections go through `storage_aes_xts_encrypt_new` (`storage.c`).
+- `snx_hac_ticket_key` (`snx_hac.c`): a common ticket's title key into the keyset, as ScarletNX's driver reads
+  tickets (`container.c`).
+- `zbic_stub.c`: ScarletNX's ZBIC NSO compression answered "no", as the transcoder never decompresses NSOs (it
+  would otherwise pull in zstd). `common/utilities/` holds the few ScarletNX headers the copy includes.
+
+---
+
 # hactool, as scarletnx --extract runs it
 
 [hactool](https://github.com/SciresM/hactool) by SciresM, from commit `1d64a83450e025622f3468c28fc4164dad2c5ef6`
