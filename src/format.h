@@ -11,7 +11,9 @@ constexpr uint8_t TAW_KIND_AW = 0;
 constexpr uint8_t TAW_KIND_AWSEEK = 1;
 
 constexpr uint8_t TAW_PROFILE_INT_ORDER0 = 0;
-constexpr uint8_t TAW_PROFILE_F32_STRICT_MIX = 1; /* reserved */
+constexpr uint8_t TAW_PROFILE_F32_STRICT_MIX = 1;
+/* H-Net boundary feature: profile 1 plus one integer boundary input (§2.14). */
+constexpr uint8_t TAW_PROFILE_HNET_BOUNDARY = 14;
 
 constexpr uint8_t TAW_QUANT_NONE = 0;
 constexpr uint8_t TAW_QUANT_F16 = 1;

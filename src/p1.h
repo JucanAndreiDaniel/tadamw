@@ -19,7 +19,9 @@
 enum {
 	P1_NCM = 12,     /* context models (each gives two inputs) */
 	P1_NCTX = 25,    /* context-model inputs: 2 per model + match */
-	P1_F = 26,       /* mixer inputs: P1_NCTX + bias */
+	P1_F = 26,       /* mixer inputs in profile 1: P1_NCTX + bias */
+	P1_F_HNET = 27,  /* profile 14: profile 1 plus the boundary input */
+	P1_FMAX = 27,    /* widest mixer row built here */
 	P1_NHASH = 10,   /* hashed context models (all but o0, o1) */
 	P1_HMAX = 32,    /* max hidden units */
 	P1_MODEL_HEAD = 8,
@@ -161,13 +163,15 @@ static inline uint32_t p1_sel_value(unsigned sel, const p1_sel_ctx *sc)
 
 /* ---- the frozen network -------------------------------------------------- */
 
-/* Mixer input vectors are P1_XPAD floats: x[0..P1_F-1] then zeros, so
- * that SIMD kernels may read whole vectors. */
+/* Mixer input vectors are P1_XPAD floats: x[0..f-1] then zeros, so that
+ * SIMD kernels may read whole vectors. f is P1_F (profile 1) or P1_F_HNET
+ * (profile 14). */
 enum { P1_XPAD = 32 };
 
 typedef struct p1_net p1_net;
 struct p1_net {
 	p1_shape s;
+	unsigned f;    /* mixer inputs: P1_F or P1_F_HNET */
 	unsigned hpad; /* hidden rounded up to 8 */
 	unsigned w2s;  /* output-layer row stride: hpad, or P1_XPAD if H = 0 */
 	float *w1;     /* [S1][P1_F][hpad], transposed, zero padded */
@@ -178,13 +182,23 @@ struct p1_net {
 	    const float *w2);
 };
 
-/* Bytes the weight payload needs for a shape and quant format. */
-uint64_t p1_weights_size(const p1_shape *s, uint8_t quant);
+/* Bytes the weight payload needs for a shape, quant format and row width. */
+uint64_t p1_weights_size_ex(const p1_shape *s, uint8_t quant, unsigned f);
+static inline uint64_t p1_weights_size(const p1_shape *s, uint8_t quant)
+{
+	return p1_weights_size_ex(s, quant, P1_F);
+}
 bool p1_quant_supported(uint8_t quant);
 
-/* Parse a model section (header + weights) and dequantize it. */
-taw_status p1_net_load(p1_net *n, uint8_t quant, const uint8_t *model,
-    size_t size);
+/* Parse a model section (header + weights) and dequantize it. The _ex form
+ * chooses the mixer width; profile 1 uses p1_net_load (f = P1_F). */
+taw_status p1_net_load_ex(p1_net *n, uint8_t quant, const uint8_t *model,
+    size_t size, unsigned f);
+static inline taw_status p1_net_load(p1_net *n, uint8_t quant,
+    const uint8_t *model, size_t size)
+{
+	return p1_net_load_ex(n, quant, model, size, P1_F);
+}
 void p1_net_free(p1_net *n);
 /* Stretch-domain output, [-2047, 2047]. x has P1_XPAD entries,
  * x[P1_IN_BIAS] = 1 and x[P1_F..] = 0. */
@@ -231,6 +245,26 @@ void p1_ctx_tail(p1_ctx *c, int bit);
 #define P1_BOUNDARY_BITS 0x198u
 void p1_ctx_boundary(p1_ctx *c, int bit);
 extern const uint16_t p1_squash_knot[33];
+
+/* ---- APM stages (shared by profile 1 and profile 14) --------------------- */
+
+/* Tables and the one-entry update of format.md §2.2.9. Keeping one copy
+ * guarantees the two profiles refine probabilities identically. */
+void p1_apm_reset(uint16_t apm1[256 * 33], uint16_t *apm2);
+static inline uint32_t p1_apm_p(const uint16_t *t, size_t row, int32_t s12,
+    uint32_t *upd)
+{
+	uint32_t u = (uint32_t)(s12 + 2048);
+	uint32_t lo = u >> 7, w = u & 127;
+	const uint16_t *r = t + row * 33;
+	*upd = (uint32_t)(row * 33) + lo + (w >> 6);
+	return (r[lo] * (128 - w) + r[lo + 1] * w) >> 7;
+}
+static inline void p1_apm_update(uint16_t *e, int bit)
+{
+	*e = bit ? (uint16_t)(*e + ((65535u - *e) >> P1_APM_RATE))
+		 : (uint16_t)(*e - (*e >> P1_APM_RATE));
+}
 
 /* The whole per-bit loop with the AVX2 kernels fused (p1_run_avx2.c):
  * the same bits as the generic loop in predictor.c. */

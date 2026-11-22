@@ -172,3 +172,152 @@ the leader's small W2 LR.
   implemented there. Memory overhead is `O(m+n)` extra floats per matrix,
   plus one scalar for MALTER; compute is one NS pass plus row/column sums,
   i.e. essentially Muon's cost.
+
+## H-Net boundary feature (profile 14) — branch `exp/hnet-feature`
+
+Rebased onto `origin/main` `1aa3dd7`. New arithmetic profile **14**
+`HNET_BOUNDARY`, CLI `-p hnet`, public predictor `TAW_PREDICTOR_HNET`.
+
+### 1. Design
+
+H-Net's dynamic chunking ([arXiv:2507.07955](https://arxiv.org/abs/2507.07955))
+scores a boundary by the dissimilarity of adjacent context representations,
+`p_t = ½(1 − cos(q_t, k_{t−1}))`. This profile keeps that one idea but builds
+the signal entirely from tadamw's existing integer context state: no libm, no
+cosine, no extra learned weights, no extra archived fields.
+
+* **Sampled representation.** Four stretched estimates that profile 1 already
+  computes: `st[0]` (o0), `st[1]` (o1), `st[7]` (word), `st[24]` (match).
+  `x[i] = st[i]/256` is exact in binary32, so `u[j] = x[P[j]] * 256` recovers
+  the integer stretch value with no rounding.
+* **Sampling instant.** Once per byte, on the inputs of `bitpos = 7` (last bit
+  of the byte), before that bit is coded. The value is held for that bit and
+  the first seven bits of the next byte, so it spans the byte-to-byte
+  transition. Sampling at `bitpos = 0` instead (`c0 = 1`, a near-constant o0
+  context) was measured first and was clearly worse: it cost 243/29/16/108
+  bytes against the new baseline on text1m L1/L5 and libc1m L1/L5.
+* **Score.** With `prev[4]` the previous sample (zero at a coding-unit start),
+
+  ```
+  d[j] = |u[j] − prev[j]|;  s = Σ d[j];  b = min(s, 4*2*2047 = 16376);  prev = u
+  x[26] = b/256   (exact; b is a non-negative integer in stretch units)
+  ```
+
+  Four subtractions, four absolute values and one clamp per byte. `b` lives
+  in decoder state and is reset with the context state per coding unit
+  (whole `.aw` stream, each `.awseek` block).
+* **Mixer.** Profile 1's frozen MLP with `F = 27` instead of 26: the same
+  direct inputs, the same bias at `x[25]`, the same fixed `dot4` order,
+  hidden clamp ±8, output clamp ±2047/256, integer squash and the same two
+  APM stages. No new selector, table or weight format; only the weight rows
+  are one element wider (27 instead of 26).
+* **Feature pass.** `fit.c` calls the same `phnet_boundary()` on the same
+  first-of-byte inputs, so the fitter trains on exactly the signal the decoder
+  sees; `tests/test_hnet.c` checks this bit for bit, including after a
+  coding-unit reset.
+
+Rationale, why the last bit rather than the first, and the full arithmetic are
+in `docs/format.md` §2.14/§5.1 and `docs/design.md` "H-Net boundary profile".
+
+### 2. Format and implementation additions
+
+| item | addition |
+|------|----------|
+| header | `arith_profile = 14` (`TAW_PROFILE_HNET_BOUNDARY`); same header and model-section layout as profile 1 |
+| model head | identical 8 bytes; reserved bytes 6–7 must be zero |
+| weight rows | `len = 27` for layer-1 rows and for the single-layer output row; quant formats unchanged (F16, Q8, Q4, Q2, FP8, NVFP4, IQ8, IQ4, IQ2) |
+| loader | width is derived from `arith_profile`; a 26-wide payload under 14 (or 27-wide under 1) is `TAW_E_FORMAT`; all existing head/quant checks apply |
+| state | `prev[4] = 0`, `b = 0` at each coding-unit reset; `b` constant within a byte |
+| files | `src/phnet.{h,c}` (new), `src/p1.{h}`/`p1_net.c` (parameterised row width, shared APM), `src/predictor.c`, `src/fit.c`, `src/fit_internal.h`, `src/format.h`, `include/tadamw/tadamw.h`, `src/header.c`, `tools/taw.c`, `src/CMakeLists.txt` |
+| tests | `tests/test_hnet.c` (new), registered in `tests/CMakeLists.txt` |
+
+**SIMD note.** The fused AVX2 per-bit loop (`p1_run_avx2.c`) and the AVX2 /
+AVX-512 mixer kernels (`p1_simd_out.h` has `static_assert(P1_F == 26)`)
+hardcode `F = 26`. Profile 14 therefore dispatches to the **scalar mixer and
+the generic per-bit loop** on every CPU. The context-model kernels are shared
+and bit-identical, and ISA-forcing tests confirm the same archive bytes from
+each ISA; no new SIMD kernel was added.
+
+GPU fitting is not available for the wider rows: `-g auto` silently fits on
+the CPU and `-g on` with `-p hnet` returns `TAW_E_ARG`.
+
+### 3. Results
+
+Corpora and baseline archives are the read-only `/tmp/opencode/tadamw-bench`
+set (1 MiB `text1m`, 1 MiB `libc1m`). Bytes are primary; encode/decode times
+were taken best-of-3 for decode with the same clang Release build. The "new
+baseline" is profile 1 at `e64cc83`; "entropy gate" is sibling profile 11 as
+given in the task.
+
+| profile / level | text1m | Δ vs new base | libc1m | Δ vs new base | sum |
+|-----------------|-------:|--------------:|-------:|--------------:|----:|
+| new baseline 1 / 5 | 181557 / 179166 | — | 379197 / 375291 | — | 1115211 |
+| entropy gate 11, 1 / 5 | 181473 / 179098 | −84 / −68 | 378070 / 374705 | −1127 / −586 | 1113346 |
+| **hnet 14, 1 / 5** | **181307 / 179426** | **−250 / +260** | **377294 / 371256** | **−1903 / −4035** | **1109283** |
+
+* Total: **−5928 bytes (−0.53 %)** versus the new baseline; **4063 bytes
+  better than the entropy-gate profile** on the same four points.
+* Wins on text L1 (−0.14 %), libc L1 (−0.50 %) and libc L5 (−1.08 %); loses
+  on text L5 (+0.15 %). Model section grew from 608 to 624 bytes (wider
+  rows) in all four runs.
+* `.awseek` sanity check with 64 KiB blocks (16 independent units): profile 14
+  229421 / 422506 bytes versus profile 1 229962 / 422664 bytes for
+  text1m / libc1m at level 1 (−541 / −158), with the per-block boundary reset
+  exercised.
+
+Timing (same machine, other agents benchmarking concurrently, so relative
+only): profile 14 encode ≈ 9 s (L1) / 19–21 s (L5) and decode ≈ 6 s per MiB,
+versus ≈ 1.8 s / 7.4 s and ≈ 0.9 s for the fused profile 1. This is the cost
+of the generic loop, not of the boundary arithmetic itself.
+
+### Correctness / verification
+
+* Rebased onto upstream `origin/main` `1aa3dd7` (merged PRs #3 MALTER and
+  #4 Muon). Upstream's optimizer code and bench results are kept verbatim;
+  only the optimizer's W1 width was generalised from the constant `P1_F` to
+  the net's `t->f` (26 for profiles 1/11-style fits, 27 for profile 14) in
+  the MALT/Muon allocation, untie, update and debug paths. With the tuning
+  env vars unset, upstream's default fit behaviour is unchanged.
+* `ctest`: **13/13 passed** (12 baseline tests + the new `hnet` test),
+  including all profile-1 golden vectors unchanged and the new profile's
+  F16/Q8 golden vectors (len/CRC `57761 / 0xEE2926BD`, `48573 /
+  0x482211FB`). The CLI roundtrip script now also exercises `-p hnet`
+  stream + `.awseek` + range extraction. A GCC 16 `-Werror` build is clean
+  and its tests pass too.
+* Decode of all four new archives reproduces the original input byte for byte.
+  The existing profile-1 baseline archives also still decode byte for byte
+  with the modified decoder. After the rebase, all four profile-14 archives
+  were re-encoded and came out **byte-identical** to the pre-rebase ones
+  (181307 / 179426 / 377294 / 371256 bytes), and a clang `-Werror` Release
+  rebuild passes the suite.
+* Fit-pass and decoder boundary signals match for every byte of a skewed
+  input across a mid-stream coding-unit reset.
+* Boundary checksum over 4096 fixed text bytes: `sum=8352596`,
+  `sum2=1113733144`, `min=0`, `max=11517`, 9 zero samples.
+
+### 4. Verdict
+
+**Keep as an experimental, opt-in profile.** The feature is deterministic,
+cheap in integer operations, adds only one mixer weight per row, and gives a
+net byte win on the bench (−0.53 % overall, −1.08 % on libc L5), beating the
+sibling entropy-gate profile in total bytes on these four points. It does not
+win everywhere (text L5 is slightly worse) and it is not a default: use
+`taw c -p hnet`.
+
+### 5. Caveats
+
+* Speed: no fused AVX2 path; encode/decode are several times slower than
+  profile 1. Adding a SIMD kernel requires reworking `p1_simd_out.h` and
+  `p1_run_avx2.c` for `F = 27`, which was out of scope.
+* The clamp bound is the natural saturating width of four stretch values and
+  does not actually truncate any valid sum (max 16376). It is part of the
+  spec to pin the register width; loosening it to 4095/8191 or tightening it
+  to 2047 changed the fitter's candidate choices and produced mixed results
+  (the 2047 variant lost ~700 bytes overall against the new baseline).
+* The first sample of a coding unit compares against the zero vector, which
+  acts like an artificial boundary at the start of each `.awseek` block.
+  Its effect is one byte per block; the 64 KiB-block check still improved.
+* Only 1 MiB text and 1 MiB libc at levels 1 and 5 were measured. Fitting is
+  deterministic on the CPU but the chosen quant/shape can jump between
+  levels, so small differences here should not be over-read.
+* Profile 14 is only available with CPU fitting; GPU `-g on` is rejected.

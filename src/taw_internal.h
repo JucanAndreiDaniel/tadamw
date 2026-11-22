@@ -124,12 +124,14 @@ static inline int taw_rc_dec_bit(taw_rc_dec *d, uint32_t p1)
 /* ---- predictor / arithmetic profiles (docs/format.md §2) ---------------- */
 
 struct taw_p1;
+struct taw_hnet;
 
 typedef struct {
 	uint8_t profile;
 	uint32_t c0;     /* partial byte with leading 1 bit, 1..255 */
 	uint16_t p[256]; /* profile 0 state */
-	struct taw_p1 *p1; /* profile 1 state (heap), else nullptr */
+	struct taw_p1 *p1;   /* profile 1 state (heap), else nullptr */
+	struct taw_hnet *hn; /* profile 14 state (heap), else nullptr */
 } taw_pred;
 
 /* Is (profile, quant) a pair this build can decode? */

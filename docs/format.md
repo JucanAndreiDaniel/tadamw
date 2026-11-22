@@ -52,7 +52,8 @@ identical probabilities for every bit.
 |----|-----------------|---------------|--------|
 | 0  | `INT_ORDER0`    | empty (`model_size = 0`, `quant = 0`) | implemented, placeholder |
 | 1  | `F32_STRICT_MIX`| mixer shape and weights, §5.1; quant `F16`, `Q8`, `Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4` or `IQ2` | implemented |
-| 2..255 | — | — | reserved, refuse |
+| 14 | `HNET_BOUNDARY` | profile 1 plus one integer boundary input, §2.14; same model section with one extra weight per mixer row | implemented |
+| 2..13, 15..255 | — | — | reserved, refuse |
 
 ### 2.1 Profile 0: `INT_ORDER0`
 
@@ -306,6 +307,80 @@ and the same `A2` entry are updated: `e += (65535 - e) >> 6` if `b`, else
    `nib = 1` and select lines with `q = c0`. At `bitpos` 8: byte end
    (§2.2.5).
 
+### 2.14 Profile 14: `HNET_BOUNDARY`
+
+This profile is profile 1 with one extra mixer input. All 12 context models,
+their hashes and counters, the selectors, the `dot4` order and clamps, the
+integer squash, both APM stages, the range coder and the model-section head
+and row formats are exactly those of §2.2 and §5.1. Only the mixer row width
+and the per-bit inputs change. It is an integer-exact analogue of the H-Net
+dynamic-chunking router ([arXiv:2507.07955](https://arxiv.org/abs/2507.07955)),
+which scores a boundary by the dissimilarity of adjacent context
+representations; here the context representation is four stretched context
+estimates from the existing integer state. There is no libm and there are no
+new learned weights beyond the wider rows.
+
+#### 2.14.1 Sampled estimates and the boundary signal
+
+Let the four sampled input indices be `P = [0, 1, 7, 24]`: the direct o0 and
+o1 estimates, the direct word estimate and the match estimate of §2.2.3.
+
+A sample is taken once per byte, on the inputs of `bitpos = 7` (the last bit
+of a byte, just before the byte completes), **before** that bit is coded. The
+new value of `b` is used for that bit and is held until the next byte's
+`bitpos = 7`, i.e. through the first seven bits of the next byte. If `x[i]`
+are the profile-1 inputs of that bit, the integer stretch values are
+`u[j] = x[P[j]] * 256`, which is exact (binary32 division and multiplication
+by a power of two: `x[i] = stretch[i]/256`).
+
+With `prev[0..3]` the previous sample (initially all zero, see §2.14.3):
+
+```
+d[j] = abs(u[j] - prev[j])                  (non-negative, <= 4094)
+s    = d[0] + d[1] + d[2] + d[3]            (0..16376)
+b    = min(s, 16376)                        (14-bit saturating; no wrap)
+prev = u
+```
+
+`b` is a non-negative integer in stretch units (1/256). Clamping at
+`4 * 2 * 2047` is the natural bound of four stretch differences; with the
+normative stretch range it never truncates a valid sum, but it fixes the
+register width.
+
+#### 2.14.2 Mixer and probability
+
+The mixer is §2.2.8 with `F = 27`: for `i = 0..24`, `x[i] = st[i]/256` as in
+profile 1, `x[25] = 1`, and
+
+```
+x[26] = b / 256     (exact in binary32; b <= 16376, so 0 <= x[26] <= 63.90625)
+```
+
+`x[27..31] = 0` (padding). Layer-1 weight rows are 27 weights in input order;
+single-layer (`hidden = 0`) output rows are also 27 weights. `dot4` keeps the
+same four partial sums, summation order and `(-2047/256, 2047/256)` clamp.
+The output then passes through §2.2.9's APM stages and probability formula
+unchanged.
+
+The reference implementation uses the scalar mixer and the generic per-bit
+loop. Both the AVX2/AVX-512 mixer kernels and the fused AVX2 per-bit loop of
+this codebase hardcode `F = 26`, so a profile-14 decoder must not dispatch to
+them; a decoder that implements the profile independently only has to match
+the bits above. (The context-model kernels are shared and bit-identical.)
+
+#### 2.14.3 State and encoder rules
+
+At the start of every coding unit (whole stream for `.aw`, every block for
+`.awseek`), in addition to §2.2.2: `prev[0..3] = 0`, `b = 0`. The first
+sample of a unit therefore compares its byte-7 state with the zero vector;
+before the first `bitpos = 7` of a unit, `x[26] = 0`. The state carries across
+`aw` chunks like profile 1's.
+
+The encoder's feature pass must compute `b` with exactly these rules (same
+indices, same sampling instant, same clamp, same per-unit reset) and store it
+with each training bit; a mismatch changes the fitted weights, not a decoded
+byte, so `tests/test_hnet.c` checks fit-pass and decoder signals bit for bit.
+
 ## 3. Quantization formats
 
 The format in which model weights are stored. Encoders may pick any format
@@ -432,11 +507,18 @@ Bytes per row: `Q4`/`IQ4` `2 + ceil(len/2)`; `Q2` `4 + ceil(len/4)`;
 `IQ2` `2 + ceil(len/4)`; `FP8`/`IQ8` `2 + len`; `NVFP4`
 `2 + ceil(len/16) + ceil(len/2)`.
 
+Profile 14 uses this exact head and these exact row encodings; the only
+difference is `len = 27` instead of `26` for layer-1 rows and for output rows
+when `hidden = 0` (§2.14.2). There are no profile-specific header fields or
+extra weights: `model_size = 8 + payload` with `len = 27`. A decoder chooses
+the width from the header's `arith_profile`, so a 26-wide payload under
+profile 14 (or a 27-wide one under profile 1) is a format error.
+
 `model_size` MUST equal `8` plus the payload size exactly. A decoder MUST
 refuse (format error) any field out of range, non-zero reserved bytes, a
 size mismatch, a non-finite F16 value, scale or offset, a Q8 value of
 -128, a NaN E4M3 code, a negative NVFP4 block scale, or non-zero unused
-code bits. Profile 1 accepts the row formats (`quant` 1 and 4..11);
+code bits. Profiles 1 and 14 accept the row formats (`quant` 1 and 4..11);
 `BF16`, `F32` and reserved values are unsupported.
 
 A decoder needs about `10 * 2^L * 64 + 2^HB + 4 * 2^MB` bytes of tables
