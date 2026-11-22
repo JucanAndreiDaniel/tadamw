@@ -580,11 +580,14 @@ static const uint8_t sel2_opts_h[] = {P1_SEL_NONE, P1_SEL_BITPOS, P1_SEL_C0};
 static const uint8_t sel2_opts_0[] = {P1_SEL_NONE, P1_SEL_BITPOS,
 	P1_SEL_MATCH, P1_SEL_C0, P1_SEL_C1, P1_SEL_C0C1HI};
 
-/* Prior preference (higher = fitted first), from full candidate sweeps over
- * text, a word list, roff, and ELF binaries: the best models cost about
- * n/1100 to n/220 bytes, and the top few shapes are within ~0.5% of each
- * other. Shapes near n/500 bytes (at most 128 KiB) with a hidden layer, Q8
- * weights and a bit-position selector win most often. */
+/* Prior preference (higher = fitted first), fitted to full candidate
+ * sweeps at levels 1 and 5 over text, a word list, roff, C source and an
+ * ELF binary (1 MiB each): the first candidate is on average 0.6% from
+ * the best one (it was 3% with the earlier hand-set prior). Shapes near
+ * n/500 bytes (at most 128 KiB) are preferred only mildly; no layer-1
+ * selector and a bit-position output selector win most often; the 2-bit
+ * formats and F16 rarely do. The 4- and 8-bit formats are close, so the
+ * size term breaks their ties. */
 static double prior(const cand *c, size_t n)
 {
 	/* Capped: past ~128 KiB the weight tables (a 4096-set selector is
@@ -594,13 +597,17 @@ static double prior(const cand *c, size_t n)
 	if (target > 131072.0)
 		target = 131072.0;
 	double r = dlog2((double)c->size / target);
-	double pr = -(r < 0 ? -r : r);
-	if (c->s.hidden)
+	double pr = -0.25 * (r < 0 ? -r : r);
+	if (c->s.sel1 == P1_SEL_NONE)
 		pr += 0.5;
-	if (c->quant == TAW_QUANT_Q8)
-		pr += 0.3;
-	if (c->s.sel1 == P1_SEL_BITPOS || c->s.sel2 == P1_SEL_BITPOS)
-		pr += 0.3;
+	if (c->s.sel2 == P1_SEL_BITPOS)
+		pr += 0.6;
+	switch (c->quant) {
+	case TAW_QUANT_Q2: pr -= 0.5; break;
+	case TAW_QUANT_IQ2: pr -= 1.0; break;
+	case TAW_QUANT_F16: pr -= 0.3; break;
+	default: break;
+	}
 	return pr;
 }
 

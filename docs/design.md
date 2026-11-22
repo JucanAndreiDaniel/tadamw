@@ -195,14 +195,17 @@ parallel (`taw d -j N`, `taw_seek_set_threads`): 5 blocks went from
    rotated order (a hash of the byte position), so every bit position is
    sampled: a plain stride kept only bit 7 whenever 8n / samples was a
    multiple of 8, which cost 3-11% on power-of-two inputs.
-4. Candidate shapes: hidden ∈ {0, 4, 8, 16} × selectors × {F16, Q8}, each
-   kept only if `8 + payload <= n/32`. They are ranked by a prior from
-   full sweeps on the bench corpus: the best models cost n/1100 to n/220
-   bytes, and the top shapes are within ~0.5% of each other. So the prior
-   favours models near n/500 bytes, with a hidden layer, Q8 weights and a
-   bit-position selector. The target is capped at 128 KiB: on a 1.3 GB XCI
-   the uncapped prior chose a 1.8 MB model with a 4096-set selector, whose
-   weights fall out of cache, and decoding ran about 3x slower.
+4. Candidate shapes: hidden ∈ {0, 4, 8, 16} × selectors × the nine
+   weight formats, each kept only if `8 + payload <= n/32`. They are
+   ranked by a prior fitted to full sweeps (every candidate fitted) at
+   levels 1 and 5 on the bench corpus: the first candidate is on average
+   0.6% from the best (the earlier hand-set prior: 3%). It prefers sizes
+   near n/500 bytes only mildly (capped at 128 KiB: on a 1.3 GB XCI the
+   uncapped target chose a 1.8 MB model with a 4096-set selector, whose
+   weights fall out of cache, and decoding ran about 3x slower), no
+   layer-1 selector and a bit-position output selector, and penalizes Q2,
+   IQ2 and F16. Real archives against the previous prior: level 1
+   0.6-4.1% smaller, level 5 0.5-1.9% smaller, level 9 within ±0.8%.
 5. Fit the top candidates with AdamW (batch 256, lr 0.02 → 0.001
    linearly, β = 0.9/0.999, weight decay 1e-5, lazy updates of only the
    weight sets a batch touches). The first `max(1, epochs/5)` epochs train
@@ -262,11 +265,12 @@ scales per row rather than ggml's 32- or 256-weight blocks, and the
   ideal one. Every choice is scored with the decoder's own dequantized
   values.
 
-On the bench corpus at level 1 (every candidate fitted, archive estimate
-relative to the best), the 4-bit formats win most often: IQ4/Q4 on libc,
-roff and C source, FP8 on text and the word list. F16 and IQ2 never win;
-IQ2 loses 2-15% (post-training quantization to 2 bits is too coarse for
-the hidden layer).
+On the bench corpus at level 1 (every candidate fitted, best estimate
+per format), the best format is IQ8 on the word list, IQ4 on libc, Q8 on
+roff, NVFP4 on text, Q4 on C source; the 4- and 8-bit formats are within
+about 1.5% of each other. IQ2 loses 2-13% and Q2 up to 5% (post-training
+quantization to 2 bits is too coarse for the hidden layer), except on
+libc where the single-layer C1-selector models are within 0.6%.
 
 ## Decoder
 
