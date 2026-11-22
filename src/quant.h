@@ -46,4 +46,18 @@ void taw_quant_row_encode(uint8_t quant, const float *w, unsigned len,
 /* Public weight choice <-> quant id (TAW_QUANT_NONE for AUTO). */
 uint8_t taw_quant_from_weights(taw_weights w);
 
+/* Encoder-only helpers for quantization-aware training (fit.c). The format
+ * and the decoder are unchanged: they reuse the same level tables and the
+ * same F16 scale representation as taw_quant_row_encode/decode.
+ *  - row_scale: cheap amax / max-level F16 scale (the search's start point).
+ *  - simulate: dequantized row under `scale` (>0), or row_scale when scale
+ *    is 0; *scale_out receives the scale used. Returns false for Q2/NVFP4.
+ *  - encode_with_scale: encode a row using a prescribed scale instead of
+ *    searching; returns false for Q2/NVFP4 (fall back to the normal search). */
+float taw_quant_row_scale(uint8_t quant, const float *w, unsigned len);
+bool taw_quant_simulate(uint8_t quant, const float *w, unsigned len,
+    float scale, float *out, float *scale_out);
+bool taw_quant_row_encode_with_scale(uint8_t quant, const float *w,
+    unsigned len, float scale, uint8_t *out);
+
 #endif

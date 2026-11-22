@@ -367,12 +367,11 @@ static void put16(uint8_t *p, uint16_t v)
 	p[1] = (uint8_t)(v >> 8);
 }
 
-static void encode_levels(uint8_t quant, const float *w, unsigned len,
-    uint8_t *out)
+static void encode_levels_at(uint8_t quant, const float *w, unsigned len,
+    uint16_t sh, uint8_t *out)
 {
 	levels L;
 	levels_for(quant, &L);
-	const uint16_t sh = search_scale(&L, w, len);
 	const float d = taw_h2f(sh);
 	put16(out, sh);
 	uint8_t *q = out + 2;
@@ -387,6 +386,71 @@ static void encode_levels(uint8_t quant, const float *w, unsigned len,
 		else
 			q[i * bits / 8] |= (uint8_t)(c << (i * bits % 8));
 	}
+}
+
+static void encode_levels(uint8_t quant, const float *w, unsigned len,
+    uint8_t *out)
+{
+	levels L;
+	levels_for(quant, &L);
+	encode_levels_at(quant, w, len, search_scale(&L, w, len), out);
+}
+
+/* QAT helpers ---------------------------------------------------------------
+ * Cheap amax/max-level scale: the grid point search_scale() starts from.
+ * Level formats only; F16 has no scale, Q2/NVFP4 have per-row/block extras. */
+float taw_quant_row_scale(uint8_t quant, const float *w, unsigned len)
+{
+	if (quant == TAW_QUANT_F16)
+		return 0.0f;
+	levels L;
+	levels_for(quant, &L);
+	if (!L.n)
+		return 0.0f;
+	float amax = 0.0f;
+	for (unsigned i = 0; i < len; i++)
+		if (absf(w[i]) > amax)
+			amax = absf(w[i]);
+	const float lmax = absf(L.lv[0]) > absf(L.lv[L.n - 1]) ?
+	    absf(L.lv[0]) : absf(L.lv[L.n - 1]);
+	return taw_h2f(half_scale(amax / lmax));
+}
+
+bool taw_quant_simulate(uint8_t quant, const float *w, unsigned len,
+    float scale, float *out, float *scale_out)
+{
+	if (quant == TAW_QUANT_F16) {
+		for (unsigned i = 0; i < len; i++)
+			out[i] = taw_h2f(taw_f2h(clamp_half(w[i])));
+		if (scale_out)
+			*scale_out = 0.0f;
+		return true;
+	}
+	levels L;
+	levels_for(quant, &L);
+	if (!L.n)
+		return false;
+	const float d = scale > 0.0f ? scale : taw_quant_row_scale(quant, w, len);
+	for (unsigned i = 0; i < len; i++)
+		(void)nearest(&L, d, w[i], &out[i]);
+	if (scale_out)
+		*scale_out = d;
+	return true;
+}
+
+bool taw_quant_row_encode_with_scale(uint8_t quant, const float *w,
+    unsigned len, float scale, uint8_t *out)
+{
+	if (quant == TAW_QUANT_F16) {
+		taw_quant_row_encode(quant, w, len, out);
+		return true;
+	}
+	levels L;
+	levels_for(quant, &L);
+	if (!L.n)
+		return false;
+	encode_levels_at(quant, w, len, half_scale(scale), out);
+	return true;
 }
 
 /* Q2: w = fl(fl(q * d) + m), q = 0..3. */

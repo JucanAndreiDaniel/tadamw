@@ -26,6 +26,11 @@ typedef struct {
 	uint8_t *touched1, *touched2;
 	bool tied; /* warm-up: every sample uses set 0 */
 	uint32_t *list1, *list2;
+	/* Quantization-aware training (CPU fitter only, opt-in via TAW_QAT):
+	 * 0 none, 1 F16, 2 recomputed scale, 3 fixed at init, 4 fixed at
+	 * untie, 5 EMA scale. sc1/sc2 hold per-row Q8 scales for 3/4/5. */
+	uint8_t qat, quant;
+	float *sc1, *sc2;
 } tnet;
 
 /* ---- deterministic PRNG ------------------------------------------------------ */

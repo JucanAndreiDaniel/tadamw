@@ -258,6 +258,40 @@ static taw_status collect(const taw_source *in, uint64_t unit,
 	return TAW_OK;
 }
 
+/* ---- quantization-aware training -----------------------------------------------
+ * During fitting, the forward pass uses the *dequantized* weights the decoder
+ * will see: F16 round-trip, or Q8 with a per-row absmax F16 scale. Gradients
+ * pass through the rounding/scale as if identity (straight-through estimator),
+ * so AdamW optimizes weights that survive quantization. The final model is
+ * still serialized by the ordinary put_row() path: no format or decoder
+ * change. TAW_QAT selects the experiment mode (off / on / q8fixed /
+ * q8fixed2 / q8ema / f16only). */
+
+typedef enum {
+	QAT_OFF = 0,
+	QAT_ON,      /* match the candidate's quantizer */
+	QAT_Q8FIXED, /* Q8 scale frozen from initialization */
+	QAT_Q8FIX2,  /* Q8 scale frozen at untie (after warm-up) */
+	QAT_Q8EMA,   /* Q8 scale = EMA of per-row absmax scale */
+	QAT_F16ONLY  /* only F16 candidates use QAT */
+} qat_mode;
+
+static qat_mode fit_qat_mode(void)
+{
+	const char *s = getenv("TAW_QAT");
+	if (!s || !*s || strcmp(s, "off") == 0)
+		return QAT_OFF;
+	if (strcmp(s, "q8fixed") == 0)
+		return QAT_Q8FIXED;
+	if (strcmp(s, "q8fixed2") == 0)
+		return QAT_Q8FIX2;
+	if (strcmp(s, "q8ema") == 0)
+		return QAT_Q8EMA;
+	if (strcmp(s, "f16only") == 0)
+		return QAT_F16ONLY;
+	return QAT_ON;
+}
+
 /* ---- the trainable network (tnet: fit_internal.h) ------------------------------- */
 
 static void tnet_free(tnet *t)
@@ -270,13 +304,62 @@ static void tnet_free(tnet *t)
 	free(t->touched2);
 	free(t->list1);
 	free(t->list2);
+	free(t->sc1);
+	free(t->sc2);
 	memset(t, 0, sizeof *t);
 }
 
-static taw_status tnet_init(tnet *t, const p1_shape *s, uint64_t seed)
+/* Cheap per-row scale (the encoder's scale-search starting point). */
+static float row_scale(const tnet *t, const float *w, size_t len)
+{
+	return taw_quant_row_scale(t->quant, w, (unsigned)len);
+}
+
+/* Dequantize one row into out[], with a straight-through rounding gradient.
+ * `fixed` > 0 selects a frozen scale (Q8 fixed modes). Level formats and F16
+ * reuse the quant.c tables; Q2/NVFP4 have no simple level set and skip QAT. */
+static void dequant_row(const tnet *t, const float *w, size_t len,
+    float fixed, float *out)
+{
+	if (t->qat == 0 ||
+	    !taw_quant_simulate(t->quant, w, (unsigned)len, fixed, out,
+	        nullptr))
+		memcpy(out, w, len * sizeof *w);
+}
+
+/* True when a frozen Q8 scale is in effect (mode 4 only after warm-up). */
+static inline bool q8_fixed_active(const tnet *t)
+{
+	return t->qat == 3 || (t->qat == 4 && !t->tied);
+}
+
+/* EMA of the per-row absmax scale: adapts slowly instead of jumping every
+ * step (recomputed) or never (fixed). Called from the forward pass. */
+static float qat_ema_scale(const tnet *t, const float *w, size_t len,
+    float *sc)
+{
+	const float target = row_scale(t, w, len);
+	*sc = 0.98f * *sc + 0.02f * target;
+	return *sc;
+}
+
+static void qat_fixed_scales(tnet *t)
+{
+	const unsigned H = t->s.hidden;
+	if (H)
+		for (size_t j = 0; j < H * t->s1; j++)
+			t->sc1[j] = row_scale(t, t->w + j * P1_F, P1_F);
+	for (size_t j = 0; j < t->s2; j++)
+		t->sc2[j] = row_scale(t, t->w + t->n1 + j * t->row2, t->row2);
+}
+
+static taw_status tnet_init(tnet *t, const p1_shape *s, uint64_t seed,
+    uint8_t qat, uint8_t quant)
 {
 	memset(t, 0, sizeof *t);
 	t->s = *s;
+	t->qat = qat;
+	t->quant = quant;
 	const unsigned H = s->hidden;
 	t->s1 = H ? p1_sel_size[s->sel1] : 0;
 	t->s2 = p1_sel_size[s->sel2];
@@ -293,8 +376,14 @@ static taw_status tnet_init(tnet *t, const p1_shape *s, uint64_t seed)
 	t->touched2 = calloc(t->s2, 1);
 	t->list1 = malloc((t->s1 + 1) * sizeof(uint32_t));
 	t->list2 = malloc(t->s2 * sizeof(uint32_t));
+	if (t->qat >= 3) {
+		if (H)
+			t->sc1 = malloc(H * t->s1 * sizeof(float));
+		t->sc2 = malloc(t->s2 * sizeof(float));
+	}
 	if (!t->w || !t->m || !t->v || !t->g || !t->touched1 || !t->touched2 ||
-	    !t->list1 || !t->list2) {
+	    !t->list1 || !t->list2 || (t->qat >= 3 &&
+	    (t->sc2 == nullptr || (H && t->sc1 == nullptr)))) {
 		tnet_free(t);
 		return TAW_E_NOMEM;
 	}
@@ -321,6 +410,8 @@ static taw_status tnet_init(tnet *t, const p1_shape *s, uint64_t seed)
 			for (unsigned i = 0; i < P1_F; i++)
 				w2[set * P1_F + i] = i == P1_IN_BIAS ? 0.0f : 0.3f;
 	}
+	if (t->qat == 3 || t->qat == 5)
+		qat_fixed_scales(t);
 	return TAW_OK;
 }
 
@@ -340,34 +431,43 @@ static void tnet_step(tnet *t, const sample *smp)
 	float *w2 = t->w + t->n1 + s2 * t->row2;
 	float *g2 = t->g + t->n1 + s2 * t->row2;
 	float z = 0.0f, h[P1_HMAX], a[P1_HMAX];
-	const float *w1 = nullptr;
-	float *g1 = nullptr;
+	float qw2[P1_HMAX + 1];
+	float sc2 = t->qat == 5 ? qat_ema_scale(t, w2, t->row2, &t->sc2[s2])
+		: q8_fixed_active(t) ? t->sc2[s2] : 0.0f;
+	dequant_row(t, w2, t->row2, sc2, qw2);
+	const uint32_t s1 = H ? (t->tied ? 0 : p1_sel_value(t->s.sel1, &sc)) : 0;
+	const float *w1 = H ? t->w + s1 * t->row1 : nullptr;
+	float *g1 = H ? t->g + s1 * t->row1 : nullptr;
 	if (H) {
-		const uint32_t s1 = t->tied ? 0 : p1_sel_value(t->s.sel1, &sc);
-		w1 = t->w + s1 * t->row1;
-		g1 = t->g + s1 * t->row1;
 		for (unsigned j = 0; j < H; j++) {
+			float qw1[P1_F];
+			float sc1 = t->qat == 5
+				? qat_ema_scale(t, w1 + j * P1_F, P1_F,
+				    &t->sc1[s1 * H + j])
+				: q8_fixed_active(t) ? t->sc1[s1 * H + j] : 0.0f;
+			dequant_row(t, w1 + j * P1_F, P1_F, sc1, qw1);
 			float acc = 0.0f;
-			const float *r = w1 + j * P1_F;
 			for (unsigned i = 0; i < P1_F; i++)
-				acc += r[i] * x[i];
+				acc += qw1[i] * x[i];
 			a[j] = acc;
 			h[j] = clamp8(acc);
-			z += w2[j] * h[j];
+			z += qw2[j] * h[j];
 		}
-		z += w2[H];
+		z += qw2[H];
 	} else {
 		for (unsigned i = 0; i < P1_F; i++)
-			z += w2[i] * x[i];
+			z += qw2[i] * x[i];
 	}
 	const float lim = 2047.0f / 256.0f;
 	float zc = z > lim ? lim : z < -lim ? -lim : z;
 	float p = (float)p1_squash((int32_t)(zc * 256.0f)) * (1.0f / 65536.0f);
 	float gz = p - (float)smp->bit;
+	/* Straight-through estimator: gradient w.r.t. the dequantized weight is
+	 * used unchanged for the latent float weight. */
 	if (H) {
 		for (unsigned j = 0; j < H; j++) {
 			g2[j] += gz * h[j];
-			float ga = (a[j] > -8.0f && a[j] < 8.0f) ? gz * w2[j] : 0.0f;
+			float ga = (a[j] > -8.0f && a[j] < 8.0f) ? gz * qw2[j] : 0.0f;
 			if (ga != 0.0f) {
 				float *gr = g1 + j * P1_F;
 				for (unsigned i = 0; i < P1_F; i++)
@@ -394,6 +494,15 @@ static void tnet_untie(tnet *t)
 			    t->row2 * sizeof(float));
 	}
 	t->tied = false;
+	if (t->qat == 4)
+		qat_fixed_scales(t);
+	if (t->qat == 5) {
+		for (size_t set = 1; set < t->s1; set++)
+			memcpy(t->sc1 + set * t->s.hidden, t->sc1,
+			    (size_t)t->s.hidden * sizeof(float));
+		for (size_t set = 1; set < t->s2; set++)
+			t->sc2[set] = t->sc2[0];
+	}
 }
 
 typedef struct {
@@ -483,15 +592,22 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 			}
 		}
 	}
+	if (t->qat == 4 && t->tied)
+		qat_fixed_scales(t); /* 1 epoch: no untie ever happens */
 }
 
 /* ---- quantization / serialization -------------------------------------------- */
 
-static void put_row(taw_buf *b, uint8_t quant, const float *w, size_t len)
+/* `fixed` > 0 selects the QAT frozen/EMA scale instead of the encoder's
+ * searched scale. The format and the decoder are unchanged. */
+static void put_row(taw_buf *b, uint8_t quant, const float *w, size_t len,
+    float fixed)
 {
 	uint8_t row[2 * (P1_HMAX + P1_F)];
 	const size_t n = (size_t)taw_quant_row_bytes(quant, len);
-	taw_quant_row_encode(quant, w, (unsigned)len, row);
+	if (!(fixed > 0.0f &&
+	    taw_quant_row_encode_with_scale(quant, w, (unsigned)len, fixed, row)))
+		taw_quant_row_encode(quant, w, (unsigned)len, row);
 	taw_buf_put(b, row, n);
 }
 
@@ -503,9 +619,11 @@ static taw_status serialize(const tnet *t, uint8_t quant, taw_buf *b)
 	const unsigned H = t->s.hidden;
 	for (size_t set = 0; set < t->s1; set++)
 		for (unsigned j = 0; j < H; j++)
-			put_row(b, quant, t->w + set * t->row1 + j * P1_F, P1_F);
+			put_row(b, quant, t->w + set * t->row1 + j * P1_F, P1_F,
+			    t->qat >= 3 ? t->sc1[set * H + j] : 0.0f);
 	for (size_t set = 0; set < t->s2; set++)
-		put_row(b, quant, t->w + t->n1 + set * t->row2, t->row2);
+		put_row(b, quant, t->w + t->n1 + set * t->row2, t->row2,
+		    t->qat >= 3 ? t->sc2[set] : 0.0f);
 	return b->oom ? TAW_E_NOMEM : TAW_OK;
 }
 
@@ -657,22 +775,59 @@ typedef struct {
 	size_t ns;
 	int epochs;
 	uint64_t n;
+	qat_mode qat;
 	taw_buf *model; /* [tries] */
 	double *est, *bpb;
 	taw_status *st;
 	tnet *pre; /* [tries] or nullptr: nets already trained (on the GPU) */
 } fit_job;
 
+static bool qat_level_format(uint8_t quant)
+{
+	switch (quant) {
+	case TAW_QUANT_Q8: case TAW_QUANT_Q4: case TAW_QUANT_FP8:
+	case TAW_QUANT_IQ8: case TAW_QUANT_IQ4: case TAW_QUANT_IQ2:
+		return true;
+	default:
+		return false; /* F16 handled below; Q2/NVFP4 have no level set */
+	}
+}
+
+static uint8_t qat_for(qat_mode mode, uint8_t quant)
+{
+	if (mode == QAT_OFF || mode == QAT_F16ONLY) {
+		return mode == QAT_F16ONLY && quant == TAW_QUANT_F16 ? 1 : 0;
+	}
+	if (quant == TAW_QUANT_F16)
+		return 1;
+	if (!qat_level_format(quant))
+		return 0;
+	if (quant == TAW_QUANT_Q8) {
+		if (mode == QAT_Q8FIXED)
+			return 3;
+		if (mode == QAT_Q8FIX2)
+			return 4;
+		if (mode == QAT_Q8EMA)
+			return 5;
+	}
+	return 2; /* recomputed scale */
+}
+
 static void fit_one(void *arg, size_t ci, unsigned w)
 {
 	(void)w;
 	fit_job *F = arg;
 	tnet t;
+	const uint8_t qat = qat_for(F->qat, F->cs[ci].quant);
 	taw_status st = TAW_OK;
 	if (F->pre && F->pre[ci].w) {
+		/* GPU-trained weights: QAT training was not applied, but the
+		 * scale mode was set up by fit_all so serialization is
+		 * self-consistent. */
 		t = F->pre[ci];
 		F->pre[ci] = (tnet){0};
-	} else if ((st = tnet_init(&t, &F->cs[ci].s, 0x7A57A11ull + ci)) == TAW_OK) {
+	} else if ((st = tnet_init(&t, &F->cs[ci].s, 0x7A57A11ull + ci, qat,
+	    F->cs[ci].quant)) == TAW_OK) {
 		tnet_train(&t, F->sm, F->ns, F->epochs, 0xC0FFEEull + ci);
 	}
 	if (st == TAW_OK) {
@@ -768,7 +923,8 @@ static taw_status fit_all(fit_job *F, size_t tries, unsigned threads,
 	if (ng && (!nets || !seeds || !F->pre))
 		st = TAW_E_NOMEM;
 	for (size_t j = 0; j < ng && st == TAW_OK; j++) {
-		st = tnet_init(&nets[j], &F->cs[gi[j]].s, 0x7A57A11ull + gi[j]);
+		st = tnet_init(&nets[j], &F->cs[gi[j]].s, 0x7A57A11ull + gi[j],
+		    qat_for(F->qat, F->cs[gi[j]].quant), F->cs[gi[j]].quant);
 		seeds[j] = 0xC0FFEEull + gi[j];
 	}
 	gpu_job J = {.g = g, .nets = nets, .k = ng, .epochs = F->epochs,
@@ -864,7 +1020,7 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 		tries = ncand;
 
 	fit_job F = {.cs = cs, .sm = sm, .ns = ns, .epochs = effort[lv].epochs,
-		.n = n};
+		.n = n, .qat = fit_qat_mode()};
 	F.model = calloc(tries, sizeof *F.model);
 	F.est = calloc(tries, sizeof *F.est);
 	F.bpb = calloc(tries, sizeof *F.bpb);
