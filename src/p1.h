@@ -243,8 +243,8 @@ void p11_gate_write(uint8_t out[P11_GATE_SIZE], const p11_gate *g);
 
 /* Profile 1 state. After the mixer, two adaptive APM (SSE) stages refine
  * the probability in the contexts c0 and c1:c0 (format.md §2.2.9).
- * With `gated` set (profile 11) the generic loop inserts the entropy gate;
- * the fused AVX2 loop only implements profile 1 and is bypassed then. */
+ * With `gated` set (profile 11) both the generic loop in predictor.c and the
+ * fused AVX2 loop insert the entropy gate; the golden vectors pin them. */
 enum { P1_APM_RATE = 6 };
 struct taw_p1 {
 	p1_ctx ctx;

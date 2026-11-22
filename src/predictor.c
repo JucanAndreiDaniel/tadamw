@@ -204,7 +204,7 @@ void taw_pred_encode(taw_pred *pr, taw_rc_enc *e, const uint8_t *src,
 	if (pr->p1) {
 		struct taw_p1 *m = pr->p1;
 #if TAW_X86_SIMD
-		if (m->ctx.avx2 && !m->gated) {
+		if (m->ctx.avx2) {
 			p1_encode_avx2(m, e, src, n);
 			return;
 		}
@@ -239,7 +239,7 @@ void taw_pred_skip(taw_pred *pr, const uint8_t *src, size_t n)
 		/* the same predictions and updates as coding, without a coder */
 		struct taw_p1 *m = pr->p1;
 #if TAW_X86_SIMD
-		if (m->ctx.avx2 && !m->gated) {
+		if (m->ctx.avx2) {
 			p1_skip_avx2(m, src, n);
 			return;
 		}
@@ -263,7 +263,7 @@ void taw_pred_decode(taw_pred *pr, taw_rc_dec *d, uint8_t *dst, size_t n)
 	if (pr->p1) {
 		struct taw_p1 *m = pr->p1;
 #if TAW_X86_SIMD
-		if (m->ctx.avx2 && !m->gated) {
+		if (m->ctx.avx2) {
 			p1_decode_avx2(m, d, dst, n);
 			return;
 		}
