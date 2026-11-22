@@ -457,7 +457,7 @@ overlap it.
 ### 7.1 File directory
 
 The directory names byte ranges of the decoded data, so one `.awseek` can hold
-several files:
+several files (for example a dump and its `/.meta`, docs/nx.md):
 
 | size | field |
 |------|-------|

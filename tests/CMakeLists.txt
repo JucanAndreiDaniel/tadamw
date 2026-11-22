@@ -23,3 +23,22 @@ add_test(NAME cli_roundtrip
                  "-DSOURCES=${PROJECT_SOURCE_DIR}/docs/format.md|${PROJECT_SOURCE_DIR}/docs/design.md"
                  -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli_work
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/cli_roundtrip.cmake)
+
+# taw-nx (built only with OpenSSL and LZ4): synthetic keys and NSP, no real
+# dumps or keys needed.
+if(TARGET taw_nx)
+  add_executable(test_nx test_nx.c)
+  target_include_directories(test_nx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+                             ${PROJECT_SOURCE_DIR}/tools/hactool)
+  target_compile_definitions(test_nx PRIVATE _DEFAULT_SOURCE _FILE_OFFSET_BITS=64)
+  set_target_properties(test_nx PROPERTIES C_EXTENSIONS ON)
+  target_link_libraries(test_nx PRIVATE hactool_lib)
+  add_test(NAME nx_crypto
+           COMMAND ${CMAKE_COMMAND} -E env sh -c
+                   "rm -rf '${CMAKE_CURRENT_BINARY_DIR}/nx_work' && mkdir -p '${CMAKE_CURRENT_BINARY_DIR}/nx_work' && '$<TARGET_FILE:test_nx>' '${CMAKE_CURRENT_BINARY_DIR}/nx_work'")
+  add_test(NAME cli_nx
+           COMMAND ${CMAKE_COMMAND} -DTAWNX=$<TARGET_FILE:taw_nx> -DTAW=$<TARGET_FILE:taw_cli>
+                   -DWORK=${CMAKE_CURRENT_BINARY_DIR}/nx_work
+                   -P ${CMAKE_CURRENT_SOURCE_DIR}/cli_nx.cmake)
+  set_tests_properties(cli_nx PROPERTIES DEPENDS nx_crypto)
+endif()

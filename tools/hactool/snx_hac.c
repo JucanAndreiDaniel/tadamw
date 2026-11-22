@@ -857,3 +857,18 @@ int snx_hac_ticket_key(SnxHac *hac, const unsigned char *data, size_t size) {
     snx_hac_add_title_key(hac, data + offset + 0x160, data + offset + 0x40);
     return 1;
 }
+
+/* tadamw: the inverse of snx_hac_xci_info: an XCI header's gamecard info (0x70 bytes at 0x190) decrypted,
+   AES-128-CBC under xci_header_key with iv (the header's IV at 0x120, its bytes reversed). 0, or -1 when
+   prod.keys has no xci_header_key */
+int snx_hac_xci_info_decrypt(SnxHac *hac, const unsigned char iv[16], const unsigned char enc[0x70],
+                             unsigned char out[0x70]) {
+    static const unsigned char zero[0x10];
+    aes_ctx_t *aes;
+    if (!memcmp(hac->tool.settings.keyset.xci_header_key, zero, 0x10)) return -1;
+    aes = new_aes_ctx(hac->tool.settings.keyset.xci_header_key, 0x10, AES_MODE_CBC);
+    aes_setiv(aes, iv, 0x10);
+    aes_decrypt(aes, out, enc, 0x70);
+    free_aes_ctx(aes);
+    return 0;
+}

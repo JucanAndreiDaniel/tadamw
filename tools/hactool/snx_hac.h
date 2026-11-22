@@ -106,6 +106,9 @@ int snx_hac_xci_info(SnxHac* hac, const unsigned char iv[16], const unsigned cha
    snx_hac_message. The result can differ from the original only for an NCA2 with unused FS headers: compare */
 int snx_hac_encrypt(SnxHac* hac, FILE* file, uint64_t offset, uint64_t size,
                     int (*write)(const void* bytes, size_t size, void* data), void* data);
+/* tadamw: the inverse of snx_hac_xci_info: the gamecard info decrypted. 0, or -1 without xci_header_key */
+int snx_hac_xci_info_decrypt(SnxHac* hac, const unsigned char iv[16], const unsigned char enc[0x70],
+                             unsigned char out[0x70]);
 /* tadamw: a ticket's title key (a common ticket's) into the keyset: 1 given, 0 personalized, -1 not a ticket */
 int snx_hac_ticket_key(SnxHac* hac, const unsigned char* data, size_t size);
 

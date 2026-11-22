@@ -32,7 +32,8 @@ Sanitizer build: `-DTADAMW_SANITIZE=ON -DTADAMW_WERROR=ON`.
 | `TADAMW_ENCODER` | ON | compression and model fitting |
 | `TADAMW_DECODER` | ON | decompression and random access |
 | `BUILD_SHARED_LIBS` | OFF | `libtadamw.so` instead of `libtadamw.a` |
-| `TADAMW_TOOLS` | ON | the `taw` tool |
+| `TADAMW_TOOLS` | ON | `taw` (and `taw-nx`) |
+| `TADAMW_NX` | ON | `taw-nx`, when OpenSSL 3 and LZ4 are found |
 | `TADAMW_TESTS` | ON | the tests (need both halves) |
 | `TADAMW_INSTALL` | ON | install rules |
 
@@ -64,6 +65,18 @@ taw d archive out
 taw x archive.awseek OFFSET LENGTH out # random-access range
 taw x archive.awseek /name out         # a named file
 taw i archive                          # header info and files
+```
+
+## taw-nx: Switch dumps
+
+`tools/taw-nx` turns XCI/NSP dumps into `.awseek` archives (the dump plus a
+`/.meta` file) and back, byte for byte. It stores NCAs and the gamecard info
+decrypted, since ciphertext does not compress, and encrypts them again on the
+way out. Keys come from `~/.switch/prod.keys`. See [docs/nx.md](docs/nx.md).
+
+```sh
+taw-nx enc [-l 1..9] [-j threads] game.nsp game.awseek
+taw-nx dec game.awseek game.nsp
 ```
 
 ## License

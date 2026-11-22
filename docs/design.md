@@ -19,10 +19,11 @@ drive a binary range coder (format.md §4).
 | weights | stored in a tagged quant format; F16 is standard |
 | arithmetic | tagged arithmetic profile; decoders refuse unknown profiles/quants |
 | variants | `.aw` stream, `.awseek` seekable with one global model |
-| language | C23 inside, CMake + CTest; libtadamw needs libc and pthreads |
+| language | C23 inside, CMake + CTest; libtadamw needs libc and pthreads; `taw-nx` also needs OpenSSL 3 and LZ4 |
 | library | `libtadamw` (static or shared), `<tadamw/tadamw.h>` usable from C99+/C++, encoder and decoder halves selectable at build time |
 | portability | every SIMD path has a generic one with identical results; byte-wise little-endian I/O, so big-endian hosts (ppc64) work too (not yet run on one) |
-| license | GPL-3.0-or-later, since `tools/hactool` carries ScarletNX's code |
+| license | GPL-3.0-or-later, since `taw-nx` borrows ScarletNX's hactool code |
+| Switch dumps | an ordinary `.awseek` with the dump (NCAs and gamecard info decrypted) and `/.meta`; decoding encrypts again and checks a SHA-256 of the original |
 | awseek extras | file directory (format.md §7.1), stored blocks/chunks, parallel streaming encoder (`taw_seek_encode`) whose output does not depend on the thread count |
 | libm | never used, in the encoder or the decoder; squash/exp go through SIMD intrinsics or tables |
 | model shape | table/MLP split chosen heuristically per input, not fixed |
@@ -224,6 +225,8 @@ can run in parallel later.
 | `src/aw.c` | `.aw` stream encode/decode |
 | `src/awseek.c` | `.awseek` encode/decode/random access |
 | `tools/taw.c` | CLI |
+| `tools/taw_nx.c` | XCI/NSP transcoder (docs/nx.md) |
+| `tools/hactool/` | hactool as ScarletNX carries it, plus `snx_hac_encrypt` (tadamw) |
 | `tests/` | CTest executables + CLI roundtrip script |
 
 ## Open items
@@ -254,3 +257,9 @@ can run in parallel later.
   encoder (`taw_seek_encode`), which fits on an even sample of the whole input.
 - Big-endian: the code is written for it (byte-wise I/O, CRC table path
   byte-swaps), but it has not run on a big-endian machine yet.
+- taw-nx: the XCI's update, normal and logo partitions stay encrypted
+  (small); personalized tickets' title keys are not decrypted, so those NCAs
+  stay encrypted. The encoder writes a temporary plain image the size of the
+  dump next to the output; a source that decrypts on the fly would avoid it.
+  Incompressible blocks (compressed game assets) pay a full coding pass before
+  being stored; an entropy pre-check could skip them.
