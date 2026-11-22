@@ -61,3 +61,30 @@ execute_process(COMMAND "${TAW}" x "${WORK}/in.awseek" ${size} 1 "${WORK}/bad.bi
 if(rc EQUAL 0)
   message(FATAL_ERROR "out-of-range extract succeeded")
 endif()
+
+# Profile 1 (the fitted mixer), forced, both weight formats.
+foreach(w f16 q8)
+  run("${TAW}" c -l 1 -p mix -w ${w} "${INPUT}" "${WORK}/in.${w}.aw")
+  run("${TAW}" d "${WORK}/in.${w}.aw" "${WORK}/out.${w}.bin")
+  same("${INPUT}" "${WORK}/out.${w}.bin")
+  execute_process(COMMAND "${TAW}" i "${WORK}/in.${w}.aw" OUTPUT_VARIABLE info)
+  if(NOT info MATCHES "profile: +1 \\(F32_STRICT_MIX\\)" OR NOT info MATCHES "\\(${w}\\)")
+    message(FATAL_ERROR "unexpected info output:\n${info}")
+  endif()
+endforeach()
+
+# Profile 1, seekable, with a range that straddles blocks.
+run("${TAW}" c -l 1 -p mix -B 16384 "${INPUT}" "${WORK}/mix.awseek")
+run("${TAW}" x "${WORK}/mix.awseek" 15000 5000 "${WORK}/mix_range.bin")
+file(READ "${INPUT}" want OFFSET 15000 LIMIT 5000 HEX)
+file(READ "${WORK}/mix_range.bin" got HEX)
+if(NOT want STREQUAL got)
+  message(FATAL_ERROR "profile 1 range extract mismatch")
+endif()
+
+# Bad option values are usage errors.
+execute_process(COMMAND "${TAW}" c -p bogus "${INPUT}" "${WORK}/bad.aw"
+                RESULT_VARIABLE rc ERROR_QUIET)
+if(NOT rc EQUAL 2)
+  message(FATAL_ERROR "bad -p accepted (${rc})")
+endif()

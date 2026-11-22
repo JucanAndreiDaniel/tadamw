@@ -17,13 +17,18 @@ static const char *prog = "taw";
 static void usage(FILE *f)
 {
 	fprintf(f,
-	    "usage: taw c [-l level] [-s] [-B block_size] <in> <out>\n"
+	    "usage: taw c [-l level] [-s] [-B block_size] [-p predictor] [-w weights]\n"
+	    "             <in> <out>\n"
 	    "       taw d <in> <out>\n"
 	    "       taw x <in.awseek> <offset> <length> <out>\n"
 	    "       taw i <in>\n"
 	    "       taw --version\n"
 	    "\n"
 	    "  c   compress (.awseek output or -s gives the seekable variant)\n"
+	    "      -l 1..9          fitting effort (default 5)\n"
+	    "      -p auto|order0|mix  predictor (default auto: the fitted mixer\n"
+	    "                       if it beats order0)\n"
+	    "      -w auto|f16|q8   mixer weight format (default auto)\n"
 	    "  d   decompress a .aw or .awseek archive\n"
 	    "  x   extract an uncompressed byte range from a .awseek archive\n"
 	    "  i   print header information\n"
@@ -103,6 +108,35 @@ static bool parse_u64(const char *s, uint64_t *v)
 	return true;
 }
 
+static const char *const predictors[] = {"auto", "order0", "mix", nullptr};
+static const char *const weights[] = {"auto", "f16", "q8", nullptr};
+
+static bool parse_choice(const char *s, const char *const *names,
+    uint64_t *v)
+{
+	for (uint64_t i = 0; names[i]; i++)
+		if (strcmp(s, names[i]) == 0) {
+			*v = i;
+			return true;
+		}
+	return false;
+}
+
+static const char *profile_name(unsigned p)
+{
+	switch (p) {
+	case 0: return "INT_ORDER0";
+	case 1: return "F32_STRICT_MIX";
+	default: return "?";
+	}
+}
+
+static const char *quant_name(unsigned q)
+{
+	static const char *const n[] = {"none", "f16", "bf16", "f32", "q8"};
+	return q < 5 ? n[q] : "?";
+}
+
 static int cmd_compress(int argc, char **argv)
 {
 	taw_params p = {0};
@@ -114,6 +148,14 @@ static int cmd_compress(int argc, char **argv)
 		} else if (strcmp(argv[i], "-l") == 0 && i + 1 < argc &&
 		    parse_u64(argv[i + 1], &v) && v <= 9) {
 			p.level = (int)v;
+			i++;
+		} else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc &&
+		    parse_choice(argv[i + 1], predictors, &v)) {
+			p.predictor = (taw_predictor)v;
+			i++;
+		} else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc &&
+		    parse_choice(argv[i + 1], weights, &v)) {
+			p.weights = (taw_weights)v;
 			i++;
 		} else if (strcmp(argv[i], "-B") == 0 && i + 1 < argc &&
 		    parse_u64(argv[i + 1], &v) && v <= UINT32_MAX) {
@@ -245,8 +287,9 @@ static int cmd_info(int argc, char **argv)
 		return fail(argv[0], taw_strerror(st));
 	printf("kind:       %s\n",
 	    info.kind == TAW_KIND_SEEKABLE ? "awseek" : "aw");
-	printf("profile:    %u\n", info.arith_profile);
-	printf("quant:      %u\n", info.quant);
+	printf("profile:    %u (%s)\n", info.arith_profile,
+	    profile_name(info.arith_profile));
+	printf("quant:      %u (%s)\n", info.quant, quant_name(info.quant));
 	printf("level:      %u\n", info.level);
 	if (info.kind == TAW_KIND_SEEKABLE)
 		printf("block_size: %" PRIu32 "\n", info.block_size);
