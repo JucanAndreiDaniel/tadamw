@@ -15,3 +15,9 @@ taw_test(awseek)
 
 add_test(NAME cli_version COMMAND taw_cli --version)
 set_tests_properties(cli_version PROPERTIES PASS_REGULAR_EXPRESSION "^taw [0-9]+\\.[0-9]+\\.[0-9]+")
+
+add_test(NAME cli_roundtrip
+         COMMAND ${CMAKE_COMMAND} -DTAW=$<TARGET_FILE:taw_cli>
+                 "-DSOURCES=${PROJECT_SOURCE_DIR}/docs/format.md|${PROJECT_SOURCE_DIR}/docs/design.md"
+                 -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli_work
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cli_roundtrip.cmake)

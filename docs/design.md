@@ -71,6 +71,8 @@ can run in parallel later.
 | path | role |
 |------|------|
 | `include/taw/taw.h` | public API |
+| `src/api.c` | public entry points, variant dispatch |
+| `src/buf.c` | growable output buffer |
 | `src/crc32c.c` | CRC-32C |
 | `src/rc.c` | binary range coder (format.md §4) |
 | `src/predictor.c` | arithmetic profiles (profile 0 for now) |
