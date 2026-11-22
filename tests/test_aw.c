@@ -168,7 +168,7 @@ int main(void)
 	CHECK(taw_compress(&one, 1, &bad, &o, &on) == TAW_E_ARG);
 	bad = (taw_params){.predictor = (taw_predictor)7};
 	CHECK(taw_compress(&one, 1, &bad, &o, &on) == TAW_E_ARG);
-	bad = (taw_params){.weights = (taw_weights)7};
+	bad = (taw_params){.weights = (taw_weights)(TAW_WEIGHTS_IQ2 + 1)};
 	CHECK(taw_compress(&one, 1, &bad, &o, &on) == TAW_E_ARG);
 	/* Too small for any model inside the n/32 budget. */
 	bad = (taw_params){.predictor = TAW_PREDICTOR_MIX};

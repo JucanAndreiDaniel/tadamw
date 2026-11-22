@@ -51,7 +51,7 @@ identical probabilities for every bit.
 | id | name            | model section | status |
 |----|-----------------|---------------|--------|
 | 0  | `INT_ORDER0`    | empty (`model_size = 0`, `quant = 0`) | implemented, placeholder |
-| 1  | `F32_STRICT_MIX`| mixer shape and weights, §5.1; quant `F16` or `Q8` | implemented |
+| 1  | `F32_STRICT_MIX`| mixer shape and weights, §5.1; quant `F16`, `Q8`, `Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4` or `IQ2` | implemented |
 | 2..255 | — | — | reserved, refuse |
 
 ### 2.1 Profile 0: `INT_ORDER0`
@@ -318,7 +318,32 @@ the profile allows. F16 is the standard format.
 | 2  | `BF16` | bfloat16 (upper 16 bits of binary32) |
 | 3  | `F32`  | IEEE 754 binary32 |
 | 4  | `Q8`   | int8 rows with one F16 scale per row (§5.1) |
-| 5..255 | — | reserved, refuse |
+| 5  | `Q4`   | 4-bit integers, one F16 scale per row |
+| 6  | `Q2`   | 2-bit integers, an F16 scale and an F16 offset per row |
+| 7  | `FP8`  | FP8 E4M3 values, one F16 scale per row |
+| 8  | `NVFP4`| FP4 E2M1 values in blocks of 16 with an E4M3 scale per block, one F16 scale per row |
+| 9  | `IQ8`  | 8-bit indices into a non-linear table, one F16 scale per row |
+| 10 | `IQ4`  | 4-bit indices into a non-linear table (ggml's IQ4_NL values), one F16 scale per row |
+| 11 | `IQ2`  | 2-bit indices into a non-linear table, one F16 scale per row |
+| 12..255 | — | reserved, refuse |
+
+Formats 1 and 4..11 are row formats: every row of weights (§5.1) carries
+its own scales. Their exact encodings are in §5.1.
+
+Minifloats used by them (both convert to binary32 exactly):
+
+- **E4M3**: sign bit 7, exponent bits 6..3 (bias 7), mantissa bits 2..0.
+  Exponent 0 is subnormal: `m × 2^-9`; otherwise `(1 + m/8) × 2^(e-7)`.
+  No infinities; `0x7F` and `0xFF` are NaN. The largest value is 448.
+- **E2M1**: a 4-bit code, sign bit 3; bits 2..0 index
+  `{0, 0.5, 1, 1.5, 2, 3, 4, 6}`.
+
+Tables:
+
+- `IQ4_TAB[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113}`
+- `IQ2_TAB[4] = {-127, -38, 38, 127}` (4-level Lloyd-Max for a Gaussian, scaled to 127)
+- `IQ8(k) = k × (|k| + 128)` for the signed byte `k` (−32768..32385; the
+  step grows from 129 near zero to 255 at the ends).
 
 ## 4. Binary range coder
 
@@ -385,11 +410,34 @@ Row encodings:
   weight, `q != -128`. The weight is the binary32 product
   `float(q) * float(scale)`, rounded once.
 
+The remaining row formats all start with a little-endian binary16 scale
+`d` (finite). `float(...)` is exact in every case below, and each `*` and
+`+` is one binary32 operation, rounded to nearest even, in the order
+written. Sub-byte codes are packed little-end first: weight `i` of a
+4-bit format is bits `4(i mod 2)..` of code byte `i / 2`, of a 2-bit
+format bits `2(i mod 4)..` of byte `i / 4`. Unused bits in the last code
+byte MUST be zero. With `len` the row length:
+
+| quant | after `d` | weight `i` |
+|-------|-----------|------------|
+| `Q4`  | `ceil(len/2)` bytes of 4-bit `q` | `float(q - 8) * d` |
+| `Q2`  | binary16 offset `m` (finite), then `ceil(len/4)` bytes of 2-bit `q` | `float(q) * d + m` |
+| `FP8` | `len` E4M3 bytes `q`, not NaN | `e4m3(q) * d` |
+| `NVFP4` | `ceil(len/16)` E4M3 block scales `s[b]` (sign bit 0, not NaN), then `ceil(len/2)` bytes of E2M1 codes `q` | `e2m1(q) * (e4m3(s[i/16]) * d)` |
+| `IQ8` | `len` bytes, signed `k` | `float(IQ8(k)) * d` |
+| `IQ4` | `ceil(len/2)` bytes of 4-bit `q` | `float(IQ4_TAB[q]) * d` |
+| `IQ2` | `ceil(len/4)` bytes of 2-bit `q` | `float(IQ2_TAB[q]) * d` |
+
+Bytes per row: `Q4`/`IQ4` `2 + ceil(len/2)`; `Q2` `4 + ceil(len/4)`;
+`IQ2` `2 + ceil(len/4)`; `FP8`/`IQ8` `2 + len`; `NVFP4`
+`2 + ceil(len/16) + ceil(len/2)`.
+
 `model_size` MUST equal `8` plus the payload size exactly. A decoder MUST
 refuse (format error) any field out of range, non-zero reserved bytes, a
-size mismatch, a non-finite F16 value or scale, or a Q8 value of -128.
-Profile 1 accepts `quant` `F16` and `Q8` only; other quant values are
-unsupported.
+size mismatch, a non-finite F16 value, scale or offset, a Q8 value of
+-128, a NaN E4M3 code, a negative NVFP4 block scale, or non-zero unused
+code bits. Profile 1 accepts the row formats (`quant` 1 and 4..11);
+`BF16`, `F32` and reserved values are unsupported.
 
 A decoder needs about `10 * 2^L * 64 + 2^HB + 4 * 2^MB` bytes of tables
 plus about 4.6 MB fixed (o1 table and APM), and resets them per coding

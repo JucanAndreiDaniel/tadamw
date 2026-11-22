@@ -9,6 +9,7 @@
 #include "half.h"
 #include "header.h"
 #include "p1.h"
+#include "quant.h"
 #include "taw_internal.h"
 #include "testdata.h"
 
@@ -42,9 +43,56 @@ static void put_row(taw_buf *b, uint8_t quant, uint64_t *r, float scale,
 		for (size_t i = 0; i < len; i++)
 			taw_buf_put_u8(b, (uint8_t)(int8_t)(
 			    (int)(td_next(r) % 255) - 127));
-	} else {
+	} else if (quant == TAW_QUANT_F16) {
 		for (size_t i = 0; i < len; i++)
 			put_h(b, wgen(r, scale));
+	} else {
+		/* Random valid codes, so that the goldens pin the decoding
+		 * rules independently of the encoder's quantizer. */
+		uint8_t row[128];
+		const size_t n = (size_t)taw_quant_row_bytes(quant, len);
+		const unsigned nb = (unsigned)(len + 15) / 16;
+		for (size_t i = 0; i < n; i++)
+			row[i] = (uint8_t)td_next(r);
+		const float div = quant == TAW_QUANT_Q4 ? 8.0f :
+		    quant == TAW_QUANT_Q2 ? 3.0f :
+		    quant == TAW_QUANT_FP8 ? 448.0f :
+		    quant == TAW_QUANT_NVFP4 ? 6.0f * 448.0f :
+		    quant == TAW_QUANT_IQ8 ? 32768.0f : 127.0f;
+		uint16_t h = taw_f2h(scale / div);
+		row[0] = (uint8_t)h;
+		row[1] = (uint8_t)(h >> 8);
+		size_t codes = 2, bits = 8;
+		switch (quant) {
+		case TAW_QUANT_Q2:
+			h = taw_f2h(-scale);
+			row[2] = (uint8_t)h;
+			row[3] = (uint8_t)(h >> 8);
+			codes = 4;
+			bits = 2;
+			break;
+		case TAW_QUANT_IQ2: bits = 2; break;
+		case TAW_QUANT_Q4: case TAW_QUANT_IQ4: bits = 4; break;
+		case TAW_QUANT_FP8:
+			for (size_t i = 2; i < n; i++)
+				if ((row[i] & 0x7F) == 0x7F)
+					row[i] = 0x38;
+			break;
+		case TAW_QUANT_NVFP4:
+			for (unsigned k = 0; k < nb; k++) {
+				row[2 + k] &= 0x7F;
+				if (row[2 + k] >= 0x70) /* keep scales moderate */
+					row[2 + k] = 0x38;
+			}
+			codes = 2 + nb;
+			bits = 4;
+			break;
+		default: break;
+		}
+		const size_t per = 8 / bits, used = len % per;
+		if (used)
+			row[codes + len / per] &= (uint8_t)((1u << (used * bits)) - 1);
+		taw_buf_put(b, row, n);
 	}
 }
 
@@ -167,8 +215,10 @@ static void parity(void)
 		if (!hs[i])
 			m.s.sel1 = P1_SEL_NONE;
 		parity_one(&m);
-		m.quant = TAW_QUANT_Q8;
-		parity_one(&m);
+		for (uint8_t q = TAW_QUANT_Q8; q < TAW_QUANT_COUNT; q++) {
+			m.quant = q;
+			parity_one(&m);
+		}
 		/* Large weights: every hidden unit saturates. */
 		m.quant = TAW_QUANT_F16;
 		m.scale = 60000.0f;
@@ -404,6 +454,13 @@ static void golden(void)
 	} want[] = {
 		{TAW_QUANT_F16, 59885, 0x74309CD4u},
 		{TAW_QUANT_Q8, 48112, 0x899F4057u},
+		{TAW_QUANT_Q4, 47020, 0xA78FE21Du},
+		{TAW_QUANT_Q2, 23304, 0x2D02777Au},
+		{TAW_QUANT_FP8, 43808, 0xF5A4AC7Bu},
+		{TAW_QUANT_NVFP4, 44641, 0xD47885B8u},
+		{TAW_QUANT_IQ8, 62559, 0x2AC391B8u},
+		{TAW_QUANT_IQ4, 45922, 0x84FA96FDu},
+		{TAW_QUANT_IQ2, 48256, 0xAF5179FAu},
 	};
 	for (size_t i = 0; i < sizeof want / sizeof *want; i++) {
 		for (int isa = 0; isa < P1_ISA_COUNT; isa++) {

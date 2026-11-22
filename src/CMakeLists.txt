@@ -17,7 +17,7 @@ configure_file(${PROJECT_SOURCE_DIR}/cmake/config.h.in
 
 set(tadamw_sources
   api.c aw.c awseek.c buf.c crc32c.c header.c p1_ctx.c p1_net.c pool.c
-  predictor.c rc.c version.c)
+  predictor.c quant.c rc.c version.c)
 if(TADAMW_ENCODER)
   list(APPEND tadamw_sources fit.c) # AdamW fitting, encoder only
 endif()

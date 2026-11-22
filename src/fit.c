@@ -16,6 +16,7 @@
 #include "format.h"
 #include "half.h"
 #include "p1.h"
+#include "quant.h"
 #include "taw_internal.h"
 
 /* ---- small math without libm ---------------------------------------------- */
@@ -510,40 +511,12 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 
 /* ---- quantization / serialization -------------------------------------------- */
 
-static float clamp_half(float w)
-{
-	return w > 65504.0f ? 65504.0f : w < -65504.0f ? -65504.0f : w;
-}
-
 static void put_row(taw_buf *b, uint8_t quant, const float *w, size_t len)
 {
-	if (quant == TAW_QUANT_Q8) {
-		float amax = 0.0f;
-		for (size_t i = 0; i < len; i++) {
-			float a = w[i] < 0 ? -w[i] : w[i];
-			if (a > amax)
-				amax = a;
-		}
-		uint16_t sh = taw_f2h(clamp_half(amax / 127.0f));
-		float scale = taw_h2f(sh);
-		uint8_t hb[2] = {(uint8_t)sh, (uint8_t)(sh >> 8)};
-		taw_buf_put(b, hb, 2);
-		for (size_t i = 0; i < len; i++) {
-			int q = 0;
-			if (scale > 0.0f) {
-				float r = w[i] / scale;
-				q = (int)(r + (r >= 0 ? 0.5f : -0.5f));
-				q = q > 127 ? 127 : q < -127 ? -127 : q;
-			}
-			taw_buf_put_u8(b, (uint8_t)(int8_t)q);
-		}
-	} else {
-		for (size_t i = 0; i < len; i++) {
-			uint16_t h = taw_f2h(clamp_half(w[i]));
-			uint8_t hb[2] = {(uint8_t)h, (uint8_t)(h >> 8)};
-			taw_buf_put(b, hb, 2);
-		}
-	}
+	uint8_t row[2 * (P1_HMAX + P1_F)];
+	const size_t n = (size_t)taw_quant_row_bytes(quant, len);
+	taw_quant_row_encode(quant, w, (unsigned)len, row);
+	taw_buf_put(b, row, n);
 }
 
 static taw_status serialize(const tnet *t, uint8_t quant, taw_buf *b)
@@ -633,12 +606,13 @@ static size_t enumerate(const p1_shape *geo, uint64_t budget, int quant_pref,
     size_t n, cand *out, size_t cap)
 {
 	size_t k = 0;
-	static const uint8_t quants[] = {TAW_QUANT_F16, TAW_QUANT_Q8};
-	for (size_t qi = 0; qi < 2; qi++) {
+	static const uint8_t quants[] = {TAW_QUANT_F16, TAW_QUANT_Q8,
+		TAW_QUANT_Q4, TAW_QUANT_Q2, TAW_QUANT_FP8, TAW_QUANT_NVFP4,
+		TAW_QUANT_IQ8, TAW_QUANT_IQ4, TAW_QUANT_IQ2};
+	const uint8_t want = taw_quant_from_weights((taw_weights)quant_pref);
+	for (size_t qi = 0; qi < sizeof quants; qi++) {
 		uint8_t q = quants[qi];
-		if (quant_pref == TAW_WEIGHTS_F16 && q != TAW_QUANT_F16)
-			continue;
-		if (quant_pref == TAW_WEIGHTS_Q8 && q != TAW_QUANT_Q8)
+		if (want != TAW_QUANT_NONE && q != want)
 			continue;
 		for (size_t hi = 0; hi < sizeof hidden_opts; hi++) {
 			uint8_t H = hidden_opts[hi];
@@ -746,8 +720,8 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 
 	p1_shape geo = {0};
 	geometry((size_t)unit, &geo);
-	cand cs[256];
-	size_t ncand = enumerate(&geo, budget, p->weights, (size_t)n, cs, 256);
+	cand cs[1024];
+	size_t ncand = enumerate(&geo, budget, p->weights, (size_t)n, cs, 1024);
 	if (ncand == 0)
 		return forced ? TAW_E_ARG : TAW_OK;
 

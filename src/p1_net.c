@@ -6,6 +6,7 @@
 #include "format.h"
 #include "half.h"
 #include "p1.h"
+#include "quant.h"
 #include "taw_internal.h"
 
 /* ---- model head ------------------------------------------------------------ */
@@ -50,7 +51,7 @@ taw_status p1_head_parse(const uint8_t *p, size_t n, p1_shape *s)
 
 bool p1_quant_supported(uint8_t quant)
 {
-	return quant == TAW_QUANT_F16 || quant == TAW_QUANT_Q8;
+	return taw_quant_is_row_format(quant);
 }
 
 /* Row geometry: layer 1 has S1 * H rows of P1_F; the output layer has S2
@@ -68,9 +69,8 @@ uint64_t p1_weights_size(const p1_shape *s, uint8_t quant)
 {
 	uint64_t r1, l1, r2, l2;
 	rows(s, &r1, &l1, &r2, &l2);
-	if (quant == TAW_QUANT_Q8)
-		return r1 * (2 + l1) + r2 * (2 + l2);
-	return 2 * (r1 * l1 + r2 * l2);
+	return r1 * taw_quant_row_bytes(quant, l1) +
+	    r2 * taw_quant_row_bytes(quant, l2);
 }
 
 /* ---- ISA selection ----------------------------------------------------------- */
@@ -140,49 +140,30 @@ p1_isa p1_isa_current(void)
 
 /* ---- loading ------------------------------------------------------------------ */
 
-static bool half_finite(uint16_t h)
-{
-	return (h & 0x7C00u) != 0x7C00u;
-}
-
 /* Decode n_rows rows of len weights into dst[row * stride + col * cstride]. */
 static taw_status read_rows(const uint8_t **pp, uint8_t quant, p1_isa isa,
     uint64_t n_rows, unsigned len, float *tmp, float *dst, size_t row_stride,
     size_t col_stride)
 {
 	const uint8_t *p = *pp;
-	uint16_t hb[P1_HMAX + P1_F];
-	for (uint64_t r = 0; r < n_rows; r++) {
-		if (quant == TAW_QUANT_Q8) {
-			uint16_t sh = taw_rd16(p);
-			if (!half_finite(sh))
-				return TAW_E_FORMAT;
-			float scale = taw_h2f(sh);
-			p += 2;
-			for (unsigned i = 0; i < len; i++) {
-				int8_t q = (int8_t)p[i];
-				if (q == -128)
-					return TAW_E_FORMAT;
-				tmp[i] = (float)q * scale;
-			}
-			p += len;
-		} else {
+	const size_t rb = (size_t)taw_quant_row_bytes(quant, len);
+	for (uint64_t r = 0; r < n_rows; r++, p += rb) {
+#if TAW_X86_SIMD
+		if (quant == TAW_QUANT_F16 && isa >= P1_ISA_AVX2) {
+			uint16_t hb[P1_HMAX + P1_F];
 			for (unsigned i = 0; i < len; i++) {
 				hb[i] = taw_rd16(p + 2 * i);
-				if (!half_finite(hb[i]))
+				if ((hb[i] & 0x7C00u) == 0x7C00u)
 					return TAW_E_FORMAT;
 			}
-			p += 2 * len;
-#if TAW_X86_SIMD
-			if (isa >= P1_ISA_AVX2) {
-				p1_f16_to_f32_f16c(hb, tmp, len);
-			} else
+			p1_f16_to_f32_f16c(hb, tmp, len);
+		} else
 #endif
-			{
-				(void)isa;
-				for (unsigned i = 0; i < len; i++)
-					tmp[i] = taw_h2f(hb[i]);
-			}
+		{
+			(void)isa;
+			taw_status st = taw_quant_row_decode(quant, p, len, tmp);
+			if (st != TAW_OK)
+				return st;
 		}
 		for (unsigned i = 0; i < len; i++)
 			dst[r * row_stride + i * col_stride] = tmp[i];

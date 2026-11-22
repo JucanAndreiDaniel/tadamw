@@ -27,7 +27,7 @@ drive a binary range coder (format.md §4).
 | awseek extras | file directory (format.md §7.1), stored blocks/chunks, parallel streaming encoder (`taw_seek_encode`) whose output does not depend on the thread count |
 | libm | never used, in the encoder or the decoder; squash/exp go through SIMD intrinsics or tables |
 | model shape | table/MLP split chosen heuristically per input, not fixed |
-| weight formats (profile 1) | F16 and INT8 (Q8) from the start |
+| weight formats (profile 1) | F16 and INT8 (Q8) from the start; then Q4, Q2, FP8 (E4M3), NVFP4, IQ8, IQ4, IQ2 (format.md §3, §5.1) |
 | SIMD | scalar reference + AVX2/F16C and AVX-512 paths (ideas: ~/ucas, ~/q2_kernel kernels) |
 | GPU | the encoder may use a GPU for fitting, as a hybrid. Decoders are CPU by default and may opt in to a GPU (hybrid or fully). A CPU decoder is always available and is never dropped |
 | profile 1 inputs | 12 adaptive integer context models (o0-o4, o6, word, 5 sparse), each giving a direct and an indirect (bit history) estimate, plus a match model: 25 inputs + bias |
@@ -173,6 +173,36 @@ Level sets the effort only:
 stderr; `TAW_FIT_DEBUG=a` fits all candidates (slow; that is how the
 prior was calibrated).
 
+## Weight formats
+
+All formats are dequantized to binary32 once, when the model loads, so
+they cost nothing per bit: they only trade model bytes for accuracy.
+Mixer rows are short (26 or H + 1 weights), so every format keeps its
+scales per row rather than ggml's 32- or 256-weight blocks, and the
+"IQ" formats are plain tables (no E8 lattice or super-blocks):
+
+- `Q4` is ggml's Q4_0 per row; `Q2` is affine (scale and offset per row,
+  like Q2_K's min) because two symmetric bits have no zero.
+- `FP8` is E4M3 with an F16 row scale. `NVFP4` is NVIDIA's layout
+  (E2M1, an E4M3 scale per 16 weights) with an F16 row scale in place of
+  the per-tensor FP32 one.
+- `IQ4` uses ggml's IQ4_NL values. `IQ2` is the 4-level Lloyd-Max
+  quantizer of a Gaussian. `IQ8` is `k (|k| + 128)`: steps of 129 near
+  zero widen to 255 at the ends, which suits weights peaked at zero, and
+  all 256 codes are valid (Q8 refuses -128).
+- The quantizer (encoder only) searches the row scale on a grid around
+  `amax / max level` and refines it by least squares on the assignment;
+  `Q2` searches the clipped range and solves the 2x2 least squares;
+  `NVFP4` tries a few row scales and, per block, the E4M3 codes around the
+  ideal one. Every choice is scored with the decoder's own dequantized
+  values.
+
+On the bench corpus at level 1 (every candidate fitted, archive estimate
+relative to the best), the 4-bit formats win most often: IQ4/Q4 on libc,
+roff and C source, FP8 on text and the word list. F16 and IQ2 never win;
+IQ2 loses 2-15% (post-training quantization to 2 bits is too coarse for
+the hidden layer).
+
 ## Decoder
 
 1. Validate the header and refuse unsupported `(profile, quant)` pairs.
@@ -222,6 +252,7 @@ can run in parallel later.
 | `src/p1_avx512.c` | AVX-512F mixer |
 | `src/p1_simd_out.h` | mixer pieces shared by the AVX2 and AVX-512 files |
 | `src/half.h` | binary16 conversions |
+| `src/quant.c` | weight row formats: sizes, validated decoding, the encoder's quantizer |
 | `src/fit.c` | encoder: feature pass, candidates, AdamW, quantization, choice |
 | `src/header.c` | header (de)serialization and validation |
 | `src/aw.c` | `.aw` stream encode/decode |

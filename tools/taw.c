@@ -34,7 +34,8 @@ static void usage(FILE *f)
 	    "      -l 1..9          fitting effort (default 5)\n"
 	    "      -p auto|order0|mix  predictor (default auto: the fitted mixer\n"
 	    "                       if it beats order0)\n"
-	    "      -w auto|f16|q8   mixer weight format (default auto)\n"
+	    "      -w auto|f16|q8|q4|q2|fp8|nvfp4|iq8|iq4|iq2\n"
+	    "                       mixer weight format (default auto)\n"
 	    "      -j N             worker threads for .awseek (default 1)\n"
 	    "  d   decompress a .aw or .awseek archive\n"
 	    "  x   extract a byte range, or a named file, from a .awseek archive\n"
@@ -117,7 +118,8 @@ static bool parse_u64(const char *s, uint64_t *v)
 
 #if TAW_HAVE_ENCODER
 static const char *const predictors[] = {"auto", "order0", "mix", nullptr};
-static const char *const weights[] = {"auto", "f16", "q8", nullptr};
+static const char *const weights[] = {"auto", "f16", "q8", "q4", "q2", "fp8",
+	"nvfp4", "iq8", "iq4", "iq2", nullptr};
 
 static bool parse_choice(const char *s, const char *const *names,
     uint64_t *v)
@@ -143,8 +145,9 @@ static const char *profile_name(unsigned p)
 
 static const char *quant_name(unsigned q)
 {
-	static const char *const n[] = {"none", "f16", "bf16", "f32", "q8"};
-	return q < 5 ? n[q] : "?";
+	static const char *const n[] = {"none", "f16", "bf16", "f32", "q8",
+		"q4", "q2", "fp8", "nvfp4", "iq8", "iq4", "iq2"};
+	return q < sizeof n / sizeof *n ? n[q] : "?";
 }
 
 #if TAW_HAVE_ENCODER

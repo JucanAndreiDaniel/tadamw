@@ -74,11 +74,19 @@ typedef enum {
 	                         too small for any model */
 } taw_predictor;
 
-/* Weight format for the mixer. AUTO lets the encoder choose. */
+/* Weight format for the mixer (docs/format.md §3). AUTO lets the encoder
+ * choose among all of them. */
 typedef enum {
 	TAW_WEIGHTS_AUTO = 0,
 	TAW_WEIGHTS_F16,
 	TAW_WEIGHTS_Q8,
+	TAW_WEIGHTS_Q4,    /* 4-bit integers, row scale */
+	TAW_WEIGHTS_Q2,    /* 2-bit integers, row scale and offset */
+	TAW_WEIGHTS_FP8,   /* E4M3, row scale */
+	TAW_WEIGHTS_NVFP4, /* E2M1 in 16-weight blocks with E4M3 scales */
+	TAW_WEIGHTS_IQ8,   /* 8-bit non-linear table, row scale */
+	TAW_WEIGHTS_IQ4,   /* 4-bit non-linear table (IQ4_NL), row scale */
+	TAW_WEIGHTS_IQ2,   /* 2-bit non-linear table, row scale */
 } taw_weights;
 
 typedef struct {
