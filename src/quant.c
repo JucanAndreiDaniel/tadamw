@@ -227,6 +227,7 @@ typedef struct {
 
 static void levels_for(uint8_t quant, levels *L)
 {
+	memset(L, 0, sizeof *L);
 	unsigned n = 0;
 	switch (quant) {
 	case TAW_QUANT_Q8:

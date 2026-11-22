@@ -43,7 +43,7 @@ enum {
 	GPU_BLK = 1088,       /* words per prepared batch */
 	GPU_SHARED = 46080,   /* shared memory fit_gpu.comp needs (45200), rounded up */
 };
-static_assert(GPU_NB == FIT_BATCH, "the CPU trainer's batch");
+static_assert((int)GPU_NB == (int)FIT_BATCH, "the CPU trainer's batch");
 #define GPU_STAGE ((VkDeviceSize)32 << 20) /* staging buffer bytes */
 /* VRAM we allow ourselves: the GPU is likely shared with a desktop. */
 #define GPU_VRAM_MAX ((VkDeviceSize)600 << 20)

@@ -150,7 +150,8 @@ static inline uint64_t sample_index(uint64_t bit, uint64_t want,
     uint64_t total)
 {
 #if defined(__SIZEOF_INT128__)
-	return (uint64_t)(((unsigned __int128)bit * want) / total);
+	__extension__ typedef unsigned __int128 u128; /* -Wpedantic */
+	return (uint64_t)(((u128)bit * want) / total);
 #else
 	/* want <= 2^22 and bit <= total: exact while total < 2^42 bits */
 	return bit / total * want + bit % total * want / total;
