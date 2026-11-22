@@ -68,9 +68,12 @@ taw_status taw_pred_init(taw_pred *pr, uint8_t profile, uint8_t quant,
 		taw_pred_reset(pr);
 		return TAW_OK;
 	}
-	struct taw_p1 *m = calloc(1, sizeof *m);
+	/* p1_ctx has 32-byte-aligned members, so plain calloc (16-byte
+	 * alignment on glibc) is not enough for the AVX2 aligned loads. */
+	struct taw_p1 *m = aligned_alloc(_Alignof(struct taw_p1), sizeof *m);
 	if (!m)
 		return TAW_E_NOMEM;
+	memset(m, 0, sizeof *m);
 	m->apm2 = malloc(65536 * 33 * sizeof *m->apm2);
 	if (!m->apm2) {
 		free(m);

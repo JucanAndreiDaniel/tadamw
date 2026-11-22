@@ -229,7 +229,9 @@ static taw_status collect(const taw_source *in, uint64_t unit,
 	collect_job J = {.in = in, .view = taw_source_view(in), .n = n,
 		.unit = unit, .total = total, .want = want, .geo = geo};
 	J.sm = malloc((size_t)(want ? want : 1) * sizeof *J.sm);
-	J.ctx = calloc(threads, sizeof *J.ctx);
+	J.ctx = aligned_alloc(_Alignof(p1_ctx), (size_t)threads * sizeof *J.ctx);
+	if (J.ctx)
+		memset(J.ctx, 0, (size_t)threads * sizeof *J.ctx);
 	J.buf = calloc(threads, sizeof *J.buf);
 	J.st = calloc(units ? (size_t)units : 1, sizeof *J.st);
 	taw_status st = TAW_E_NOMEM;
