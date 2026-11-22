@@ -19,6 +19,7 @@
 #include "format.h"
 #include "half.h"
 #include "p1.h"
+#include "p8.h"
 #include "quant.h"
 #include "taw_internal.h"
 
@@ -650,6 +651,289 @@ static const struct {
 	{1u << 22, 8, 12},
 };
 
+/* ---- profile 8: fit the frozen features and adaptive weights ----------------
+ * Encoder-only. The decoder never fits anything: the frozen first layer,
+ * the int16 initial output weights and the per-expert rates are in the
+ * model, and the update arithmetic is the fixed integer rule in p8.c.
+ * Fitting uses binary32; the final estimate replays the exact mixer. */
+typedef struct {
+	p1_shape s;
+	uint8_t q1, q2;
+	uint8_t ushift;
+} p8cand;
+
+static const p8cand p8_shapes[] = {
+	{{.hidden = 16, .sel1 = P1_SEL_NONE, .sel2 = P1_SEL_BITPOS},
+	 TAW_QUANT_Q8, TAW_QUANT_Q8, 22},
+	{{.hidden = 8, .sel1 = P1_SEL_NONE, .sel2 = P1_SEL_C0},
+	 TAW_QUANT_Q8, TAW_QUANT_Q8, 22},
+	{{.hidden = 8, .sel1 = P1_SEL_BITPOS, .sel2 = P1_SEL_NONE},
+	 TAW_QUANT_Q8, TAW_QUANT_Q8, 22},
+	{{.hidden = 4, .sel1 = P1_SEL_BITPOS, .sel2 = P1_SEL_C0},
+	 TAW_QUANT_Q8, TAW_QUANT_Q8, 22},
+	{{.hidden = 0, .sel1 = P1_SEL_NONE, .sel2 = P1_SEL_C0},
+	 TAW_QUANT_NONE, TAW_QUANT_Q8, 22},
+};
+static const uint8_t p8_rate_choices[] = {0, 1, 2, 4, 8, 16, 32};
+enum { P8_PREFIX = 1 << 17 }; /* dense bits used to fit the rates */
+
+/* A source over the first `size` bytes of another source, to collect a
+ * dense (every bit) feature sequence for the rate fit. */
+typedef struct {
+	const taw_source *in;
+	uint64_t off;
+} p8_prefix;
+
+static taw_status p8_prefix_read(void *ctx, uint64_t off, void *dst, size_t n)
+{
+	const p8_prefix *p = ctx;
+	return p->in->read_at(p->in->ctx, p->off + off, dst, n);
+}
+
+static void p8_sample_x(const sample *u, float x[P1_XPAD])
+{
+	for (unsigned i = P1_F; i < P1_XPAD; i++)
+		x[i] = 0.0f;
+	for (unsigned i = 0; i < P1_NCTX; i++)
+		x[i] = (float)u->st[i] * (1.0f / 256.0f);
+	x[P1_IN_BIAS] = 1.0f;
+}
+
+/* APM stages of the coding pass (predictor.c), so the size estimate uses
+ * the probability that actually reaches the range coder. */
+typedef struct {
+	uint16_t a1[256 * 33];
+	uint16_t *a2;
+	uint16_t row[33];
+} p8apm;
+
+static void p8apm_reset(p8apm *a);
+
+static void p8apm_init(p8apm *a)
+{
+	a->a2 = malloc(65536 * 33 * sizeof *a->a2);
+	if (!a->a2)
+		return;
+	for (int j = 0; j < 33; j++)
+		a->row[j] = (uint16_t)p1_squash((j - 16) * 128);
+	p8apm_reset(a);
+}
+
+static void p8apm_reset(p8apm *a)
+{
+	if (!a->a2)
+		return;
+	for (size_t c = 0; c < 256; c++)
+		memcpy(a->a1 + c * 33, a->row, sizeof a->row);
+	for (size_t c = 0; c < 65536; c++)
+		memcpy(a->a2 + c * 33, a->row, sizeof a->row);
+}
+
+static inline void p8apm_update(uint16_t *e, int bit)
+{
+	*e = bit ? (uint16_t)(*e + ((65535u - *e) >> 6))
+		 : (uint16_t)(*e - (*e >> 6));
+}
+
+/* Replay the exact profile 8 arithmetic over a feature sequence, with the
+ * stored weights or with online updates. */
+static double p8_bits(p8_mix *m, p8apm *apm, const sample *sm, size_t ns,
+    uint8_t rate, bool adapt)
+{
+	const float *ct = cost_tab();
+	if (!ct)
+		return 8.0;
+	if (apm)
+		p8apm_reset(apm);
+	memset(m->rate, rate, m->E);
+	p8_reset(m);
+	double sum = 0.0;
+	for (size_t k = 0; k < ns; k++) {
+		const sample *u = &sm[k];
+		const p1_sel_ctx sc = sample_sc(u);
+		alignas(32) float x[P1_XPAD];
+		int32_t e[P8_MAXE];
+		float h[P1_HMAX];
+		p8_sample_x(u, x);
+		p8_features(m, x, &sc, e, h);
+		const uint32_t pm = p1_squash(p8_eval(m, x, e, h, &sc));
+		uint32_t q1 = pm, q2 = pm, a1i = 0, a2i = 0;
+		if (apm) {
+			const uint32_t sv = (uint32_t)(p1_stretch_tab[pm >> 4] + 2048);
+			const uint32_t lo = sv >> 7, w = sv & 127;
+			const size_t r1 = (size_t)sc.c0 * 33;
+			const size_t r2 = ((size_t)sc.c1 << 8 | sc.c0) * 33;
+			q1 = (apm->a1[r1 + lo] * (128 - w) +
+			    apm->a1[r1 + lo + 1] * w) >> 7;
+			q2 = (apm->a2[r2 + lo] * (128 - w) +
+			    apm->a2[r2 + lo + 1] * w) >> 7;
+			a1i = (uint32_t)(r1 + lo + (w >> 6));
+			a2i = (uint32_t)(r2 + lo + (w >> 6));
+		}
+		const uint32_t p = (2 * pm + q1 + q2) >> 2;
+		sum += ct[u->bit ? p : 65536u - p];
+		if (apm) {
+			p8apm_update(&apm->a1[a1i], u->bit);
+			p8apm_update(&apm->a2[a2i], u->bit);
+		}
+		if (adapt)
+			p8_update(m, e, &sc, u->bit, pm);
+	}
+	return ns ? sum / (double)ns : 8.0;
+}
+
+static taw_status p8_fit_one(const p1_shape *geo, const sample *sm, size_t ns, const sample *dense,
+    size_t ndense, const p8cand *c0, uint64_t n, int lv, taw_buf *model,
+    double *estimate)
+{
+	*estimate = 1e300;
+	p1_shape s = c0->s;
+	s.lines_log2 = geo->lines_log2;
+	s.hist_log2 = geo->hist_log2;
+	s.match_log2 = geo->match_log2;
+	const unsigned H = s.hidden;
+	const unsigned E = H ? H + 1 : P1_F;
+	const uint8_t q1 = c0->q1;
+	tnet t;
+	taw_status st = tnet_init(&t, &s, 0x5EED01ull);
+	if (st != TAW_OK)
+		return st;
+	tnet_train(&t, sm, ns, effort[lv].epochs, 0xC0FFEEull);
+
+	uint8_t head[P8_MODEL_HEAD];
+	p8_head_write(head, &s, q1, c0->q2, c0->ushift);
+	taw_buf_put(model, head, sizeof head);
+	for (size_t set = 0; H && set < t.s1; set++)
+		for (unsigned j = 0; j < H; j++)
+			put_row(model, q1, t.w + set * t.row1 + j * P1_F, P1_F);
+	const size_t w2_off = model->n;
+	for (size_t set = 0; set < t.s2; set++)
+		put_row(model, c0->q2, t.w + t.n1 + set * t.row2, E);
+	tnet_free(&t);
+	taw_buf_put(model, (const uint8_t[26]){0}, E); /* rates, fitted below */
+	if (model->oom)
+		return TAW_E_NOMEM;
+
+	p8_mix mix;
+	st = p8_load(&mix, model->p, model->n);
+	if (st != TAW_OK)
+		return st;
+	/* First half of the dense sequence fits the rate; the second half
+	 * (unseen by that choice) estimates the coded size. */
+	p8apm apm;
+	p8apm_init(&apm);
+	if (!apm.a2) {
+		p8_free(&mix);
+		return TAW_E_NOMEM;
+	}
+	const size_t half = ndense / 2;
+	uint8_t bestrate = 0;
+	double bestbits = 8.0;
+	for (size_t i = 0; i < sizeof p8_rate_choices; i++) {
+		const double b = p8_bits(&mix, &apm, dense, half,
+		    p8_rate_choices[i], true);
+		if (b < bestbits) {
+			bestbits = b;
+			bestrate = p8_rate_choices[i];
+		}
+	}
+	memset(model->p + w2_off + (size_t)p1_sel_size[s.sel2] *
+	    (c0->q2 == TAW_QUANT_Q8 ? E + 2 : 2 * E), bestrate, E);
+	const double bits = p8_bits(&mix, &apm, dense + half, ndense - half,
+	    bestrate, true);
+	p8_free(&mix);
+	free(apm.a2);
+	if (getenv("TAW_FIT_DEBUG"))
+		fprintf(stderr, "    p8 H=%u s1=%u s2=%u rate=%u heldout=%.4f "
+		    "model=%zu\n", H, s.sel1, s.sel2, bestrate, bits,
+		    model->n);
+	*estimate = bits * (double)n + (double)model->n;
+	return TAW_OK;
+}
+
+/* Fit all shapes. Fitting and replay are serial, so the result does not
+ * depend on params->threads. */
+static taw_status p8_fit_source(const taw_source *in, uint64_t unit,
+    const taw_params *p, taw_model_choice *out)
+{
+	const uint64_t n = in->size;
+	const uint64_t budget = n / 32;
+	p1_shape geo = {0};
+	geometry((size_t)unit, &geo);
+	size_t nc = 0;
+	for (size_t i = 0; i < sizeof p8_shapes / sizeof *p8_shapes; i++) {
+		p1_shape s = p8_shapes[i].s;
+		s.lines_log2 = geo.lines_log2;
+		s.hist_log2 = geo.hist_log2;
+		s.match_log2 = geo.match_log2;
+		if (p8_model_size(&s, p8_shapes[i].q1, p8_shapes[i].q2) <= budget)
+			nc++;
+	}
+	if (!nc)
+		return TAW_E_ARG;
+	static const uint32_t samples[] = {0, 1u << 18, 1u << 19, 1u << 19,
+		1u << 20, 1u << 20, 1u << 21, 1u << 21, 1u << 22, 1u << 22};
+	sample *sm = nullptr, *dense = nullptr;
+	size_t ns = 0, ndense = 0;
+	taw_status st = collect(in, unit, &geo, samples[p->level], 1, &sm, &ns);
+	const uint64_t plen = n < P8_PREFIX ? n : P8_PREFIX;
+	p8_prefix px = {.in = in, .off = n / 2};
+	taw_source ps = {.read_at = p8_prefix_read, .ctx = &px, .size = plen};
+	if (st == TAW_OK)
+		st = collect(&ps, unit > plen ? plen : unit, &geo, plen * 8, 1,
+		    &dense, &ndense);
+	taw_buf *models = nullptr;
+	double *est = nullptr;
+	taw_status *sts = nullptr;
+	if (st == TAW_OK) {
+		models = calloc(nc, sizeof *models);
+		est = calloc(nc, sizeof *est);
+		sts = calloc(nc, sizeof *sts);
+		if (!models || !est || !sts)
+			st = TAW_E_NOMEM;
+	}
+	size_t bi = 0;
+	if (st == TAW_OK) {
+		for (size_t i = 0, k = 0; i < sizeof p8_shapes / sizeof *p8_shapes;
+		    i++) {
+			p1_shape s = p8_shapes[i].s;
+			s.lines_log2 = geo.lines_log2;
+			s.hist_log2 = geo.hist_log2;
+			s.match_log2 = geo.match_log2;
+			if (p8_model_size(&s, p8_shapes[i].q1, p8_shapes[i].q2) >
+			    budget)
+				continue;
+			sts[k] = p8_fit_one(&geo, sm, ns, dense, ndense, &p8_shapes[i], n,
+			    p->level, &models[k], &est[k]);
+			if (getenv("TAW_FIT_DEBUG") && sts[k] == TAW_OK)
+				fprintf(stderr, "taw p8 fit: H=%u s1=%u s2=%u "
+				    "model=%zu est=%.0f B\n", s.hidden, s.sel1,
+				    s.sel2, models[k].n, est[k]);
+			if (sts[k] == TAW_OK && (bi == k || est[k] < est[bi]))
+				bi = k;
+			k++;
+		}
+		for (size_t k = 0; k < nc; k++)
+			if (sts[k] != TAW_OK)
+				st = sts[k];
+	}
+	if (st == TAW_OK && models && est) {
+		out->profile = TAW_PROFILE_PAQ_MIX;
+		out->quant = TAW_QUANT_NONE;
+		out->model = models[bi].p;
+		out->model_size = models[bi].n;
+		models[bi] = (taw_buf){0};
+	}
+	for (size_t k = 0; models && k < nc; k++)
+		taw_buf_free(&models[k]);
+	free(models);
+	free(est);
+	free(sts);
+	free(dense);
+	free(sm);
+	return st;
+}
+
 /* Fitting one candidate: train, quantize, score with the real inference. */
 typedef struct {
 	const cand *cs;
@@ -834,6 +1118,8 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 		.quant = TAW_QUANT_NONE};
 	if (p->predictor == TAW_PREDICTOR_ORDER0)
 		return TAW_OK;
+	if (p->predictor == TAW_PREDICTOR_PAQ)
+		return p8_fit_source(in, unit, p, out);
 	const uint64_t n = in->size;
 	const bool forced = p->predictor == TAW_PREDICTOR_MIX;
 	const uint64_t budget = n / 32;

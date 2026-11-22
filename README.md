@@ -8,9 +8,10 @@ library (`libtadamw`) plus command-line tools. Two variants:
 - `.awseek`: fixed-size blocks plus a seek table for random access, and
   optionally a directory of named files
 
-Status: working draft. The container, range coder, seeking and both
-arithmetic profiles work: profile 0 is an integer order-0 placeholder, and
-profile 1 (`F32_STRICT_MIX`) is the fitted mixer. Adaptive integer
+Status: working draft. The container, range coder, seeking and all three
+arithmetic profiles work: profile 0 is an integer order-0 placeholder,
+profile 1 (`F32_STRICT_MIX`) is the fitted frozen mixer, and profile 8
+(`PAQ_MIX`) adds PAQ-style adaptive output weights. Adaptive integer
 context models feed a small MLP that the encoder fits with AdamW and
 stores as F16 or Q8. Every SIMD path (AVX2/F16C, AVX-512, SSE4.2 CRC) has a
 generic one beside it that produces identical bits. See `docs/`.
@@ -66,6 +67,7 @@ declared. A shared library exports the `taw_*` API alone.
 taw c [-l 1..9] in out.aw              # stream
 taw c -p mix -w q8 in out.aw           # force the mixer, Q8 weights
 taw c -l 9 -g on in out.aw             # fit on a GPU (-g auto: if there is one)
+taw c -p paq in out.aw                 # profile 8, adaptive mixer weights
 taw c [-B block_size] [-j N] in out.awseek   # seekable (or -s), N threads
 taw d archive out
 taw x archive.awseek OFFSET LENGTH out # random-access range

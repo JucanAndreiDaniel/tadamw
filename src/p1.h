@@ -211,12 +211,19 @@ p1_isa p1_isa_current(void);
 
 /* ---- the per-bit loop ------------------------------------------------------- */
 
-/* Profile 1 state. After the mixer, two adaptive APM (SSE) stages refine
- * the probability in the contexts c0 and c1:c0 (format.md §2.2.9). */
+/* Shared per-bit state. After the mixer, two adaptive APM (SSE) stages
+ * refine the probability in the contexts c0 and c1:c0 (format.md §2.2.9). */
 enum { P1_APM_RATE = 6 };
+struct p8_mix; /* profile 8 state, defined in p8.h */
+enum { TAW_P8_MAXE = 26 }; /* profile 8 experts + bias */
 struct taw_p1 {
 	p1_ctx ctx;
-	p1_net net;
+	p1_net net;        /* profile 1 */
+	struct p8_mix *p8; /* profile 8 state, else nullptr */
+	bool paq;
+	p1_sel_ctx sctx;   /* selector context of the bit just predicted */
+	int32_t xe[TAW_P8_MAXE]; /* profile 8 experts of that bit */
+	uint32_t mixp;     /* p_mix of that bit */
 	uint16_t apm1[256 * 33];
 	uint16_t *apm2;    /* [65536 * 33] */
 	uint32_t a1, a2;   /* entries to update after the bit */

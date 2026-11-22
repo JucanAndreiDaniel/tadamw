@@ -12,7 +12,7 @@ drive a binary range coder (format.md §4).
 
 | topic | decision |
 |-------|----------|
-| fitting | offline, encoder only; the decoder uses frozen weights |
+| fitting | offline, encoder only (profile 1); profile 8 also stores initial mixer weights and adapts them while coding |
 | predictor | bitwise mixer: hashed order-N context features → small MLP → P(bit=1) |
 | model budget | `model_size <= raw_size / 32`; a heuristic picks the size |
 | level | effort only (epochs, number of candidate sizes), not a size knob |
@@ -33,6 +33,7 @@ drive a binary range coder (format.md §4).
 | profile 1 inputs | 12 adaptive integer context models (o0-o4, o6, word, 5 sparse), each giving a direct and an indirect (bit history) estimate, plus a match model: 25 inputs + bias |
 | profile 1 mixer | frozen MLP: one optional hidden layer (clamp ±8), weight sets picked by a selector context (the "table" part), fixed `dot4` summation order |
 | profile 1 output | integer squash, then two adaptive integer APM stages (c0, c1:c0) |
+| profile 8 mixer | PAQ-style: the frozen first layer supplies experts, int16 output weights start from the archive and adapt with a stored-rate integer logistic step (format.md §2.3, §5.2) |
 
 ## Profile 1 in short
 
@@ -406,6 +407,7 @@ the partial ones at the edges through a per-thread buffer. The source's
 | `src/p1_run_avx2.c` | the fused AVX2 per-bit loop (encode, decode, skip) |
 | `src/p1_avx512.c` | AVX-512F mixer (used by `p1_net_eval`; the per-bit loop runs the fused AVX2 code) |
 | `src/p1_simd_out.h` | mixer pieces shared by the AVX2 and AVX-512 files |
+| `src/p8.c`, `src/p8.h` | profile 8: model section, expert vector, integer logistic mixer |
 | `src/half.h` | binary16 conversions |
 | `src/quant.c` | weight row formats: sizes, validated decoding, the encoder's quantizer |
 | `src/fit.c` | encoder: feature pass, candidates, AdamW, quantization, choice, CPU/GPU split |

@@ -9,6 +9,7 @@
 #include "half.h"
 #include "header.h"
 #include "p1.h"
+#include "p8.h"
 #include "quant.h"
 #include "taw_internal.h"
 #include "testdata.h"
@@ -478,6 +479,177 @@ static void golden(void)
 	p1_isa_force(-1);
 }
 
+/* ---- profile 8: PAQ-style adaptive mixing ------------------------------------ */
+
+static const p1_shape geo8 = {
+	.lines_log2 = 12, .hist_log2 = 16, .match_log2 = 12,
+	.sel1 = P1_SEL_BITPOS, .sel2 = P1_SEL_C0, .hidden = 8,
+};
+
+typedef struct {
+	p1_shape s;
+	uint8_t q1, q2, ushift;
+	uint64_t seed;
+	float scale;
+} m8_spec;
+
+static taw_buf build_model8(const m8_spec *m)
+{
+	taw_buf b = {0};
+	uint8_t h[P8_MODEL_HEAD];
+	p8_head_write(h, &m->s, m->q1, m->q2, m->ushift);
+	taw_buf_put(&b, h, sizeof h);
+	uint64_t r = m->seed;
+	const unsigned H = m->s.hidden;
+	for (size_t set = 0; H && set < p1_sel_size[m->s.sel1]; set++)
+		for (unsigned j = 0; j < H; j++)
+			put_row(&b, m->q1, &r, m->scale, P1_F);
+	for (size_t set = 0; set < p1_sel_size[m->s.sel2]; set++)
+		put_row(&b, m->q2, &r, m->scale * 0.6f, H ? H + 1 : P1_F);
+	const unsigned E = H ? H + 1 : P1_F;
+	for (unsigned i = 0; i < E; i++)
+		taw_buf_put_u8(&b, (uint8_t)(i % 7 + 1)); /* nonzero rates */
+	REQUIRE(!b.oom);
+	REQUIRE(b.n == p8_model_size(&m->s, m->q1, m->q2));
+	return b;
+}
+
+static taw_status p8_bad(const taw_buf *mb, size_t off, uint8_t v,
+    uint8_t quant)
+{
+	uint8_t saved = mb->p[off];
+	mb->p[off] = v;
+	taw_pred pr;
+	taw_status st = taw_pred_init(&pr, TAW_PROFILE_PAQ_MIX, quant,
+	    mb->p, mb->n);
+	taw_pred_free(&pr);
+	mb->p[off] = saved;
+	return st;
+}
+
+static void p8_validation(void)
+{
+	m8_spec m = {.s = geo8, .q1 = TAW_QUANT_F16, .q2 = TAW_QUANT_Q8,
+		.ushift = 22, .seed = 9, .scale = 0.5f};
+	taw_buf mb = build_model8(&m);
+	taw_pred pr;
+	REQUIRE(taw_pred_init(&pr, TAW_PROFILE_PAQ_MIX, TAW_QUANT_NONE,
+	    mb.p, mb.n) == TAW_OK);
+	taw_pred_free(&pr);
+	CHECK(taw_pred_init(&pr, TAW_PROFILE_PAQ_MIX, TAW_QUANT_F16,
+	    mb.p, mb.n) == TAW_E_UNSUPPORTED);
+	CHECK(taw_pred_init(&pr, TAW_PROFILE_F32_STRICT_MIX, TAW_QUANT_NONE,
+	    mb.p, mb.n) == TAW_E_UNSUPPORTED);
+
+	mb.n--;
+	CHECK(taw_pred_init(&pr, TAW_PROFILE_PAQ_MIX, TAW_QUANT_NONE, mb.p,
+	    mb.n) == TAW_E_FORMAT);
+	taw_buf_free(&mb);
+
+	/* H = 0: no first layer, sel1 must be NONE. */
+	m.s.hidden = 0;
+	m.s.sel1 = P1_SEL_NONE;
+	m.q1 = TAW_QUANT_NONE;
+	mb = build_model8(&m);
+	REQUIRE(taw_pred_init(&pr, TAW_PROFILE_PAQ_MIX, TAW_QUANT_NONE,
+	    mb.p, mb.n) == TAW_OK);
+	taw_pred_free(&pr);
+	CHECK(p8_bad(&mb, 3, P1_SEL_BITPOS, TAW_QUANT_NONE) == TAW_E_FORMAT);
+	CHECK(p8_bad(&mb, 6, TAW_QUANT_F16, TAW_QUANT_NONE) == TAW_E_FORMAT);
+	taw_buf_free(&mb);
+}
+
+static uint32_t golden8(const m8_spec *m, uint32_t *coded_len)
+{
+	enum { N = 1 << 16 };
+	uint8_t *src = malloc(N), *dst = malloc(N);
+	REQUIRE(src && dst);
+	td_fill(src, N, TD_TEXT, 1234);
+	for (size_t i = 0; i < N; i += 4096)
+		memcpy(src + i, src, 64);
+	taw_buf mb = build_model8(m);
+	taw_pred pr;
+	REQUIRE(taw_pred_init(&pr, TAW_PROFILE_PAQ_MIX, TAW_QUANT_NONE,
+	    mb.p, mb.n) == TAW_OK);
+	taw_buf out = {0};
+	taw_rc_enc e;
+	taw_rc_enc_init(&e, &out);
+	taw_pred_encode(&pr, &e, src, N);
+	taw_rc_enc_flush(&e);
+	REQUIRE(!out.oom);
+	taw_pred_reset(&pr);
+	taw_rc_dec d;
+	taw_rc_dec_init(&d, out.p, out.n);
+	taw_pred_decode(&pr, &d, dst, N);
+	CHECK(memcmp(src, dst, N) == 0);
+	const uint32_t crc = taw_crc32c(0, out.p, out.n);
+	*coded_len = (uint32_t)out.n;
+	taw_pred_free(&pr);
+	taw_buf_free(&out);
+	taw_buf_free(&mb);
+	free(src);
+	free(dst);
+	return crc;
+}
+
+static void p8_golden(void)
+{
+	m8_spec specs[2] = {
+		{.s = geo8, .q1 = TAW_QUANT_F16, .q2 = TAW_QUANT_Q8,
+		 .ushift = 22, .seed = 4242, .scale = 0.4f},
+		{.s = geo8, .q1 = TAW_QUANT_NONE, .q2 = TAW_QUANT_F16,
+		 .ushift = 20, .seed = 777, .scale = 0.3f},
+	};
+	specs[1].s.hidden = 0;
+	specs[1].s.sel1 = P1_SEL_NONE;
+	static const struct { uint32_t len, crc; } want[] = {
+		{18931, 0xCC99DFE4u}, {17746, 0xE9855CB2u},
+	};
+	for (size_t i = 0; i < 2; i++) {
+		uint32_t len, crc = golden8(&specs[i], &len);
+		if (len != want[i].len || crc != want[i].crc)
+			fprintf(stderr, "golden p8[%zu]: len %u crc 0x%08X\n",
+			    i, len, crc);
+		CHECK(len == want[i].len && crc == want[i].crc);
+	}
+}
+
+/* Whole archives: every ISA encodes the profile 8 archive identically. */
+static void p8_archive(void)
+{
+	enum { N = 200000 };
+	uint8_t *src = malloc(N);
+	REQUIRE(src);
+	td_fill(src, N, TD_TEXT, 99);
+	const taw_params p = {.level = 1, .predictor = TAW_PREDICTOR_PAQ};
+	void *ref = nullptr;
+	size_t ref_n = 0;
+	for (int isa = 0; isa < P1_ISA_COUNT; isa++) {
+		if (!p1_isa_available((p1_isa)isa))
+			continue;
+		p1_isa_force(isa);
+		void *arc, *dec;
+		size_t arc_n, dec_n;
+		REQUIRE(taw_compress(src, N, &p, &arc, &arc_n) == TAW_OK);
+		taw_info info;
+		REQUIRE(taw_read_info(arc, arc_n, &info) == TAW_OK);
+		CHECK(info.arith_profile == TAW_PROFILE_PAQ_MIX);
+		if (!ref) {
+			ref = arc;
+			ref_n = arc_n;
+		} else {
+			CHECK(arc_n == ref_n && memcmp(arc, ref, arc_n) == 0);
+			free(arc);
+		}
+		CHECK(taw_decompress(ref, ref_n, &dec, &dec_n) == TAW_OK);
+		CHECK(dec_n == N && memcmp(dec, src, N) == 0);
+		free(dec);
+	}
+	p1_isa_force(-1);
+	free(ref);
+	free(src);
+}
+
 int main(void)
 {
 	tables();
@@ -486,6 +658,9 @@ int main(void)
 	ctx_parity();
 	validation();
 	golden();
+	p8_validation();
+	p8_golden();
+	p8_archive();
 	archive_parity();
 	archive_model_damage();
 	return CHECK_DONE();

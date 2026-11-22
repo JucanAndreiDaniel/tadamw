@@ -52,7 +52,8 @@ identical probabilities for every bit.
 |----|-----------------|---------------|--------|
 | 0  | `INT_ORDER0`    | empty (`model_size = 0`, `quant = 0`) | implemented, placeholder |
 | 1  | `F32_STRICT_MIX`| mixer shape and weights, §5.1; quant `F16`, `Q8`, `Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4` or `IQ2` | implemented |
-| 2..255 | — | — | reserved, refuse |
+| 8  | `PAQ_MIX`       | frozen layer + adaptive output weights, §5.2; quant `NONE` | implemented |
+| 2..7, 9..255 | — | — | reserved, refuse |
 
 ### 2.1 Profile 0: `INT_ORDER0`
 
@@ -306,6 +307,84 @@ and the same `A2` entry are updated: `e += (65535 - e) >> 6` if `b`, else
    `nib = 1` and select lines with `q = c0`. At `bitpos` 8: byte end
    (§2.2.5).
 
+### 2.3 Profile 8: `PAQ_MIX`
+
+This profile uses exactly the same integer context models, `squash`/`stretch`
+tables, selectors, match model and the two APM stages as profile 1
+(§2.2.1–§2.2.7, §2.2.9, §2.2.10). Only the mixer differs. Profile 8 uses
+`quant = NONE`; the weight encodings are defined by the model section itself
+(§5.2).
+
+The output layer has two parts: a **frozen binary32 part**, whose weights are
+the dequantized initial weights from the archive, and a **live integer
+delta** per expert, starting at zero and updated after every bit by a
+deterministic PAQ-style logistic gradient step. With every rate zero the
+two profiles produce identical probabilities bit for bit.
+
+#### 2.3.1 Expert vector
+
+Let `H` be the hidden-unit count from the model head (0..32), and let
+`a = sel1`'s value for this bit. With `x[0..24]` the stretched context
+features (§2.2.8; `x[i] = st[i]/256`) and `x[25] = 1`, compute, in binary32
+with the same `dot4` order as §2.2.8:
+
+```
+if H > 0:
+    for j = 0 .. H-1:
+        h[j] = min(max(dot4(W1[a][j], x, 26), -8), 8)
+        e[j] = round_away(h[j] * 256)        /* integer, [-2048, 2048] */
+    E = H + 1;  e[H] = 256                   /* bias */
+else:
+    for i = 0 .. 24: e[i] = st[i]            /* integer, [-2047, 2047] */
+    E = 26;  e[25] = 256
+```
+
+`round_away` rounds to nearest, ties away from zero. `W1` is the frozen first
+layer from the model section. With `H = 0` there is no first layer and
+`sel1` must be `NONE`; `h[]` is unused.
+
+#### 2.3.2 Mixer and probability
+
+Let `c = sel2`'s value for this bit, `W2[c][0..E-1]` the frozen output
+weights (binary32, dequantized from the model), `dw[c][0..E-1]` the live
+int32 deltas, and `rate[0..E-1]` the uint8 rates from the model. The frozen
+part uses exactly profile 1's output-layer arithmetic:
+
+```
+if H > 0:  z = dot4(W2[c], h, H) + W2[c][H]
+else:      z = dot4(W2[c], x, 26)
+z = clamp(z, -2047/256, 2047/256)
+base = trunc_toward_zero(z * 256)             /* as in profile 1 */
+
+acc   = sum_{i=0}^{E-1} dw[c][i] * e[i]       /* exact, int64 */
+delta = trunc_toward_zero(acc / 2^S)          /* S = 12 */
+t     = clamp(base + delta, -2047, 2047)
+p_mix = squash(t)
+p = (2 * p_mix + q1 + q2) >> 2                /* APM, exactly §2.2.9 */
+```
+
+The range coder receives `p` as `P(bit = 1)`. APM entries are updated as in
+§2.2.9. When all rates are zero, `delta` stays zero and `base`, hence `p`,
+are exactly profile 1's.
+
+#### 2.3.3 Delta update
+
+After the bit is known, with `err = (bit ? 65536 : 0) - p_mix` (in the range
+`[-65514, 65514]`):
+
+```
+for i = 0 .. E-1:
+    g = trunc_toward_zero(err * e[i] * rate[i] / 2^U)   /* U from the head */
+    dw[c][i] = clamp_s16(dw[c][i] + g)                  /* [-32768, 32767] */
+```
+
+`U` is the 8-bit `ushift` field of the model head (4..31). The product is
+computed in signed 64 bits; the division truncates **toward zero** (not
+floor), so positive and negative gradient steps of equal magnitude cancel.
+`clamp_s16` saturates to the signed 16-bit range. Only the selected set `c`
+is updated. The deltas start at zero at the beginning of every coding unit
+and are reset there; the archive weights never change.
+
 ## 3. Quantization formats
 
 The format in which model weights are stored. Encoders may pick any format
@@ -442,6 +521,47 @@ code bits. Profile 1 accepts the row formats (`quant` 1 and 4..11);
 A decoder needs about `10 * 2^L * 64 + 2^HB + 4 * 2^MB` bytes of tables
 plus about 4.6 MB fixed (o1 table and APM), and resets them per coding
 unit.
+
+### 5.2 Profile 8 model
+
+A 12-byte head, then three payload blocks: the frozen first layer, the
+initial output weights, and the per-expert update rates.
+
+| off | size | field | valid range |
+|-----|------|-------|-------------|
+| 0 | 1 | `lines_log2` (L) | 8..22 |
+| 1 | 1 | `hist_log2` (HB) | 12..26 |
+| 2 | 1 | `match_log2` (MB) | 10..24 |
+| 3 | 1 | `sel1`, first-layer selector (§2.2.7) | 0..5; must be `0` if `hidden = 0` |
+| 4 | 1 | `hidden` (H) | 0..32 |
+| 5 | 1 | `sel2`, output-weight selector | 0..5 |
+| 6 | 1 | `q1`, first-layer weight format | `0` iff `H = 0`; else `F16` (1) or `Q8` (4) |
+| 7 | 1 | `q2`, initial output-weight format | `F16` (1) or `Q8` (4) |
+| 8 | 1 | `ushift` (U) | 4..31 |
+| 9 | 3 | reserved | `0` |
+
+Payload, in this order:
+
+1. If `H > 0`: the frozen first layer. For each set `a` of `sel1`, for each
+   hidden unit `j = 0..H-1`, one row of 26 weights `W1[a][j][0..25]` in
+   input order, encoded with `q1` exactly as profile 1's rows (§5.1).
+2. For each set `c` of `sel2`, one row `W2[c]` of `E = H + 1` initial output
+   weights (hidden experts, then bias), or of `E = 26` weights if `H = 0`,
+   encoded with `q2` exactly as profile 1's rows (§5.1). A `Q8` row is a
+   little-endian F16 scale followed by `E` int8 values (`-128` is invalid).
+   The decoder dequantizes each value to binary32 exactly as profile 1
+   does; the result is the frozen part `W2[c]` of the mixer (§2.3.2).
+3. `E` bytes of update rates, one per expert, shared by all `sel2` sets.
+
+`model_size` MUST equal `12` plus the payload size exactly. A decoder MUST
+refuse (format error) any field out of range, a non-zero reserved byte, a
+size mismatch, a non-finite F16 value or scale, or a Q8 value of `-128`.
+Profile 8 accepts only `quant = NONE` in the file header; other quant values
+are unsupported.
+
+The live deltas are int32 but saturate to the int16 range after every
+update (§2.3.3), so an update can never overflow. The APM tables and context
+models are the profile 1 ones; see §5.1 for their memory requirements.
 
 ## 6. aw body (kind 0)
 

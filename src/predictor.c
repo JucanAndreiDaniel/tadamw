@@ -5,8 +5,12 @@
 
 #include "format.h"
 #include "p1.h"
+#include "p8.h"
 #include "taw_internal.h"
 
+/* Profiles 1 and 8 share the context models and APM stages. The state
+ * struct (including the profile 8 fields) lives in p1.h so the fused AVX2
+ * loop sees the same layout. */
 enum { APM_RATE = P1_APM_RATE };
 
 static void apm_reset(struct taw_p1 *m)
@@ -42,6 +46,7 @@ bool taw_pred_supported(uint8_t profile, uint8_t quant)
 	switch (profile) {
 	case TAW_PROFILE_INT_ORDER0: return quant == TAW_QUANT_NONE;
 	case TAW_PROFILE_F32_STRICT_MIX: return p1_quant_supported(quant);
+	case TAW_PROFILE_PAQ_MIX: return quant == TAW_QUANT_NONE;
 	default: return false;
 	}
 }
@@ -69,11 +74,29 @@ taw_status taw_pred_init(taw_pred *pr, uint8_t profile, uint8_t quant,
 		free(m);
 		return TAW_E_NOMEM;
 	}
-	taw_status st = p1_net_load(&m->net, quant, model, model_size);
+	const bool paq = profile == TAW_PROFILE_PAQ_MIX;
+	m->paq = paq;
+	if (paq) {
+		m->p8 = malloc(sizeof *m->p8);
+		if (!m->p8) {
+			free(m->apm2);
+			free(m);
+			return TAW_E_NOMEM;
+		}
+	}
+	taw_status st = paq ? p8_load(m->p8, model, model_size)
+			    : p1_net_load(&m->net, quant, model, model_size);
 	if (st == TAW_OK) {
-		st = p1_ctx_init(&m->ctx, &m->net.s);
-		if (st != TAW_OK)
-			p1_net_free(&m->net);
+		st = p1_ctx_init(&m->ctx, paq ? &m->p8->s : &m->net.s);
+		if (st != TAW_OK) {
+			if (paq) {
+				p8_free(m->p8);
+				free(m->p8);
+				m->p8 = nullptr;
+			} else {
+				p1_net_free(&m->net);
+			}
+		}
 	}
 	if (st != TAW_OK) {
 		free(m->apm2);
@@ -89,7 +112,12 @@ void taw_pred_free(taw_pred *pr)
 {
 	if (pr->p1) {
 		p1_ctx_free(&pr->p1->ctx);
-		p1_net_free(&pr->p1->net);
+		if (pr->p1->paq) {
+			p8_free(pr->p1->p8);
+			free(pr->p1->p8);
+		} else {
+			p1_net_free(&pr->p1->net);
+		}
 		free(pr->p1->apm2);
 		free(pr->p1);
 		pr->p1 = nullptr;
@@ -100,6 +128,8 @@ void taw_pred_reset(taw_pred *pr)
 {
 	if (pr->p1) {
 		p1_ctx_reset(&pr->p1->ctx);
+		if (pr->p1->paq)
+			p8_reset(pr->p1->p8);
 		apm_reset(pr->p1);
 		return;
 	}
@@ -126,11 +156,20 @@ static inline uint32_t p1_p16(struct taw_p1 *m)
 {
 	p1_sel_ctx sc;
 	alignas(32) float x[P1_XPAD];
+	float h[P1_HMAX];
 	p1_ctx_inputs(&m->ctx, x, &sc);
 	x[P1_IN_BIAS] = 1.0f;
 	for (unsigned i = P1_F; i < P1_XPAD; i++)
 		x[i] = 0.0f;
-	const uint32_t p = p1_squash(p1_net_eval(&m->net, x, &sc));
+	uint32_t p;
+	if (m->paq) {
+		p8_features(m->p8, x, &sc, m->xe, h);
+		p = p1_squash(p8_eval(m->p8, x, m->xe, h, &sc));
+	} else {
+		p = p1_squash(p1_net_eval(&m->net, x, &sc));
+	}
+	m->mixp = p;
+	m->sctx = sc;
 	const int32_t s12 = p1_stretch_tab[p >> 4];
 	const uint32_t q1 = apm_p(m->apm1, sc.c0, s12, &m->a1);
 	const uint32_t q2 =
@@ -141,6 +180,8 @@ static inline uint32_t p1_p16(struct taw_p1 *m)
 
 static inline void p1_update(struct taw_p1 *m, int bit)
 {
+	if (m->paq)
+		p8_update(m->p8, m->xe, &m->sctx, bit, m->mixp);
 	apm_update(&m->apm1[m->a1], bit);
 	apm_update(&m->apm2[m->a2], bit);
 	p1_ctx_update(&m->ctx, bit);
@@ -153,7 +194,7 @@ void taw_pred_encode(taw_pred *pr, taw_rc_enc *e, const uint8_t *src,
 	if (pr->p1) {
 		struct taw_p1 *m = pr->p1;
 #if TAW_X86_SIMD
-		if (m->ctx.avx2) {
+		if (!m->paq && m->ctx.avx2) {
 			p1_encode_avx2(m, e, src, n);
 			return;
 		}
@@ -188,7 +229,7 @@ void taw_pred_skip(taw_pred *pr, const uint8_t *src, size_t n)
 		/* the same predictions and updates as coding, without a coder */
 		struct taw_p1 *m = pr->p1;
 #if TAW_X86_SIMD
-		if (m->ctx.avx2) {
+		if (!m->paq && m->ctx.avx2) {
 			p1_skip_avx2(m, src, n);
 			return;
 		}
@@ -212,7 +253,7 @@ void taw_pred_decode(taw_pred *pr, taw_rc_dec *d, uint8_t *dst, size_t n)
 	if (pr->p1) {
 		struct taw_p1 *m = pr->p1;
 #if TAW_X86_SIMD
-		if (m->ctx.avx2) {
+		if (!m->paq && m->ctx.avx2) {
 			p1_decode_avx2(m, d, dst, n);
 			return;
 		}
