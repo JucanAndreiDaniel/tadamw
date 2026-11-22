@@ -3,6 +3,7 @@
 
 #include "aw.h"
 #include "awseek.h"
+#include "format.h"
 #include "header.h"
 
 static taw_status finish(taw_status st, taw_buf *b, void **out, size_t *out_n)
@@ -20,6 +21,13 @@ static taw_status finish(taw_status st, taw_buf *b, void **out, size_t *out_n)
 	return *out ? TAW_OK : TAW_E_NOMEM;
 }
 
+static taw_status encode_with(const uint8_t *src, size_t n,
+    const taw_params *p, const taw_model_choice *m, taw_buf *b)
+{
+	return p->seekable ? taw_awseek_encode(src, n, p, m, b)
+			   : taw_aw_encode(src, n, p, m, b);
+}
+
 taw_status taw_compress(const void *src, size_t n, const taw_params *params,
     void **out, size_t *out_n)
 {
@@ -29,9 +37,11 @@ taw_status taw_compress(const void *src, size_t n, const taw_params *params,
 	taw_status st = taw_params_resolve(params, &p);
 	if (st != TAW_OK)
 		return st;
+	/* Profile 1 decodes; the encoder emits profile 0 until it can fit. */
+	const taw_model_choice m = {.profile = TAW_PROFILE_INT_ORDER0,
+		.quant = TAW_QUANT_NONE};
 	taw_buf b = {0};
-	st = p.seekable ? taw_awseek_encode(src, n, &p, &b)
-			: taw_aw_encode(src, n, &p, &b);
+	st = encode_with(src, n, &p, &m, &b);
 	return finish(st, &b, out, out_n);
 }
 

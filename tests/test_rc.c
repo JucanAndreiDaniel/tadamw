@@ -86,8 +86,15 @@ int main(void)
 		td_fill(src, n, TD_RANDOM, n);
 		roundtrip(src, n);
 	}
+	/* Profile 1 needs a model; refused pairs never allocate. */
 	CHECK(taw_pred_init(&(taw_pred){0}, TAW_PROFILE_F32_STRICT_MIX,
-	    TAW_QUANT_F16, nullptr, 0) == TAW_E_UNSUPPORTED);
+	    TAW_QUANT_F16, nullptr, 0) == TAW_E_FORMAT);
+	CHECK(taw_pred_init(&(taw_pred){0}, TAW_PROFILE_F32_STRICT_MIX,
+	    TAW_QUANT_BF16, nullptr, 0) == TAW_E_UNSUPPORTED);
+	CHECK(taw_pred_init(&(taw_pred){0}, TAW_PROFILE_F32_STRICT_MIX,
+	    TAW_QUANT_NONE, nullptr, 0) == TAW_E_UNSUPPORTED);
+	CHECK(taw_pred_init(&(taw_pred){0}, 2, TAW_QUANT_NONE, nullptr, 0) ==
+	    TAW_E_UNSUPPORTED);
 	free(src);
 	return CHECK_DONE();
 }

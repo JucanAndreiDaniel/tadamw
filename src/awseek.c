@@ -8,7 +8,7 @@
 /* ---- encoder ------------------------------------------------------------ */
 
 taw_status taw_awseek_encode(const uint8_t *src, size_t n,
-    const taw_params *p, taw_buf *out)
+    const taw_params *p, const taw_model_choice *m, taw_buf *out)
 {
 	const size_t bs = p->block_size;
 	const uint64_t nblocks = ((uint64_t)n + bs - 1) / bs;
@@ -17,16 +17,19 @@ taw_status taw_awseek_encode(const uint8_t *src, size_t n,
 
 	taw_header h = {
 		.kind = TAW_KIND_AWSEEK,
-		.profile = TAW_PROFILE_INT_ORDER0,
-		.quant = TAW_QUANT_NONE,
+		.profile = m->profile,
+		.quant = m->quant,
 		.level = (uint8_t)p->level,
 		.block_size = p->block_size,
-		.model_crc = taw_crc32c(0, nullptr, 0),
+		.model_size = m->model_size,
+		.model_crc = taw_crc32c(0, m->model, m->model_size),
 	};
 	taw_header_write(out, &h);
+	taw_buf_put(out, m->model, m->model_size);
 
 	taw_pred pr;
-	taw_status st = taw_pred_init(&pr, h.profile, h.quant, nullptr, 0);
+	taw_status st =
+	    taw_pred_init(&pr, h.profile, h.quant, m->model, m->model_size);
 	if (st != TAW_OK)
 		return st;
 
@@ -46,12 +49,14 @@ taw_status taw_awseek_encode(const uint8_t *src, size_t n,
 		uint64_t coded = out->n - at;
 		if (coded > UINT32_MAX) {
 			taw_buf_free(&index);
+			taw_pred_free(&pr);
 			return TAW_E_ARG;
 		}
 		taw_buf_put_u64(&index, at);
 		taw_buf_put_u32(&index, (uint32_t)coded);
 		taw_buf_put_u32(&index, taw_crc32c(0, src + off, len));
 	}
+	taw_pred_free(&pr);
 	if (index.oom) {
 		taw_buf_free(&index);
 		return TAW_E_NOMEM;
@@ -281,6 +286,7 @@ void taw_seek_close(taw_seek *s)
 {
 	if (!s)
 		return;
+	taw_pred_free(&s->pr);
 	free(s->model);
 	free(s->ent);
 	free(s->coded);
