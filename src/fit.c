@@ -120,6 +120,327 @@ static unsigned clampu(unsigned v, unsigned lo, unsigned hi)
 	return v < lo ? lo : v > hi ? hi : v;
 }
 
+/* ---- H-Net-style sample weighting (encoder only) -------------------------
+ *
+ * H-Net (arXiv:2507.07955) learns where the context changes and adds an
+ * MoE-style ratio loss to hit a target compression ratio. Both ideas are
+ * repurposed here as deterministic, encoder-only fitting weights: the
+ * decoder, format and quantization are untouched, and every archive with
+ * these knobs unset is byte-identical to the shipped fitter.
+ *
+ * A per-sample context-change score chg[i] compares neighbouring collected
+ * samples (the sample array is in input-position order). The "weight" arm
+ * multiplies the sample's cross-entropy gradient by
+ *
+ *     w[i] = clamp( r[i]^p / mean_j(r[j]^p), 1/C, C ),
+ *     r[i] = chg[i] / mean_k(chg[k])                      (mean >= 1)
+ *
+ * so the overall gradient scale stays ~1 while boundary-like samples (large
+ * chg) count more. The "ratio" arm is one projected step on the load-
+ * balancing loss L = K * sum_k f_k^2, where f_k is the fraction of weighted
+ * gradient mass on selector class k: it multiplies each sample's weight by
+ *
+ *     m[i] = clamp( (target / f_{k(i)})^alpha / Z, 1/C, C )
+ *
+ * with target = TAW_HNET_TARGET / K (1 = uniform) and Z chosen so the
+ * base-weighted mean of m is 1. Both arms compose multiplicatively and are
+ * clamped again to [1/C, C]. Only the training gradient is weighted: scoring
+ * uses the decoder's real inference on unweighted samples, as before.
+ *
+ * Knobs (all opt-in; TAW_HNET_MODE unset/off reproduces baseline exactly):
+ *   TAW_HNET_MODE   off | weight | boundary | ratio | both (default off)
+ *   TAW_HNET_SCORE  st2 | all | byte | c0 | c0c1       (default st2)
+ *   TAW_HNET_W      exponent p: -2,-1,-0.5,0,0.5,1,2 (default 1; <0 = inverse)
+ *   TAW_HNET_LAG    compare sample i with i-lag        (default 1)
+ *   TAW_HNET_CLAMP  clamp C >= 1                       (default 2)
+ *   TAW_HNET_Q      boundary top-quantile q            (default 0.1)
+ *   TAW_HNET_TARGET target class mass / uniform        (default 1)
+ *   TAW_HNET_RATIO  ratio exponent alpha               (default 1)
+ *   TAW_HNET_CTX    class context for the ratio arm:
+ *                   sel | c0 | c1hi | bitpos           (default sel)
+ * GPU fitting is disabled while these knobs are on (the GPU trainer has no
+ * notion of sample weights), so an H-Net run always trains on the CPU.
+ */
+
+enum { HNET_ST2, HNET_ALL, HNET_BYTE, HNET_C0, HNET_C0C1 };
+enum { HNET_CTX_SEL, HNET_CTX_C0, HNET_CTX_C1HI, HNET_CTX_BITPOS };
+
+typedef struct {
+	bool on, weight, ratio, hard;
+	unsigned score, ctx, lag;
+	float p, alpha, clamp, target, q;
+} hnet_cfg;
+
+static float hnet_env_float(const char *name, float dflt, float lo, float hi)
+{
+	const char *s = getenv(name);
+	if (!s || !*s)
+		return dflt;
+	char *end;
+	float v = strtof(s, &end);
+	if (*end || v != v || v < lo || v > hi)
+		return dflt;
+	return v;
+}
+
+static hnet_cfg hnet_config(void)
+{
+	hnet_cfg c = {.p = 1.0f, .alpha = 1.0f, .clamp = 2.0f,
+		.target = 1.0f, .q = 0.1f, .lag = 1, .score = HNET_ST2,
+		.ctx = HNET_CTX_SEL};
+	const char *mode = getenv("TAW_HNET_MODE");
+	if (!mode || !*mode || !strcmp(mode, "off"))
+		return c;
+	if (!strcmp(mode, "weight") || !strcmp(mode, "w"))
+		c.weight = true;
+	else if (!strcmp(mode, "boundary") || !strcmp(mode, "bnd")) {
+		c.weight = c.hard = true;
+	} else if (!strcmp(mode, "ratio") || !strcmp(mode, "r"))
+		c.ratio = true;
+	else if (!strcmp(mode, "both") || !strcmp(mode, "b"))
+		c.weight = c.ratio = true;
+	else
+		return c; /* unknown mode: silent no-op */
+	c.on = true;
+	const char *score = getenv("TAW_HNET_SCORE");
+	if (score && *score) {
+		if (!strcmp(score, "all")) c.score = HNET_ALL;
+		else if (!strcmp(score, "byte")) c.score = HNET_BYTE;
+		else if (!strcmp(score, "c0")) c.score = HNET_C0;
+		else if (!strcmp(score, "c0c1")) c.score = HNET_C0C1;
+	}
+	const char *ctx = getenv("TAW_HNET_CTX");
+	if (ctx && *ctx) {
+		if (!strcmp(ctx, "c0")) c.ctx = HNET_CTX_C0;
+		else if (!strcmp(ctx, "c1hi")) c.ctx = HNET_CTX_C1HI;
+		else if (!strcmp(ctx, "bitpos")) c.ctx = HNET_CTX_BITPOS;
+	}
+	{
+		const char *s = getenv("TAW_HNET_LAG");
+		if (s && *s) {
+			char *end;
+			long v = strtol(s, &end, 10);
+			if (!*end && v >= 1 && v <= 1024)
+				c.lag = (unsigned)v;
+		}
+	}
+	c.q = hnet_env_float("TAW_HNET_Q", 0.1f, 0.01f, 0.5f);
+	c.p = hnet_env_float("TAW_HNET_W", 1.0f, -2.0f, 2.0f);
+	c.alpha = hnet_env_float("TAW_HNET_RATIO", 1.0f, 0.0f, 4.0f);
+	c.clamp = hnet_env_float("TAW_HNET_CLAMP", 2.0f, 1.0f, 64.0f);
+	c.target = hnet_env_float("TAW_HNET_TARGET", 1.0f, 0.01f, 4.0f);
+	/* Only these exponents are exact; anything between is snapped to 1. */
+	if (c.p != -2.0f && c.p != -1.0f && c.p != -0.5f && c.p != 0.0f &&
+	    c.p != 0.5f && c.p != 1.0f && c.p != 2.0f)
+		c.p = 1.0f;
+	if (!c.weight)
+		c.p = 1.0f;
+	if (!c.ratio) {
+		c.alpha = 1.0f;
+		c.target = 1.0f;
+	}
+	return c;
+}
+
+static float hnet_pow(float r, float p)
+{
+	if (p == 0.0f || r == 1.0f)
+		return 1.0f;
+	if (p < 0.0f) {
+		float q = hnet_pow(r, -p);
+		return q > 0.0f ? 1.0f / q : 1.0f;
+	}
+	if (p == 0.5f)
+		return fsqrt(r);
+	if (p == 2.0f)
+		return r * r;
+	return r; /* p == 1 */
+}
+
+static float hnet_clampw(float v, float clamp)
+{
+	float lo = 1.0f / clamp;
+	return v < lo ? lo : v > clamp ? clamp : v;
+}
+
+/* chg[i] for i >= lag (0 before that, no predecessor); lag defaults to 1. */
+static void hnet_chg(const sample *sm, size_t ns, unsigned score,
+    unsigned lag, uint32_t *chg)
+{
+	if (!ns)
+		return;
+	for (size_t i = 0; i < ns && i < lag; i++)
+		chg[i] = 0;
+	for (size_t i = lag; i < ns; i++) {
+		const sample *a = &sm[i], *b = &sm[i - lag];
+		uint32_t v = 0;
+		switch (score) {
+		case HNET_ALL:
+			for (unsigned q = 0; q < P1_NCTX; q++)
+				v += (uint32_t)abs(a->st[q] - b->st[q]);
+			break;
+		case HNET_BYTE:
+			v = (uint32_t)abs((int)a->c1 - (int)b->c1);
+			break;
+		case HNET_C0:
+			v = (uint32_t)abs((int)a->c0 - (int)b->c0);
+			break;
+		case HNET_C0C1:
+			v = (uint32_t)abs((int)a->c0 - (int)b->c0) +
+			    (uint32_t)abs((int)a->c1 - (int)b->c1);
+			break;
+		default: /* HNET_ST2: direct o0 and o1 stretch features */
+			v = (uint32_t)abs(a->st[0] - b->st[0]) +
+			    (uint32_t)abs(a->st[1] - b->st[1]);
+			break;
+		}
+		chg[i] = v;
+	}
+}
+
+static int hnet_cmp_u32(const void *a, const void *b)
+{
+	uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+	return (x > y) - (x < y);
+}
+
+/* The context-change arm of the weight. */
+static void hnet_base(const hnet_cfg *c, const uint32_t *chg, size_t ns,
+    float *w)
+{
+	if (!c->weight) {
+		for (size_t i = 0; i < ns; i++)
+			w[i] = 1.0f;
+		return;
+	}
+	if (c->hard && ns) {
+		/* H-Net's binary boundary analogue: the top q of chg values are
+		 * boundaries, everything else is not. Normalize to mean 1. */
+		uint32_t *sorted = malloc(ns * sizeof *sorted);
+		if (sorted) {
+			memcpy(sorted, chg, ns * sizeof *sorted);
+			qsort(sorted, ns, sizeof *sorted, hnet_cmp_u32);
+			uint32_t thr = sorted[(size_t)((double)(ns - 1) *
+			    (1.0 - (double)c->q))];
+			free(sorted);
+			double sw = 0.0;
+			for (size_t i = 0; i < ns; i++) {
+				w[i] = chg[i] >= thr ? c->clamp : 1.0f / c->clamp;
+				sw += w[i];
+			}
+			float scale = sw > 0.0 ? (float)((double)ns / sw) : 1.0f;
+			for (size_t i = 0; i < ns; i++)
+				w[i] = hnet_clampw(w[i] * scale, c->clamp);
+			return;
+		}
+	}
+	uint64_t sum = 0;
+	for (size_t i = 0; i < ns; i++)
+		sum += chg[i];
+	double mu = ns ? (double)sum / (double)ns : 1.0;
+	if (mu < 1.0)
+		mu = 1.0;
+	/* Raw r^p, normalized to mean 1 before clamping. */
+	double mean = 0.0;
+	for (size_t i = 0; i < ns; i++)
+		mean += hnet_pow((float)((double)chg[i] / mu), c->p);
+	mean = ns ? mean / (double)ns : 1.0;
+	if (mean <= 0.0)
+		mean = 1.0;
+	for (size_t i = 0; i < ns; i++) {
+		float v = hnet_pow((float)((double)chg[i] / mu), c->p) /
+		    (float)mean;
+		w[i] = hnet_clampw(v, c->clamp);
+	}
+}
+
+/* One load-balancing step over a selector's classes: k is the class count,
+ * cls the class of each sample, base the incoming weights. Writes a
+ * base-weighted-mean-one multiplier per sample. */
+static void hnet_balance(const float *base, const size_t *cls, size_t ns,
+    unsigned k, float target, float alpha, float clamp, float *mult)
+{
+	float mass[4096] = {0}; /* largest selector (C0C1HI) has 4096 classes */
+	double total = 0.0;
+	for (size_t i = 0; i < ns; i++) {
+		mass[cls[i]] += base[i];
+		total += base[i];
+	}
+	if (total <= 0.0) {
+		for (size_t i = 0; i < ns; i++)
+			mult[i] = 1.0f;
+		return;
+	}
+	float t = target / (float)k; /* target as a fraction of uniform mass */
+	double z = 0.0;
+	for (size_t i = 0; i < ns; i++) {
+		float f = (float)((double)mass[cls[i]] / total);
+		float v = hnet_pow(f > 0.0f ? t / f : clamp, alpha);
+		mult[i] = hnet_clampw(v, clamp);
+		z += (double)base[i] * mult[i];
+	}
+	/* Renormalize so the base-weighted mean multiplier is 1. */
+	if (z > 0.0) {
+		float scale = (float)(total / z);
+		for (size_t i = 0; i < ns; i++) {
+			float v = mult[i] * scale;
+			mult[i] = hnet_clampw(v, clamp);
+		}
+	}
+}
+
+/* Final per-candidate weights: context-change arm times ratio arm(s). */
+static float *hnet_weights(const hnet_cfg *c, const sample *sm, size_t ns,
+    const float *base, unsigned sel1, unsigned sel2)
+{
+	float *w = malloc((ns ? ns : 1) * sizeof *w);
+	if (!w)
+		return nullptr;
+	if (!c->ratio) {
+		memcpy(w, base, ns * sizeof *w);
+		return w;
+	}
+	/* The class context: the winning shape uses sel2 = BITPOS (8 classes),
+	 * so `sel` is often already balanced; `c0`/`c1hi` expose a skewed one. */
+	unsigned ctx = c->ctx == HNET_CTX_SEL ? sel2 :
+	    c->ctx == HNET_CTX_C0 ? P1_SEL_C0 :
+	    c->ctx == HNET_CTX_C1HI ? P1_SEL_C0C1HI : P1_SEL_BITPOS;
+	unsigned k = p1_sel_size[ctx];
+	size_t *cls = calloc(ns ? ns : 1, sizeof *cls);
+	float *m = calloc(ns ? ns : 1, sizeof *m);
+	if (!cls || !m) {
+		free(cls);
+		free(m);
+		memcpy(w, base, ns * sizeof *w);
+		return w;
+	}
+	for (size_t i = 0; i < ns; i++) {
+		const p1_sel_ctx sc = sample_sc(&sm[i]);
+		cls[i] = p1_sel_value(ctx, &sc);
+	}
+	hnet_balance(base, cls, ns, k, c->target, c->alpha, c->clamp, m);
+	if (c->ctx == HNET_CTX_SEL && sel1 > P1_SEL_NONE &&
+	    p1_sel_size[sel1] > 1) {
+		float *m1 = malloc((ns ? ns : 1) * sizeof *m1);
+		if (m1) {
+			for (size_t i = 0; i < ns; i++) {
+				const p1_sel_ctx sc = sample_sc(&sm[i]);
+				cls[i] = p1_sel_value(sel1, &sc);
+			}
+			hnet_balance(base, cls, ns, p1_sel_size[sel1],
+			    c->target, c->alpha, c->clamp, m1);
+			for (size_t i = 0; i < ns; i++)
+				m[i] *= m1[i];
+			free(m1);
+		}
+	}
+	for (size_t i = 0; i < ns; i++)
+		w[i] = hnet_clampw(base[i] * m[i], c->clamp);
+	free(cls);
+	free(m);
+	return w;
+}
+
 /* Table geometry from the coding-unit size. */
 static void geometry(size_t unit, p1_shape *s)
 {
@@ -329,8 +650,9 @@ static inline float clamp8(float a)
 	return a < -8.0f ? -8.0f : a > 8.0f ? 8.0f : a;
 }
 
-/* Forward + backward for one sample, accumulating into t->g. */
-static void tnet_step(tnet *t, const sample *smp)
+/* Forward + backward for one sample, accumulating into t->g. `wt` is the
+ * H-Net sample weight; 1.0 (the default) adds no arithmetic at all. */
+static void tnet_step(tnet *t, const sample *smp, float wt)
 {
 	const unsigned H = t->s.hidden;
 	float x[P1_XPAD];
@@ -364,6 +686,8 @@ static void tnet_step(tnet *t, const sample *smp)
 	float zc = z > lim ? lim : z < -lim ? -lim : z;
 	float p = (float)p1_squash((int32_t)(zc * 256.0f)) * (1.0f / 65536.0f);
 	float gz = p - (float)smp->bit;
+	if (wt != 1.0f)
+		gz *= wt;
 	if (H) {
 		for (unsigned j = 0; j < H; j++) {
 			g2[j] += gz * h[j];
@@ -416,15 +740,45 @@ static void adam_rows(tnet *t, adamw *o, float *w, float *m, float *v,
 	(void)t;
 }
 
+/* Benchmarking aid: shift both fitter RNG seeds. Default 0 = shipped. */
+static uint64_t fit_seed_off(void)
+{
+	const char *s = getenv("TAW_SEED");
+	if (!s || !*s)
+		return 0;
+	char *end;
+	unsigned long long v = strtoull(s, &end, 10);
+	return *end ? 0 : (uint64_t)v;
+}
+
+/* Optional AdamW tuning overrides (for the control arms; not H-Net).
+ * Unset variables keep the shipped values, so the default fit is unchanged.
+ * TAW_LR1 defaults to TAW_LR0 / 20, the shipped 0.02 -> 0.001 schedule. */
+static float fit_env_float(const char *name, float fallback, float lo, float hi)
+{
+	const char *s = getenv(name);
+	if (!s || !*s)
+		return fallback;
+	char *end = nullptr;
+	float v = strtof(s, &end);
+	if (end == s || *end || v != v || v < lo || v > hi)
+		return fallback;
+	return v;
+}
+
 /* Train on samples for the given epochs. Batches touch few weight sets, so
  * only those rows are updated ("lazy" AdamW). */
 static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
-    uint64_t seed)
+    uint64_t seed, const float *w)
 {
 	enum { BATCH = FIT_BATCH };
-	adamw o = {.b1 = 0.9f, .b2 = 0.999f, .eps = 1e-6f, .wd = 1e-5f,
+	const float lr0 = fit_env_float("TAW_LR0", 0.02f, 0.0f, 1.0f);
+	float lr1 = fit_env_float("TAW_LR1", lr0 / 20.0f, 0.0f, 1.0f);
+	adamw o = {.b1 = fit_env_float("TAW_B1", 0.9f, 0.0f, 0.999999f),
+		.b2 = fit_env_float("TAW_B2", 0.999f, 0.0f, 0.999999f),
+		.eps = 1e-6f,
+		.wd = fit_env_float("TAW_WD", 1e-5f, 0.0f, 1.0f),
 		.b1t = 1.0f, .b2t = 1.0f};
-	const float lr0 = 0.02f, lr1 = 0.001f;
 	const uint64_t steps_total = (uint64_t)epochs * ((ns + BATCH - 1) / BATCH);
 	uint64_t step = 0;
 	/* Stride through the samples (fit_stride). */
@@ -443,7 +797,8 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 			size_t nb = ns - done < BATCH ? ns - done : BATCH;
 			size_t n1 = 0, n2 = 0;
 			for (size_t k = 0; k < nb; k++) {
-				const sample *s = &sm[pos];
+				const size_t si = pos;
+				const sample *s = &sm[si];
 				pos += stride;
 				if (pos >= ns)
 					pos %= ns;
@@ -460,7 +815,7 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 						t->list1[n1++] = a1;
 					}
 				}
-				tnet_step(t, s);
+				tnet_step(t, s, w ? w[si] : 1.0f);
 			}
 			done += nb;
 			step++;
@@ -657,6 +1012,8 @@ typedef struct {
 	size_t ns;
 	int epochs;
 	uint64_t n;
+	const hnet_cfg *hnet; /* opt-in H-Net weighting; nullptr = shipped */
+	const float *hnet_base; /* [ns] context-change arm, shared by all candidates */
 	taw_buf *model; /* [tries] */
 	double *est, *bpb;
 	taw_status *st;
@@ -672,8 +1029,19 @@ static void fit_one(void *arg, size_t ci, unsigned w)
 	if (F->pre && F->pre[ci].w) {
 		t = F->pre[ci];
 		F->pre[ci] = (tnet){0};
-	} else if ((st = tnet_init(&t, &F->cs[ci].s, 0x7A57A11ull + ci)) == TAW_OK) {
-		tnet_train(&t, F->sm, F->ns, F->epochs, 0xC0FFEEull + ci);
+	} else if ((st = tnet_init(&t, &F->cs[ci].s,
+			  0x7A57A11ull + ci + fit_seed_off())) == TAW_OK) {
+		float *sw = nullptr; /* sample weights (not the worker index) */
+		if (F->hnet && F->hnet->on)
+			sw = hnet_weights(F->hnet, F->sm, F->ns, F->hnet_base,
+			    F->cs[ci].s.sel1, F->cs[ci].s.sel2);
+		if (F->hnet && F->hnet->on && !sw)
+			st = TAW_E_NOMEM;
+		else {
+			tnet_train(&t, F->sm, F->ns, F->epochs,
+			    0xC0FFEEull + ci + fit_seed_off(), sw);
+			free(sw);
+		}
 	}
 	if (st == TAW_OK) {
 		st = serialize(&t, F->cs[ci].quant, &F->model[ci]);
@@ -730,6 +1098,9 @@ static taw_status fit_all(fit_job *F, size_t tries, unsigned threads,
     taw_gpu_mode mode, bool dbg)
 {
 	const double t0 = dbg ? now_s() : 0.0;
+	/* The GPU trainer has no sample weights; H-Net runs always fit on CPU. */
+	if (F->hnet && F->hnet->on)
+		mode = TAW_GPU_OFF;
 	/* AUTO leaves small fits to the CPU: opening a GPU takes about 0.2 s,
 	 * more than levels 1-2 spend fitting. A rule of the effort alone. */
 	if (mode == TAW_GPU_AUTO &&
@@ -768,8 +1139,9 @@ static taw_status fit_all(fit_job *F, size_t tries, unsigned threads,
 	if (ng && (!nets || !seeds || !F->pre))
 		st = TAW_E_NOMEM;
 	for (size_t j = 0; j < ng && st == TAW_OK; j++) {
-		st = tnet_init(&nets[j], &F->cs[gi[j]].s, 0x7A57A11ull + gi[j]);
-		seeds[j] = 0xC0FFEEull + gi[j];
+		st = tnet_init(&nets[j], &F->cs[gi[j]].s,
+		    0x7A57A11ull + gi[j] + fit_seed_off());
+		seeds[j] = 0xC0FFEEull + gi[j] + fit_seed_off();
 	}
 	gpu_job J = {.g = g, .nets = nets, .k = ng, .epochs = F->epochs,
 		.seeds = seeds, .st = TAW_OK};
@@ -863,16 +1235,42 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 	if (tries > ncand)
 		tries = ncand;
 
+	hnet_cfg hnet = hnet_config();
+	uint32_t *chg = nullptr;
+	float *base = nullptr;
+	if (hnet.on) {
+		chg = malloc((ns ? ns : 1) * sizeof *chg);
+		base = malloc((ns ? ns : 1) * sizeof *base);
+		if (!chg || !base)
+			st = TAW_E_NOMEM;
+		else {
+			hnet_chg(sm, ns, hnet.score, hnet.lag, chg);
+			hnet_base(&hnet, chg, ns, base);
+			if (dbg)
+				fprintf(stderr, "taw fit: hnet: mode=%s%s%s score=%u "
+				    "p=%.2f C=%.2f target=%.2f alpha=%.2f ctx=%u "
+				    "lag=%u q=%.2f\n",
+				    hnet.weight ? (hnet.hard ? "b" : "w") : "",
+				    hnet.ratio ? "r" : "",
+				    hnet.weight || hnet.ratio ? "" : "?",
+				    hnet.score, hnet.p, hnet.clamp, hnet.target,
+				    hnet.alpha, hnet.ctx, hnet.lag, hnet.q);
+		}
+	}
+
 	fit_job F = {.cs = cs, .sm = sm, .ns = ns, .epochs = effort[lv].epochs,
-		.n = n};
-	F.model = calloc(tries, sizeof *F.model);
-	F.est = calloc(tries, sizeof *F.est);
-	F.bpb = calloc(tries, sizeof *F.bpb);
-	F.st = calloc(tries, sizeof *F.st);
-	if (!F.model || !F.est || !F.bpb || !F.st)
-		st = TAW_E_NOMEM;
-	else
-		st = fit_all(&F, tries, threads, p->gpu, dbg != nullptr);
+		.n = n, .hnet = hnet.on ? &hnet : nullptr,
+		.hnet_base = hnet.on ? base : nullptr};
+	if (st == TAW_OK) {
+		F.model = calloc(tries, sizeof *F.model);
+		F.est = calloc(tries, sizeof *F.est);
+		F.bpb = calloc(tries, sizeof *F.bpb);
+		F.st = calloc(tries, sizeof *F.st);
+		if (!F.model || !F.est || !F.bpb || !F.st)
+			st = TAW_E_NOMEM;
+		else
+			st = fit_all(&F, tries, threads, p->gpu, dbg != nullptr);
+	}
 	size_t best = SIZE_MAX;
 	for (size_t ci = 0; st == TAW_OK && ci < tries; ci++) {
 		if ((st = F.st[ci]) != TAW_OK)
@@ -900,6 +1298,8 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 	free(F.est);
 	free(F.bpb);
 	free(F.st);
+	free(chg);
+	free(base);
 	free(sm);
 	return st;
 }

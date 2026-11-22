@@ -1,0 +1,7 @@
+# phase 4: seed robustness of the lag-32 winner (TAW_SEED is a benchmark-only knob)
+seed1_base	TAW_SEED=1
+seed1_win	TAW_SEED=1 TAW_HNET_MODE=weight TAW_HNET_SCORE=st2 TAW_HNET_W=1 TAW_HNET_LAG=32
+seed2_base	TAW_SEED=2
+seed2_win	TAW_SEED=2 TAW_HNET_MODE=weight TAW_HNET_SCORE=st2 TAW_HNET_W=1 TAW_HNET_LAG=32
+seed3_base	TAW_SEED=3
+seed3_win	TAW_SEED=3 TAW_HNET_MODE=weight TAW_HNET_SCORE=st2 TAW_HNET_W=1 TAW_HNET_LAG=32
