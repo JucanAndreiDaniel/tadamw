@@ -20,7 +20,9 @@ for c in text1m libc1m; do
     dt=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.3f", b-a}')
     if cmp -s bench/dec/out "$DATA/$c"; then ok=1; else ok=0; fi
     sz=$(stat -c %s "$arc")
+    mode=${TAW_HYBRID:-adam}
+    [ -z "${TAW_ADAGO:-}" ] || mode="$mode/${TAW_ADAGO}"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$NAME" "${TAW_HYBRID:-adam}" "${CFG:-}" "$c" "$l" "$sz" "$dt" "$ok" | tee -a "$T"
+      "$NAME" "$mode" "${CFG:-}" "$c" "$l" "$sz" "$dt" "$ok" | tee -a "$T"
   done
 done

@@ -38,6 +38,19 @@ static float fsqrt(float x)
 #endif
 }
 
+/* Real cube root by Newton iteration (no libm in the fitter). Used for
+ * OptMuon's q = 2/3 exponent: x^(2/3) = cbrt(x)^2. Bit-trick seed keeps the
+ * iteration fast for both tiny and large accumulators. */
+static float fcbrt(float x)
+{
+	if (!(x > 0.0f))
+		return 0.0f;
+	float y = taw_bits_f32(taw_f32_bits(x) / 3u + 0x2A511CD6u);
+	for (int i = 0; i < 5; i++)
+		y = (2.0f * y + x / (y * y)) * (1.0f / 3.0f);
+	return y;
+}
+
 /* log2(x) for x > 0, good to ~1e-9; used only for size estimates. */
 static double dlog2(double x)
 {
@@ -427,6 +440,21 @@ typedef enum {
 	HYB_ROUTE     /* W1: Muon for hot sets, AdamW for cold sets */
 } hyb_mode;
 
+/* AdaGO (Zhang et al., arXiv:2509.02981) and OptMuon (Yuan,
+ * arXiv:2606.08783) replace Muon's hand-tuned scalar LR with an AdaGrad-Norm
+ * scalar while keeping the Newton-Schulz orthogonalized direction. State is
+ * kept here (one fit = one tnet_train call); on this base W1 is a single
+ * 16x26 matrix, so one scalar accumulator exactly matches the papers' global
+ * scalar. Knob-off leaves the shipped Muon/AdamW paths bit-for-bit unchanged.
+ *
+ * AdaGO:   v2 += min(||G||^2, gamma^2);  alpha = max(eps, eta*min(||G||,gamma)/v)
+ * OptMuon: rho = ((1+max g_i^2)/(1+sum g_i^2))^q, alpha_t = rho_{t-1},
+ *          M_t = G_t + (1-alpha_t) M_{t-1},
+ *          gamma_t = min(alpha_t^2, alpha_t (1+sum alpha_j ||M_j||^2)^-1/2),
+ *          dW = -theta * gamma_t * ||M_t|| * Orth(M_t).
+ */
+enum { AD_OFF = 0, AD_ADAGO, AD_OPTMUON };
+
 typedef struct {
 	float lr, lrvec, lr1;  /* current LRs: Muon W1, Adam W2, Adam W1 */
 	float wd, vecwd, wd1;  /* decoupled weight decay */
@@ -435,6 +463,21 @@ typedef struct {
 	float b1t, b2t;        /* b1^t, b2^t */
 	unsigned ns_steps;
 	bool nesterov;
+	int ad_mode;           /* AD_OFF / AD_ADAGO / AD_OPTMUON */
+	float ad_eta;          /* scalar multiplier of the (possibly decayed) LR */
+	float ad_eps;          /* AdaGO step-size floor */
+	float ad_gamma;        /* AdaGO gradient-norm clamp (0 = no clamp) */
+	float ad_v2;           /* AdaGO accumulated clamped squared norm (+v0^2) */
+	float ad_gmax;         /* OptMuon running max of g_i^2 */
+	float ad_sumg;         /* OptMuon sum of g_i^2 */
+	float ad_rho;          /* OptMuon rho_{t-1}, i.e. alpha_t (lagged) */
+	float ad_emom;         /* OptMuon sum alpha_j ||M_j||_F^2 */
+	float ad_q;            /* OptMuon exponent: 0.5 (A) or 2/3 (I) */
+	bool ad_runmax;        /* OptMuon running-maximum numerator correction */
+	bool ad_mom_muon;      /* ablation: Muon's fixed momentum as direction source */
+	bool ad_const;         /* freeze eta at lr0 (no linear LR decay) for W1 */
+	unsigned ad_dbg;       /* print adaptive step every N calls, 0 = off */
+	unsigned ad_calls;
 } optcfg;
 
 /* Tuning hooks (encoder-only; unset = shipped behaviour). */
@@ -475,7 +518,7 @@ static void adam_rows(optcfg *o, float *w, float *m, float *v, const float *g,
 
 /* Muon on a row-major rows x cols matrix. Largest shape here is
  * P1_HMAX x P1_F = 32 x 26, so scratch fits on the stack. */
-static void muon_rows(const optcfg *o, float *w, float *m, const float *g,
+static void muon_rows(optcfg *o, float *w, float *m, const float *g,
     size_t rows, size_t cols, float scale, float lr, float wd, float mix)
 {
 	float x[MUON_MAXEL], a[MUON_MAXEL], b[MUON_MAXEL], y[MUON_MAXEL];
@@ -483,10 +526,19 @@ static void muon_rows(const optcfg *o, float *w, float *m, const float *g,
 	const size_t mr = tr ? cols : rows, mc = tr ? rows : cols;
 	if (rows * cols > MUON_MAXEL || mr == 0 || mc == 0)
 		return;
+	const bool adaptive = o->ad_mode != AD_OFF;
+	const bool opt = o->ad_mode == AD_OPTMUON;
+	const float alpha = opt ? o->ad_rho : 0.0f; /* lagged OptMuon alpha_t */
+	float g2 = 0.0f;
 	for (size_t i = 0; i < rows * cols; i++) {
 		float gi = g[i] * scale;
-		m[i] = o->mom * m[i] + gi;
-		float u = o->nesterov ? o->mom * m[i] + gi : m[i];
+		if (adaptive)
+			g2 += gi * gi;
+		if (opt && !o->ad_mom_muon)
+			m[i] = gi + (1.0f - alpha) * m[i]; /* OptMuon momentum */
+		else
+			m[i] = o->mom * m[i] + gi;
+		float u = (!opt && o->nesterov) ? o->mom * m[i] + gi : m[i];
 		size_t at = tr ? (i % cols) * mc + i / cols : i;
 		x[at] = u;
 	}
@@ -524,7 +576,51 @@ static void muon_rows(const optcfg *o, float *w, float *m, const float *g,
 			x[i] = 3.4445f * x[i] + y[i];
 	}
 	const size_t dmax = rows > cols ? rows : cols;
-	const float factor = mix * lr * o->gain * fsqrt((float)dmax);
+	float factor = mix * lr * o->gain * fsqrt((float)dmax);
+	if (adaptive) {
+		const float eta = lr * o->ad_eta;
+		if (opt) {
+			/* OptMuon, Option A (q=1/2) by default; Option I (q=2/3)
+			 * uses the same scalar rule with a STORM momentum, which our
+			 * single-gradient fitting loop does not evaluate. */
+			const float g = fsqrt(g2);
+			o->ad_sumg += g2;
+			o->ad_gmax = o->ad_runmax && o->ad_gmax > g2 ? o->ad_gmax : g2;
+			const float ratio = (1.0f + o->ad_gmax) / (1.0f + o->ad_sumg);
+			const float cr = o->ad_q == 0.5f ? 0.0f : fcbrt(ratio);
+			const float rho = o->ad_q == 0.5f ? fsqrt(ratio) : cr * cr;
+			o->ad_rho = rho; /* lagged: used at the next step */
+			const float gam = alpha * alpha <
+					  alpha / fsqrt(1.0f + o->ad_emom)
+					    ? alpha * alpha
+					    : alpha / fsqrt(1.0f + o->ad_emom);
+			o->ad_emom += alpha * ss; /* sum alpha_j ||M_j||_F^2 */
+			factor = mix * eta * gam * norm;
+			if (o->ad_dbg && ++o->ad_calls % o->ad_dbg == 0)
+				fprintf(stderr,
+				    "AD opt g=%.5g max=%.5g sum=%.5g alpha=%.5g"
+				    " gam=%.5g m=%.5g eta=%.5g factor=%.5g\n",
+				    g, o->ad_gmax, o->ad_sumg, alpha, gam, norm,
+				    eta, factor);
+		} else {
+			/* AdaGO: AdaGrad-Norm scalar with a clamped current norm. */
+			const float gcl = g2 > 0.0f ? fsqrt(g2) : 0.0f;
+			const float v2 = o->ad_v2 +
+			    (o->ad_gamma > 0.0f && g2 > o->ad_gamma * o->ad_gamma
+				 ? o->ad_gamma * o->ad_gamma : g2);
+			const float v = fsqrt(v2);
+			const float gn = o->ad_gamma > 0.0f && gcl > o->ad_gamma
+					 ? o->ad_gamma : gcl;
+			const float a = eta * gn / v;
+			o->ad_v2 = v2;
+			factor = mix * (a > o->ad_eps ? a : o->ad_eps);
+			if (o->ad_dbg && ++o->ad_calls % o->ad_dbg == 0)
+				fprintf(stderr,
+				    "AD adago g=%.5g gn=%.5g v=%.5g a=%.5g"
+				    " eta=%.5g factor=%.5g\n",
+				    gcl, gn, v, a, eta, factor);
+		}
+	}
 	for (size_t i = 0; i < rows * cols; i++) {
 		size_t at = tr ? (i % cols) * mc + i / cols : i;
 		w[i] -= factor * x[at] + mix * lr * wd * w[i];
@@ -555,6 +651,16 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 	else if (!strcmp(hs, "route"))
 		mode = HYB_ROUTE;
 
+	/* AdaGO / OptMuon take over the W1 update (W2 stays on AdamW).
+	 * "off" (the default) leaves every existing path untouched. */
+	const char *as = fit_env_str("TAW_ADAGO", "off");
+	int ad_mode = AD_OFF;
+	if (!strcmp(as, "adago"))
+		ad_mode = AD_ADAGO;
+	else if (!strcmp(as, "optmuon"))
+		ad_mode = AD_OPTMUON;
+	const float ad_q = fit_env_float("TAW_ADAGO_Q", 0.5f);
+
 	/* LR endpoints. Plain AdamW defaults to the shipped schedule; each
 	 * other component has its own knob so the two LRs can be tuned apart. */
 	const float lr0 = fit_env_float("TAW_LR0", 0.02f);
@@ -572,7 +678,21 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 		.gain = fit_env_float("TAW_MUON_GAIN", 0.2f),
 		.b1t = 1.0f, .b2t = 1.0f,
 		.ns_steps = fit_env_uint("TAW_MUON_NS", 5),
-		.nesterov = fit_env_uint("TAW_MUON_NEST", 1) != 0};
+		.nesterov = fit_env_uint("TAW_MUON_NEST", 1) != 0,
+		.ad_mode = ad_mode,
+		.ad_eta = fit_env_float("TAW_ADAGO_LR", 1.0f),
+		.ad_eps = fit_env_float("TAW_ADAGO_EPS", 1e-4f),
+		.ad_gamma = fit_env_float("TAW_ADAGO_GAMMA", 0.0f),
+		.ad_v2 = fit_env_float("TAW_ADAGO_V0", 1.0f) *
+			 fit_env_float("TAW_ADAGO_V0", 1.0f),
+		.ad_gmax = 0.0f, .ad_sumg = 0.0f,
+		.ad_rho = 1.0f, .ad_emom = 0.0f,
+		.ad_q = ad_q > 0.6f ? 0.6666667f : 0.5f,
+		.ad_runmax = fit_env_uint("TAW_ADAGO_RUNMAX", 1) != 0,
+		.ad_mom_muon = !strcmp(fit_env_str("TAW_ADAGO_MOMSRC", "paper"),
+				      "muon"),
+		.ad_const = fit_env_uint("TAW_ADAGO_CONST", 0) != 0,
+		.ad_dbg = fit_env_uint("TAW_ADAGO_DEBUG", 0)};
 	o.vecwd = fit_env_float("TAW_WD", 1e-5f);
 	o.wd = fit_env_float("TAW_MUON_WD", mode == HYB_ADAM ? o.vecwd : 1e-3f);
 	o.wd1 = fit_env_float("TAW_ADAM1_WD", o.vecwd);
@@ -661,6 +781,8 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 			step++;
 			float frac = (float)step / (float)steps_total;
 			o.lr = m_lr0 + (m_lr1 - m_lr0) * frac;
+			if (ad_mode && o.ad_const)
+				o.lr = m_lr0; /* adaptive scalar: no linear decay */
 			o.lrvec = vec_lr0 + (vec_lr1 - vec_lr0) * frac;
 			o.lr1 = a1_lr0 + (a1_lr1 - a1_lr0) * frac;
 			o.b1t *= o.b1;
@@ -677,7 +799,13 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 				    (mode == HYB_ROUTE && t->route1[set]);
 				if (t->tied && warm_adam)
 					muon = false;
-				if (mode == HYB_ADAM) {
+				if (ad_mode) {
+					/* AdaGO/OptMuon: orthogonalized direction with an
+					 * adaptive scalar replacing the Muon LR. */
+					muon_rows(&o, t->w + off, t->m + off,
+					    t->g + off, H, P1_F, scale, o.lr,
+					    o.wd, 1.0f);
+				} else if (mode == HYB_ADAM) {
 					/* The shipped path, using the original m/v. */
 					adam_rows(&o, t->w + off, t->m + off,
 					    t->v + off, t->g + off, t->row1,
