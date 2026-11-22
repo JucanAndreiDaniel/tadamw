@@ -7,17 +7,7 @@
 #include "p1.h"
 #include "taw_internal.h"
 
-/* Profile 1 state. After the mixer, two adaptive APM (SSE) stages refine
- * the probability in the contexts c0 and c1:c0 (format.md §5.1.6). */
-struct taw_p1 {
-	p1_ctx ctx;
-	p1_net net;
-	uint16_t apm1[256 * 33];
-	uint16_t *apm2;    /* [65536 * 33] */
-	uint32_t a1, a2;   /* entries to update after the bit */
-};
-
-enum { APM_RATE = 6 };
+enum { APM_RATE = P1_APM_RATE };
 
 static void apm_reset(struct taw_p1 *m)
 {
@@ -162,6 +152,12 @@ void taw_pred_encode(taw_pred *pr, taw_rc_enc *e, const uint8_t *src,
 {
 	if (pr->p1) {
 		struct taw_p1 *m = pr->p1;
+#if TAW_X86_SIMD
+		if (m->ctx.avx2) {
+			p1_encode_avx2(m, e, src, n);
+			return;
+		}
+#endif
 		for (size_t i = 0; i < n; i++) {
 			unsigned c = src[i];
 			for (int k = 7; k >= 0; k--) {
@@ -191,6 +187,12 @@ void taw_pred_skip(taw_pred *pr, const uint8_t *src, size_t n)
 	if (pr->p1) {
 		/* the same predictions and updates as coding, without a coder */
 		struct taw_p1 *m = pr->p1;
+#if TAW_X86_SIMD
+		if (m->ctx.avx2) {
+			p1_skip_avx2(m, src, n);
+			return;
+		}
+#endif
 		for (size_t i = 0; i < n; i++)
 			for (int k = 7; k >= 0; k--) {
 				(void)p1_p16(m);
@@ -209,6 +211,12 @@ void taw_pred_decode(taw_pred *pr, taw_rc_dec *d, uint8_t *dst, size_t n)
 {
 	if (pr->p1) {
 		struct taw_p1 *m = pr->p1;
+#if TAW_X86_SIMD
+		if (m->ctx.avx2) {
+			p1_decode_avx2(m, d, dst, n);
+			return;
+		}
+#endif
 		for (size_t i = 0; i < n; i++) {
 			unsigned c = 1;
 			for (int k = 0; k < 8; k++) {

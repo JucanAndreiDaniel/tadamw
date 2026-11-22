@@ -134,12 +134,18 @@ static inline __m256i rate8(__m256i n)
 
 /* The 12 models as two 8-lane halves (lanes 12..15 are padding whose
  * results are never stored). The bit is the same in every lane, so each
- * counter needs one product: towards the max if the bit is 1, towards 0
- * otherwise. */
+ * counter needs one product, and the exact identities below (proved with
+ * ucas, see docs/design.md) keep the packed fields in place:
+ *   65535 - ps = ps ^ 0xFFFF            (ps < 2^16; likewise 2^22 - 1)
+ *   bit ? ps + d : ps - d = ps + sign(d, bit ? 1 : -1)
+ *   history h' at bits 15..8 = ((e << 1) & 0xFE00) | (e & 0x8000) | bit << 8 */
 void p1_cm_update_avx2(p1_ctx *c, int bit)
 {
 	alignas(32) uint32_t ns[16], nh[16];
-	const __m256i m = _mm256_set1_epi32(-bit), b = _mm256_set1_epi32(bit);
+	const __m256i sg = _mm256_set1_epi32(bit ? 1 : -1);
+	const __m256i flip16 = _mm256_set1_epi32(bit ? 0xFFFF : 0);
+	const __m256i flip22 = _mm256_set1_epi32(bit ? 0x3FFFFF : 0);
+	const __m256i bh = _mm256_set1_epi32(bit << 8);
 	const __m256i sinit = _mm256_set1_epi32((int)P1_SLOT_INIT);
 	const __m256i hinit = _mm256_set1_epi32((int)P1_HM_INIT);
 	for (unsigned i = 0; i < 16; i += 8) {
@@ -147,34 +153,27 @@ void p1_cm_update_avx2(p1_ctx *c, int bit)
 		__m256i e = _mm256_xor_si256(
 		    _mm256_load_si256((const __m256i *)(c->val + i)), sinit);
 		__m256i ps = _mm256_srli_epi32(e, 16);
-		__m256i h = _mm256_and_si256(_mm256_srli_epi32(e, 8),
-		    _mm256_set1_epi32(0xFF));
 		__m256i n = _mm256_and_si256(e, _mm256_set1_epi32(63));
-		__m256i a = _mm256_blendv_epi8(ps,
-		    _mm256_sub_epi32(_mm256_set1_epi32(65535), ps), m);
-		__m256i d = _mm256_srli_epi32(_mm256_mullo_epi32(a, rate8(n)), 16);
-		ps = _mm256_blendv_epi8(_mm256_sub_epi32(ps, d),
-		    _mm256_add_epi32(ps, d), m);
-		__m256i h2 = _mm256_or_si256(_mm256_slli_epi32(h, 1), b);
-		__m256i full = _mm256_cmpgt_epi32(h, _mm256_set1_epi32(127));
-		h = _mm256_blendv_epi8(h2, _mm256_or_si256(_mm256_and_si256(h2,
-		    _mm256_set1_epi32(0x7F)), _mm256_set1_epi32(0x80)), full);
+		__m256i d = _mm256_srli_epi32(_mm256_mullo_epi32(
+		    _mm256_xor_si256(ps, flip16), rate8(n)), 16);
+		ps = _mm256_add_epi32(ps, _mm256_sign_epi32(d, sg));
+		__m256i h = _mm256_or_si256(_mm256_or_si256(
+		    _mm256_and_si256(_mm256_slli_epi32(e, 1),
+		    _mm256_set1_epi32(0xFE00)),
+		    _mm256_and_si256(e, _mm256_set1_epi32(0x8000))), bh);
 		n = _mm256_sub_epi32(n, _mm256_cmpgt_epi32(
 		    _mm256_set1_epi32(P1_LIMIT_SLOW), n));
 		_mm256_store_si256((__m256i *)(ns + i), _mm256_xor_si256(
-		    _mm256_or_si256(_mm256_or_si256(_mm256_slli_epi32(ps, 16),
-		    _mm256_slli_epi32(h, 8)), n), sinit));
+		    _mm256_or_si256(_mm256_or_si256(_mm256_slli_epi32(ps, 16), h),
+		    n), sinit));
 
 		/* history map: p 22 | n 10, entries kept from the inputs */
 		__m256i f = _mm256_xor_si256(
 		    _mm256_load_si256((const __m256i *)(c->hmv + i)), hinit);
 		__m256i p = _mm256_srli_epi32(f, 10);
 		__m256i hn = _mm256_and_si256(f, _mm256_set1_epi32(1023));
-		__m256i pa = _mm256_blendv_epi8(p,
-		    _mm256_sub_epi32(_mm256_set1_epi32(0x3FFFFF), p), m);
-		__m256i pd = mulshr16_8(pa, rate8(hn));
-		p = _mm256_blendv_epi8(_mm256_sub_epi32(p, pd),
-		    _mm256_add_epi32(p, pd), m);
+		__m256i pd = mulshr16_8(_mm256_xor_si256(p, flip22), rate8(hn));
+		p = _mm256_add_epi32(p, _mm256_sign_epi32(pd, sg));
 		hn = _mm256_sub_epi32(hn, _mm256_cmpgt_epi32(
 		    _mm256_set1_epi32(P1_LIMIT_HMAP), hn));
 		_mm256_store_si256((__m256i *)(nh + i), _mm256_xor_si256(
@@ -233,4 +232,74 @@ void p1_line_hashes_avx2(const uint32_t *g, uint32_t q, uint32_t *hh)
 	    hash8(_mm256_load_si256((const __m256i *)g), qv, z));
 	_mm256_store_si256((__m256i *)(hh + 8),
 	    hash8(_mm256_load_si256((const __m256i *)(g + 8)), qv, z));
+}
+
+/* Arena line index per hashed model k (lanes 0..9; 10..15 point at line
+ * 0 of the arena, which is never a hashed line, and are masked out). */
+static inline void line_bases(const p1_ctx *c, const uint32_t *hh,
+    __m256i *lb0, __m256i *lb1)
+{
+	const __m128i sh = _mm_cvtsi32_si128((int)(32 - c->lines_log2));
+	const __m128i lg = _mm_cvtsi32_si128((int)c->lines_log2);
+	const __m256i k0 = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+	const __m256i k1 = _mm256_setr_epi32(8, 9, 0, 0, 0, 0, 0, 0);
+	const __m256i hx = _mm256_set1_epi32(P1_ARENA_HX);
+	__m256i a = _mm256_add_epi32(_mm256_sll_epi32(k0, lg), _mm256_srl_epi32(
+	    _mm256_load_si256((const __m256i *)hh), sh));
+	__m256i b = _mm256_add_epi32(_mm256_sll_epi32(k1, lg), _mm256_srl_epi32(
+	    _mm256_load_si256((const __m256i *)(hh + 8)), sh));
+	*lb0 = _mm256_add_epi32(hx, _mm256_slli_epi32(a, 4));
+	*lb1 = _mm256_blend_epi32(_mm256_setzero_si256(),
+	    _mm256_add_epi32(hx, _mm256_slli_epi32(b, 4)), 0x03);
+}
+
+void p1_lines_apply_avx2(p1_ctx *c, const uint32_t *hh)
+{
+	__m256i lb0, lb1;
+	line_bases(c, hh, &lb0, &lb1);
+	const __m256i lo16 = _mm256_set1_epi32(0xFFFF);
+	const __m256i one16 = _mm256_set1_epi32((int)(c->epoch << 16));
+	const __m256i t0 = _mm256_or_si256(_mm256_and_si256(
+	    _mm256_load_si256((const __m256i *)hh), lo16), one16);
+	const __m256i t1 = _mm256_or_si256(_mm256_and_si256(
+	    _mm256_load_si256((const __m256i *)(hh + 8)), lo16), one16);
+	const int *ar = (const int *)c->arena;
+	const __m256i g0 = _mm256_i32gather_epi32(ar, lb0, 4);
+	const __m256i g1 = _mm256_i32gather_epi32(ar, lb1, 4);
+	unsigned miss = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(
+	    _mm256_cmpeq_epi32(g0, t0))) |
+	    (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(
+	    _mm256_cmpeq_epi32(g1, t1))) << 8;
+	miss = ~miss & 0x3FFu;
+	/* lb[P1_CM_O2 + k]: lanes 0..9 of lb0:lb1, moved up by two. */
+	alignas(32) uint32_t lb[16], tg[16];
+	_mm256_store_si256((__m256i *)lb, lb0);
+	_mm256_store_si256((__m256i *)(lb + 8), lb1);
+	_mm256_storeu_si256((__m256i *)(c->lb + P1_CM_O2), lb0);
+	c->lb[P1_CM_O2 + 8] = lb[8];
+	c->lb[P1_CM_O2 + 9] = lb[9];
+	if (miss) {
+		_mm256_store_si256((__m256i *)tg, t0);
+		_mm256_store_si256((__m256i *)(tg + 8), t1);
+		const __m256i z = _mm256_setzero_si256();
+		do {
+			const unsigned k = (unsigned)__builtin_ctz(miss);
+			uint32_t *ln = c->arena + lb[k];
+			_mm256_store_si256((__m256i *)ln, z);
+			_mm256_store_si256((__m256i *)(ln + 8), z);
+			ln[0] = tg[k];
+			miss &= miss - 1;
+		} while (miss);
+	}
+}
+
+void p1_lines_prefetch_avx2(const p1_ctx *c, const uint32_t *hh)
+{
+	__m256i lb0, lb1;
+	line_bases(c, hh, &lb0, &lb1);
+	alignas(32) uint32_t lb[16];
+	_mm256_store_si256((__m256i *)lb, lb0);
+	_mm256_store_si256((__m256i *)(lb + 8), lb1);
+	for (unsigned k = 0; k < P1_NHASH; k++)
+		_mm_prefetch((const char *)(c->arena + lb[k]), _MM_HINT_T0);
 }

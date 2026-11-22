@@ -115,11 +115,73 @@ over. That shapes the code:
   the likely outcome (redo on a miss) 1.29 / 1.48 s. The per-candidate
   records cost the sequential path about 5% on their own.
 
-The decoder is throughput-bound, not latency-bound: about 600 cycles and
-1050 instructions per bit, IPC near 1.7, few memory or branch stalls.
-Evaluating more than one outcome multiplies the work, so it loses. What
-would help is doing less per bit: fewer or cheaper context models, a
-cheaper mixer, or AVX-512 scatter for the write-back.
+Before the second round below, the decoder ran about 675 cycles and
+1060 instructions per bit at IPC 1.6. Evaluating more than one outcome
+multiplies the work, so it loses.
+
+### Second round (fused loop)
+
+pmcstat on libc1m (8.4M bits), the same archive throughout:
+
+| step | cycles | instructions |
+|------|--------|--------------|
+| before | 5.66 G | 8.89 G |
+| both-outcome hashes + prefetch at the boundaries | 5.51 G | 9.58 G |
+| mixer: partial sums in registers | 5.12 G | 8.31 G |
+| counter update on packed fields (identities below) | 5.0 G | 7.96 G |
+| one fused AVX2 per-bit loop | 4.27 G | 6.93 G |
+| vector line selection, A2 row prefetch, inline tail | 4.0 G | 6.47 G |
+
+Wall clock, `taw d` per 1 MiB file at level 1: 1.24-1.37 s before,
+0.93-1.08 s now (20-25% less). Encoding uses the same loop and got about
+10% faster.
+
+- **Fused loop** (`p1_run_avx2.c`). One function per mode (encode,
+  decode, skip) runs inputs, mixer, squash, APM, coder and counter
+  updates. Slot values and history-map entries stay in registers from
+  the gathers to the update; the mixer, squash and selectors are inline
+  (no function pointer). Only nibble and byte boundaries call out.
+- **The mixer kept its partial sums in memory**: `s[i & 3]` with a loop
+  index made the compiler keep the four sums in a stack array, so every
+  product went through a store and a reload. Four named registers keep
+  dot4's exact order.
+- **Boundary speculation, kept this time.** One bit before a nibble or
+  byte boundary only two outcomes remain. Both outcomes' line hashes
+  (and, before a byte end, byte hashes and the match-table index) are
+  computed, their lines prefetched, and the boundary then picks one, so
+  nothing is computed twice. L3 misses fell from 6.1M to 1.0M. Measured
+  against no speculation it is 3-5% faster. (The earlier attempt
+  recomputed the hashes at the boundary.)
+- **The A2 row** (`c1:c0`, 4.3 MB table) is known at the start of a
+  bit; prefetching it there hides its latency behind the mixer.
+- **Line selection** (tag check and reset of 10 lines) is one gather and
+  a compare, with a loop over the mismatches only.
+- **Counter identities**, proved with ~/ucas (`equiv`): `65535 - ps =
+  ps ^ 0xFFFF` and `2^22 - 1 - p = p ^ 0x3FFFFF` (exhaustive);
+  `bit ? ps + d : ps - d = ps + sign(d, ±1)` (one `vpsignd`; SAT); the
+  history step on the packed slot,
+  `h' << 8 = ((e << 1) & 0xFE00) | (e & 0x8000) | bit << 8` (SAT). ucas
+  found no cheaper scalar form for the squash, APM, rate and mixing
+  formulas. For the APM interpolation,
+  `(a(128 - w) + bw) >> 7 = a + (((b - a) w) >> 7)` holds by algebra
+  (`128a` is a multiple of 128 and `>>` floors), but saves nothing in the
+  vector code.
+- **Resets.** Line tags carry an epoch (`(hash & 0xFFFF) | epoch << 16`):
+  a reset starts a new epoch, and a line of an older epoch is reset when
+  it is selected, exactly as if the table had been zeroed. Only O0 and
+  O1 are cleared. The arena comes from `mmap` (zero, and pages a unit
+  never touches are never faulted in).
+- **Tried, not kept:** resetting A2 rows lazily (per-row epoch): the
+  check costs about 2.5% per bit and saved nothing measurable even with
+  64 KiB blocks. Smaller hashed tables (lines_log2 18 down to 12) were
+  only up to 8% faster and cost up to 8% in size: the misses mostly
+  overlap.
+
+What remains is mostly the dependency chain of one bit (slot gather,
+stretch gather, mixer, squash, APM, coder) plus the 24 scalar write-backs
+(no scatter in AVX2). `.awseek` archives also decode their blocks in
+parallel (`taw d -j N`, `taw_seek_set_threads`): 5 blocks went from
+5.2 s to 1.35 s on 5 threads.
 
 ## Encoder pipeline
 
@@ -129,7 +191,10 @@ cheaper mixer, or AVX-512 scatter for the write-back.
    `hist_log2 = clamp(log2 u, 12, 24)`, `match_log2 = clamp(log2 u - 2, 10, 22)`.
 3. One pass of the context models over the input, with the decoder's
    per-unit resets, keeping an evenly spread sample of bits (features,
-   selector context, bit).
+   selector context, bit). The selection runs over bits in a per-byte
+   rotated order (a hash of the byte position), so every bit position is
+   sampled: a plain stride kept only bit 7 whenever 8n / samples was a
+   multiple of 8, which cost 3-11% on power-of-two inputs.
 4. Candidate shapes: hidden ∈ {0, 4, 8, 16} × selectors × {F16, Q8}, each
    kept only if `8 + payload <= n/32`. They are ranked by a prior from
    full sweeps on the bench corpus: the best models cost n/1100 to n/220
@@ -249,7 +314,8 @@ can run in parallel later.
 | `src/p1_ctx.c` | profile 1 context models, squash/stretch tables |
 | `src/p1_net.c` | profile 1 model parsing, dequantization, scalar mixer, ISA choice |
 | `src/p1_avx2.c` | AVX2/F16C kernels: context-model inputs/update, hashes, mixer, F16 load |
-| `src/p1_avx512.c` | AVX-512F mixer |
+| `src/p1_run_avx2.c` | the fused AVX2 per-bit loop (encode, decode, skip) |
+| `src/p1_avx512.c` | AVX-512F mixer (used by `p1_net_eval`; the per-bit loop runs the fused AVX2 code) |
 | `src/p1_simd_out.h` | mixer pieces shared by the AVX2 and AVX-512 files |
 | `src/half.h` | binary16 conversions |
 | `src/quant.c` | weight row formats: sizes, validated decoding, the encoder's quantizer |
@@ -264,11 +330,12 @@ can run in parallel later.
 
 ## Open items
 
-- Decoder speed: about 0.75-0.85 MB/s with AVX2 (see "Decoder
-  performance"). It is throughput-bound, so the ideas are about doing less
-  per bit: fewer context models where some never earn weight, cheaper
-  updates, AVX-512 scatter for the counter write-back. Evaluating several
-  outcomes of the next bit was tried and is slower.
+- Decoder speed: about 1 MB/s per thread with AVX2 (see "Decoder
+  performance"), and `.awseek` scales with threads across blocks. Ideas
+  left: fewer context models where some never earn weight, AVX-512
+  scatter for the write-back, shortening the slot → stretch → mixer
+  chain. Evaluating several outcomes of the next bit was tried and is
+  slower.
 - Encoder speed: about 2.8 s/MB at level 1, 7.5 s/MB at level 5, and
   around 2 minutes/MB at level 9. That is two context passes
   (features, then coding) plus fitting. Fitting could run on a GPU

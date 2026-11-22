@@ -30,13 +30,23 @@ static inline float dot4_finish(__m128 s)
 static inline __m256 layer1_chunk8(const float *w1, const float *x,
     unsigned hpad, unsigned j)
 {
-	__m256 s[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(),
-		_mm256_setzero_ps(), _mm256_setzero_ps()};
-	for (unsigned i = 0; i < P1_F; i++)
-		s[i & 3] = _mm256_add_ps(s[i & 3], _mm256_mul_ps(
-		    _mm256_loadu_ps(w1 + i * hpad + j), _mm256_set1_ps(x[i])));
-	__m256 a = _mm256_add_ps(_mm256_add_ps(s[0], s[1]),
-	    _mm256_add_ps(s[2], s[3]));
+	/* s_r in registers; a variable index (s[i & 3]) would keep them in
+	 * memory. Input i goes to s_(i mod 4) in increasing i: dot4's order. */
+	__m256 s0 = _mm256_setzero_ps(), s1 = s0, s2 = s0, s3 = s0;
+	const float *w = w1 + j;
+#define L1(sv, i) sv = _mm256_add_ps(sv, _mm256_mul_ps( \
+	    _mm256_loadu_ps(w + (size_t)(i) * hpad), _mm256_broadcast_ss(x + (i))))
+	static_assert(P1_F == 26, "unrolled for 26 inputs");
+	for (unsigned i = 0; i < 24; i += 4) {
+		L1(s0, i);
+		L1(s1, i + 1);
+		L1(s2, i + 2);
+		L1(s3, i + 3);
+	}
+	L1(s0, 24);
+	L1(s1, 25);
+#undef L1
+	__m256 a = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
 	return _mm256_max_ps(_mm256_min_ps(a, _mm256_set1_ps(8.0f)),
 	    _mm256_set1_ps(-8.0f));
 }

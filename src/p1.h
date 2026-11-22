@@ -111,7 +111,18 @@ typedef struct {
 	uint8_t *hist;
 	alignas(32) uint32_t hmap[P1_NCM * 256]; /* history maps, [k][h] */
 	alignas(32) uint32_t hash[16]; /* byte hashes g_k, padded */
+	/* One bit before a nibble or byte boundary, the hashes of both
+	 * outcomes are computed and their lines prefetched; the boundary
+	 * then picks one (argument reuse instead of recomputation). */
+	alignas(32) uint32_t spec_g[2][16];  /* byte hashes after the byte */
+	alignas(32) uint32_t spec_hh[2][16]; /* line hashes at the boundary */
+	uint32_t spec_mi[2];                 /* match-table index */
+	/* Line tags are (hash & 0xFFFF) | epoch << 16; a reset starts a new
+	 * epoch instead of clearing the hashed tables. */
+	uint32_t epoch;
+	bool fresh; /* the arena is still all zero */
 } p1_ctx;
+enum { P1_EPOCH_MAX = 0x7FFF };
 
 taw_status p1_ctx_init(p1_ctx *c, const p1_shape *s);
 void p1_ctx_reset(p1_ctx *c);
@@ -130,6 +141,11 @@ void p1_cm_update_avx2(p1_ctx *c, int bit);
 void p1_byte_hashes_avx2(uint32_t c4, uint32_t c8, uint32_t word,
     uint32_t *g);
 void p1_line_hashes_avx2(const uint32_t *g, uint32_t q, uint32_t *hh);
+/* Line selection for hh (tag check, reset on mismatch) and prefetch. */
+void p1_lines_apply_avx2(p1_ctx *c, const uint32_t *hh);
+void p1_lines_prefetch_avx2(const p1_ctx *c, const uint32_t *hh);
+/* Arena index of the first hashed table (after O0 and O1). */
+enum { P1_ARENA_HX = 256 + 65536 };
 
 static inline uint32_t p1_sel_value(unsigned sel, const p1_sel_ctx *sc)
 {
@@ -192,6 +208,36 @@ bool p1_isa_available(p1_isa isa);
 void p1_isa_force(int isa);
 /* The ISA that kernels picked now should use (forced or best). */
 p1_isa p1_isa_current(void);
+
+/* ---- the per-bit loop ------------------------------------------------------- */
+
+/* Profile 1 state. After the mixer, two adaptive APM (SSE) stages refine
+ * the probability in the contexts c0 and c1:c0 (format.md §2.2.9). */
+enum { P1_APM_RATE = 6 };
+struct taw_p1 {
+	p1_ctx ctx;
+	p1_net net;
+	uint16_t apm1[256 * 33];
+	uint16_t *apm2;    /* [65536 * 33] */
+	uint32_t a1, a2;   /* entries to update after the bit */
+};
+
+/* After the context-model counters of a bit are updated: the match
+ * counter, the partial byte, and the nibble/byte boundaries. */
+void p1_ctx_tail(p1_ctx *c, int bit);
+/* Bits after which p1_ctx_tail has boundary work (bitpos 3, 4, 7, 8):
+ * speculation for the next nibble, its lines, speculation for the next
+ * byte, the byte's end. */
+#define P1_BOUNDARY_BITS 0x198u
+void p1_ctx_boundary(p1_ctx *c, int bit);
+extern const uint16_t p1_squash_knot[33];
+
+/* The whole per-bit loop with the AVX2 kernels fused (p1_run_avx2.c):
+ * the same bits as the generic loop in predictor.c. */
+void p1_encode_avx2(struct taw_p1 *m, void *enc, const uint8_t *src,
+    size_t n);
+void p1_decode_avx2(struct taw_p1 *m, void *dec, uint8_t *dst, size_t n);
+void p1_skip_avx2(struct taw_p1 *m, const uint8_t *src, size_t n);
 
 /* ---- serialization (encoder) -------------------------------------------- */
 

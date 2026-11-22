@@ -3,6 +3,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 
 #include "p1.h"
 
@@ -11,7 +12,7 @@ const uint16_t p1_sel_size[P1_SEL_COUNT] = {1, 8, 8, 256, 256, 4096};
 /* ---- squash / stretch ----------------------------------------------------- */
 
 /* 65536 / (1 + e^-(k-16)/2), rounded, k = 0..32. */
-static const uint16_t squash_knot[33] = {
+const uint16_t p1_squash_knot[33] = {
 	22, 36, 60, 98, 162, 267, 439, 720, 1179, 1921, 3108, 4971, 7812,
 	11955, 17625, 24743, 32768, 40793, 47911, 53581, 57724, 60565, 62428,
 	63615, 64357, 64816, 65097, 65269, 65374, 65438, 65476, 65500, 65514,
@@ -25,7 +26,7 @@ uint32_t p1_squash(int32_t t)
 		t = -2047;
 	uint32_t u = (uint32_t)(t + 2048); /* 1..4095 */
 	uint32_t j = u >> 7, w = u & 127;
-	return (squash_knot[j] * (128 - w) + squash_knot[j + 1] * w + 64) >> 7;
+	return (p1_squash_knot[j] * (128 - w) + p1_squash_knot[j + 1] * w + 64) >> 7;
 }
 
 int16_t p1_stretch_tab[4096];
@@ -156,7 +157,18 @@ taw_status p1_ctx_init(p1_ctx *c, const p1_shape *s)
 	c->hist_mask = (1u << s->hist_log2) - 1;
 	c->match_mask = (1u << s->match_log2) - 1;
 	c->arena_n = ARENA_HX + ((size_t)P1_NHASH << (s->lines_log2 + 4));
-	c->arena = aligned_alloc(64, c->arena_n * sizeof *c->arena);
+	/* Fresh anonymous memory is zero, and pages a unit never touches are
+	 * never faulted in (the tables are sized for the coding unit, so many
+	 * lines stay unused). */
+	int fl = MAP_PRIVATE | MAP_ANON;
+#ifdef MAP_ALIGNED_SUPER
+	fl |= MAP_ALIGNED_SUPER;
+#endif
+	void *a = mmap(nullptr, c->arena_n * sizeof *c->arena,
+	    PROT_READ | PROT_WRITE, fl, -1, 0);
+	c->arena = a == MAP_FAILED ? nullptr : a;
+	c->epoch = 1;
+	c->fresh = true;
 	c->mtab = calloc((size_t)c->match_mask + 1, sizeof *c->mtab);
 	c->hist = calloc((size_t)c->hist_mask + 1, 1);
 	if (!c->arena || !c->mtab || !c->hist) {
@@ -169,7 +181,8 @@ taw_status p1_ctx_init(p1_ctx *c, const p1_shape *s)
 
 void p1_ctx_free(p1_ctx *c)
 {
-	free(c->arena);
+	if (c->arena)
+		munmap(c->arena, c->arena_n * sizeof *c->arena);
 	free(c->mtab);
 	free(c->hist);
 	memset(c, 0, sizeof *c);
@@ -218,11 +231,17 @@ static void line_hashes(const p1_ctx *c, const uint32_t *g, uint32_t q,
 /* Make the lines named by hh current: check tags, reset mismatches. */
 static void lines_apply(p1_ctx *c, const uint32_t *hh)
 {
+#if TAW_X86_SIMD
+	if (c->avx2) {
+		p1_lines_apply_avx2(c, hh);
+		return;
+	}
+#endif
 	const unsigned sh = 32 - c->lines_log2;
 	for (unsigned k = 0; k < P1_NHASH; k++) {
 		uint32_t lb = ARENA_HX +
 		    (uint32_t)(((k << c->lines_log2) + (hh[k] >> sh)) * 16);
-		uint32_t tag = (hh[k] & 0xFFFFu) | 0x10000u;
+		uint32_t tag = (hh[k] & 0xFFFFu) | c->epoch << 16;
 		uint32_t *ln = c->arena + lb;
 		c->lb[P1_CM_O2 + k] = lb;
 		if (ln[0] != tag) {
@@ -230,6 +249,21 @@ static void lines_apply(p1_ctx *c, const uint32_t *hh)
 			ln[0] = tag;
 		}
 	}
+}
+
+/* Prefetch the lines that hh would select. */
+static inline void lines_prefetch(const p1_ctx *c, const uint32_t *hh)
+{
+#if TAW_X86_SIMD
+	if (c->avx2) {
+		p1_lines_prefetch_avx2(c, hh);
+		return;
+	}
+#endif
+	const unsigned sh = 32 - c->lines_log2;
+	for (unsigned k = 0; k < P1_NHASH; k++)
+		__builtin_prefetch(c->arena + ARENA_HX +
+		    (((size_t)k << c->lines_log2) + (hh[k] >> sh)) * 16, 1);
 }
 
 static inline uint32_t word_next(uint32_t word, uint32_t ch)
@@ -244,7 +278,16 @@ static inline uint32_t match_index(const p1_ctx *c, uint32_t c4, uint32_t c8)
 
 void p1_ctx_reset(p1_ctx *c)
 {
-	memset(c->arena, 0, c->arena_n * sizeof *c->arena);
+	/* O0 and O1 are cleared; the hashed lines are invalidated by a new
+	 * epoch in their tags, so each is reset when it is next selected,
+	 * exactly as if the table had been zeroed. */
+	memset(c->arena, 0, ARENA_HX * sizeof *c->arena);
+	if (!c->fresh && ++c->epoch > P1_EPOCH_MAX) {
+		memset(c->arena + ARENA_HX, 0,
+		    (c->arena_n - ARENA_HX) * sizeof *c->arena);
+		c->epoch = 1;
+	}
+	c->fresh = false;
 	memset(c->mtab, 0, ((size_t)c->match_mask + 1) * sizeof *c->mtab);
 	memset(c->hist, 0, (size_t)c->hist_mask + 1);
 	memset(c->sm, 0, sizeof c->sm);
@@ -329,7 +372,8 @@ static void byte_end(p1_ctx *c)
 			c->mlen = 0;
 		}
 	}
-	uint32_t *me = &c->mtab[match_index(c, c->c4, c->c8)];
+	const unsigned b = ch & 1; /* the outcome speculated at bit 7 */
+	uint32_t *me = &c->mtab[c->spec_mi[b]];
 	if (c->mlen == 0 && *me) {
 		uint32_t e = *me, d = c->pos - e;
 		if (d >= 1 && d <= hm) {
@@ -348,11 +392,34 @@ static void byte_end(p1_ctx *c)
 	c->c0 = 1;
 	c->nib = 1;
 	c->bitpos = 0;
-	alignas(32) uint32_t hh[16];
-	byte_hashes_for(c, c->c4, c->c8, c->word, c->hash);
-	line_hashes(c, c->hash, 0, hh);
-	lines_apply(c, hh);
+	memcpy(c->hash, c->spec_g[b], sizeof c->hash);
+	lines_apply(c, c->spec_hh[b]);
 	c->mexp = c->mlen ? c->hist[c->mptr & c->hist_mask] : -1;
+}
+
+/* Bit 3 done: the next nibble's lines for q = 2 c0 + {0, 1}. */
+static void speculate_nibble(p1_ctx *c)
+{
+	for (unsigned b = 0; b < 2; b++) {
+		line_hashes(c, c->hash, c->c0 << 1 | b, c->spec_hh[b]);
+		lines_prefetch(c, c->spec_hh[b]);
+	}
+}
+
+/* Bit 7 done: the next byte's hashes, lines and match entry for both
+ * values of its last bit. */
+static void speculate_byte(p1_ctx *c)
+{
+	for (unsigned b = 0; b < 2; b++) {
+		const uint32_t ch = (c->c0 << 1 | b) & 0xFF;
+		const uint32_t c8 = c->c8 << 8 | c->c4 >> 24;
+		const uint32_t c4 = c->c4 << 8 | ch;
+		byte_hashes_for(c, c4, c8, word_next(c->word, ch), c->spec_g[b]);
+		line_hashes(c, c->spec_g[b], 0, c->spec_hh[b]);
+		lines_prefetch(c, c->spec_hh[b]);
+		c->spec_mi[b] = match_index(c, c4, c8);
+		__builtin_prefetch(c->mtab + c->spec_mi[b], 1);
+	}
 }
 
 void p1_ctx_update(p1_ctx *c, int bit)
@@ -368,17 +435,30 @@ void p1_ctx_update(p1_ctx *c, int bit)
 			hm_update(&c->hmap[c->hmi[k]], bit, LIMIT_HMAP);
 		}
 	}
+	p1_ctx_tail(c, bit);
+}
+
+void p1_ctx_tail(p1_ctx *c, int bit)
+{
 	if (c->mbit >= 0)
 		slot_update(&c->sm[c->msi], bit, LIMIT_MATCH);
 	c->c0 = c->c0 << 1 | (uint32_t)bit;
 	c->nib = c->nib << 1 | (uint32_t)bit;
 	c->bitpos++;
-	if (c->bitpos == 4) {
-		alignas(32) uint32_t hh[16];
+	if (P1_BOUNDARY_BITS >> c->bitpos & 1)
+		p1_ctx_boundary(c, bit);
+}
+
+void p1_ctx_boundary(p1_ctx *c, int bit)
+{
+	switch (c->bitpos) {
+	case 3: speculate_nibble(c); break;
+	case 4:
 		c->nib = 1;
-		line_hashes(c, c->hash, c->c0, hh);
-		lines_apply(c, hh);
-	} else if (c->bitpos == 8) {
-		byte_end(c);
+		lines_apply(c, c->spec_hh[bit]);
+		break;
+	case 7: speculate_byte(c); break;
+	case 8: byte_end(c); break;
+	default: break;
 	}
 }
