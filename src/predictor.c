@@ -1,10 +1,13 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* Arithmetic profiles: 0 = INT_ORDER0 (placeholder), 1 = F32_STRICT_MIX. */
+/* Arithmetic profiles: 0 = INT_ORDER0 (placeholder), 1 = F32_STRICT_MIX,
+ * 10 = F32_CHAINED_MIX. Profile 10 shares profile 1's context models and
+ * APM stages; only the frozen mixer is different. */
 #include <stdlib.h>
 #include <string.h>
 
 #include "format.h"
 #include "p1.h"
+#include "p10.h"
 #include "taw_internal.h"
 
 enum { APM_RATE = P1_APM_RATE };
@@ -42,6 +45,7 @@ bool taw_pred_supported(uint8_t profile, uint8_t quant)
 	switch (profile) {
 	case TAW_PROFILE_INT_ORDER0: return quant == TAW_QUANT_NONE;
 	case TAW_PROFILE_F32_STRICT_MIX: return p1_quant_supported(quant);
+	case TAW_PROFILE_F32_CHAINED_MIX: return p10_quant_supported(quant);
 	default: return false;
 	}
 }
@@ -69,11 +73,32 @@ taw_status taw_pred_init(taw_pred *pr, uint8_t profile, uint8_t quant,
 		free(m);
 		return TAW_E_NOMEM;
 	}
-	taw_status st = p1_net_load(&m->net, quant, model, model_size);
-	if (st == TAW_OK) {
-		st = p1_ctx_init(&m->ctx, &m->net.s);
-		if (st != TAW_OK)
-			p1_net_free(&m->net);
+	taw_status st;
+	if (profile == TAW_PROFILE_F32_CHAINED_MIX) {
+		m->chain = malloc(sizeof *m->chain);
+		if (!m->chain) {
+			free(m->apm2);
+			free(m);
+			return TAW_E_NOMEM;
+		}
+		st = p10_net_load(m->chain, quant, model, model_size);
+		if (st == TAW_OK) {
+			const p1_shape sh = p10_ctx_shape(&m->chain->s);
+			st = p1_ctx_init(&m->ctx, &sh);
+			if (st != TAW_OK)
+				p10_net_free(m->chain);
+		}
+		if (st != TAW_OK) {
+			free(m->chain);
+			m->chain = nullptr;
+		}
+	} else {
+		st = p1_net_load(&m->net, quant, model, model_size);
+		if (st == TAW_OK) {
+			st = p1_ctx_init(&m->ctx, &m->net.s);
+			if (st != TAW_OK)
+				p1_net_free(&m->net);
+		}
 	}
 	if (st != TAW_OK) {
 		free(m->apm2);
@@ -89,7 +114,12 @@ void taw_pred_free(taw_pred *pr)
 {
 	if (pr->p1) {
 		p1_ctx_free(&pr->p1->ctx);
-		p1_net_free(&pr->p1->net);
+		if (pr->p1->chain) {
+			p10_net_free(pr->p1->chain);
+			free(pr->p1->chain);
+		} else {
+			p1_net_free(&pr->p1->net);
+		}
 		free(pr->p1->apm2);
 		free(pr->p1);
 		pr->p1 = nullptr;
@@ -130,7 +160,9 @@ static inline uint32_t p1_p16(struct taw_p1 *m)
 	x[P1_IN_BIAS] = 1.0f;
 	for (unsigned i = P1_F; i < P1_XPAD; i++)
 		x[i] = 0.0f;
-	const uint32_t p = p1_squash(p1_net_eval(&m->net, x, &sc));
+	const int32_t t = m->chain ? p10_net_eval(m->chain, x, &sc)
+				   : p1_net_eval(&m->net, x, &sc);
+	const uint32_t p = p1_squash(t);
 	const int32_t s12 = p1_stretch_tab[p >> 4];
 	const uint32_t q1 = apm_p(m->apm1, sc.c0, s12, &m->a1);
 	const uint32_t q2 =
@@ -153,7 +185,7 @@ void taw_pred_encode(taw_pred *pr, taw_rc_enc *e, const uint8_t *src,
 	if (pr->p1) {
 		struct taw_p1 *m = pr->p1;
 #if TAW_X86_SIMD
-		if (m->ctx.avx2) {
+		if (!m->chain && m->ctx.avx2) {
 			p1_encode_avx2(m, e, src, n);
 			return;
 		}
@@ -188,7 +220,7 @@ void taw_pred_skip(taw_pred *pr, const uint8_t *src, size_t n)
 		/* the same predictions and updates as coding, without a coder */
 		struct taw_p1 *m = pr->p1;
 #if TAW_X86_SIMD
-		if (m->ctx.avx2) {
+		if (!m->chain && m->ctx.avx2) {
 			p1_skip_avx2(m, src, n);
 			return;
 		}
@@ -212,7 +244,7 @@ void taw_pred_decode(taw_pred *pr, taw_rc_dec *d, uint8_t *dst, size_t n)
 	if (pr->p1) {
 		struct taw_p1 *m = pr->p1;
 #if TAW_X86_SIMD
-		if (m->ctx.avx2) {
+		if (!m->chain && m->ctx.avx2) {
 			p1_decode_avx2(m, d, dst, n);
 			return;
 		}

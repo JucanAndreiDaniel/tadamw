@@ -214,9 +214,11 @@ p1_isa p1_isa_current(void);
 /* Profile 1 state. After the mixer, two adaptive APM (SSE) stages refine
  * the probability in the contexts c0 and c1:c0 (format.md §2.2.9). */
 enum { P1_APM_RATE = 6 };
+typedef struct p10_net p10_net; /* profile 10 chain net (p10.h) */
 struct taw_p1 {
 	p1_ctx ctx;
 	p1_net net;
+	p10_net *chain; /* profile 10: the chain net; NULL for profile 1 */
 	uint16_t apm1[256 * 33];
 	uint16_t *apm2;    /* [65536 * 33] */
 	uint32_t a1, a2;   /* entries to update after the bit */

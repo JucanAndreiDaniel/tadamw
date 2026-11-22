@@ -9,6 +9,7 @@
 #include "half.h"
 #include "header.h"
 #include "p1.h"
+#include "p10.h"
 #include "quant.h"
 #include "taw_internal.h"
 #include "testdata.h"
@@ -478,6 +479,181 @@ static void golden(void)
 	p1_isa_force(-1);
 }
 
+/* ---- profile 10: chained predictors ----------------------------------------- */
+
+typedef struct {
+	p10_shape s;
+	uint8_t quant;
+	uint64_t seed;
+	float scale;
+} chain_spec;
+
+static taw_buf build_chain_model(const chain_spec *m)
+{
+	taw_buf b = {0};
+	uint8_t head[P10_MODEL_HEAD];
+	p10_head_write(head, &m->s);
+	taw_buf_put(&b, head, sizeof head);
+	uint64_t r = m->seed;
+	for (unsigned u = 0; u < P10_UNITS; u++)
+		for (size_t a = 0; a < p1_sel_size[m->s.sel[u]]; a++)
+			put_row(&b, m->quant, &r, m->scale, p10_rowlen[u]);
+	REQUIRE(!b.oom);
+	REQUIRE(b.n == P10_MODEL_HEAD + p10_weights_size(&m->s, m->quant));
+	return b;
+}
+
+static taw_status load_chain(const taw_buf *mb, uint8_t quant)
+{
+	taw_pred pr;
+	taw_status st = taw_pred_init(&pr, TAW_PROFILE_F32_CHAINED_MIX, quant,
+	    mb->p, mb->n);
+	taw_pred_free(&pr);
+	return st;
+}
+
+static taw_status load_chain_patched(const taw_buf *mb, uint8_t quant,
+    size_t off, uint8_t v)
+{
+	uint8_t saved = mb->p[off];
+	mb->p[off] = v;
+	taw_status st = load_chain(mb, quant);
+	mb->p[off] = saved;
+	return st;
+}
+
+static void chain_validation(void)
+{
+	chain_spec m = {.s = {.lines_log2 = 12, .hist_log2 = 16,
+		.match_log2 = 12, .sel = {P1_SEL_BITPOS, P1_SEL_NONE,
+		P1_SEL_C0}}, .quant = TAW_QUANT_F16, .seed = 9, .scale = 1.0f};
+	taw_buf mb = build_chain_model(&m);
+	CHECK(load_chain(&mb, TAW_QUANT_F16) == TAW_OK);
+	CHECK(load_chain(&mb, TAW_QUANT_Q8) == TAW_E_FORMAT);  /* size */
+	CHECK(load_chain(&mb, TAW_QUANT_BF16) == TAW_E_UNSUPPORTED);
+	CHECK(load_chain_patched(&mb, TAW_QUANT_F16, 0, P1_LINES_MAX + 1) ==
+	    TAW_E_FORMAT);
+	CHECK(load_chain_patched(&mb, TAW_QUANT_F16, 1, P1_HIST_MIN - 1) ==
+	    TAW_E_FORMAT);
+	CHECK(load_chain_patched(&mb, TAW_QUANT_F16, 2, P1_MATCH_MAX + 1) ==
+	    TAW_E_FORMAT);
+	for (unsigned u = 0; u < P10_UNITS; u++)
+		CHECK(load_chain_patched(&mb, TAW_QUANT_F16, 3 + u,
+		    P1_SEL_COUNT) == TAW_E_FORMAT);
+	CHECK(load_chain_patched(&mb, TAW_QUANT_F16, 6, 1) == TAW_E_FORMAT);
+	CHECK(load_chain_patched(&mb, TAW_QUANT_F16, 7, 1) == TAW_E_FORMAT);
+	/* Non-finite F16 weight, and a truncated section. */
+	CHECK(load_chain_patched(&mb, TAW_QUANT_F16, P10_MODEL_HEAD + 3, 0x7C) ==
+	    TAW_E_FORMAT);
+	mb.n--;
+	CHECK(load_chain(&mb, TAW_QUANT_F16) == TAW_E_FORMAT);
+	taw_buf_free(&mb);
+
+	m.quant = TAW_QUANT_Q8;
+	mb = build_chain_model(&m);
+	CHECK(load_chain(&mb, TAW_QUANT_Q8) == TAW_OK);
+	/* Q8 row scale at the start of the first row. */
+	CHECK(load_chain_patched(&mb, TAW_QUANT_Q8, P10_MODEL_HEAD + 1, 0x7C) ==
+	    TAW_E_FORMAT);
+	CHECK(load_chain_patched(&mb, TAW_QUANT_Q8, P10_MODEL_HEAD + 2, 0x80) ==
+	    TAW_E_FORMAT);
+	taw_buf_free(&mb);
+}
+
+/* Chain inference is scalar by design, but the context kernels are ISA
+ * selected: the whole archive must still be identical on every path. */
+static void chain_archive_parity(void)
+{
+	enum { N = 40000 };
+	uint8_t *src = malloc(N);
+	REQUIRE(src);
+	td_fill(src, N, TD_TEXT, 77);
+	const taw_params p = {.level = 1, .predictor = TAW_PREDICTOR_CHAIN};
+	void *ref = nullptr;
+	size_t ref_n = 0;
+	for (int isa = 0; isa < P1_ISA_COUNT; isa++) {
+		if (!p1_isa_available((p1_isa)isa))
+			continue;
+		p1_isa_force(isa);
+		void *arc, *dec;
+		size_t arc_n, dec_n;
+		REQUIRE(taw_compress(src, N, &p, &arc, &arc_n) == TAW_OK);
+		taw_info info;
+		REQUIRE(taw_read_info(arc, arc_n, &info) == TAW_OK);
+		CHECK(info.arith_profile == TAW_PROFILE_F32_CHAINED_MIX);
+		if (!ref) {
+			ref = arc;
+			ref_n = arc_n;
+		} else {
+			CHECK(arc_n == ref_n && memcmp(arc, ref, arc_n) == 0);
+			free(arc);
+		}
+		CHECK(taw_decompress(ref, ref_n, &dec, &dec_n) == TAW_OK);
+		CHECK(dec_n == N && memcmp(dec, src, N) == 0);
+		free(dec);
+	}
+	p1_isa_force(-1);
+	free(ref);
+	free(src);
+}
+
+/* ---- profile 10 golden vector ------------------------------------------------ */
+
+static uint32_t chain_golden_crc(uint8_t quant, uint32_t *coded_len)
+{
+	enum { N = 1 << 16 };
+	uint8_t *src = malloc(N), *dst = malloc(N);
+	REQUIRE(src && dst);
+	td_fill(src, N, TD_TEXT, 567);
+	for (size_t i = 0; i < N; i += 4096)
+		memcpy(src + i, src, 64);
+	chain_spec m = {.s = {.lines_log2 = 12, .hist_log2 = 16,
+		.match_log2 = 12, .sel = {P1_SEL_BITPOS, P1_SEL_NONE,
+		P1_SEL_NONE}}, .quant = quant, .seed = 4242, .scale = 0.4f};
+	taw_buf mb = build_chain_model(&m);
+	taw_pred pr;
+	REQUIRE(taw_pred_init(&pr, TAW_PROFILE_F32_CHAINED_MIX, quant, mb.p,
+	    mb.n) == TAW_OK);
+	taw_buf out = {0};
+	taw_rc_enc e;
+	taw_rc_enc_init(&e, &out);
+	taw_pred_encode(&pr, &e, src, N);
+	taw_rc_enc_flush(&e);
+	REQUIRE(!out.oom);
+	taw_pred_reset(&pr);
+	taw_rc_dec d;
+	taw_rc_dec_init(&d, out.p, out.n);
+	taw_pred_decode(&pr, &d, dst, N);
+	CHECK(memcmp(src, dst, N) == 0);
+	uint32_t crc = taw_crc32c(0, out.p, out.n);
+	*coded_len = (uint32_t)out.n;
+	taw_pred_free(&pr);
+	taw_buf_free(&out);
+	taw_buf_free(&mb);
+	free(src);
+	free(dst);
+	return crc;
+}
+
+static void chain_golden(void)
+{
+	static const struct {
+		uint8_t quant;
+		uint32_t len, crc;
+	} want[] = {
+		{TAW_QUANT_F16, 25079, 0x8AB6CEC6u},
+		{TAW_QUANT_Q8, 91360, 0xD0109680u},
+	};
+	for (size_t i = 0; i < sizeof want / sizeof *want; i++) {
+		uint32_t len, crc = chain_golden_crc(want[i].quant, &len);
+		if (len != want[i].len || crc != want[i].crc) {
+			fprintf(stderr, "chain golden quant=%u: len %u crc 0x%08X\n",
+			    want[i].quant, len, crc);
+			check_failures++;
+		}
+	}
+}
+
 int main(void)
 {
 	tables();
@@ -488,5 +664,8 @@ int main(void)
 	golden();
 	archive_parity();
 	archive_model_damage();
+	chain_validation();
+	chain_golden();
+	chain_archive_parity();
 	return CHECK_DONE();
 }

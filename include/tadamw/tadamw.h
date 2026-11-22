@@ -83,6 +83,8 @@ typedef enum {
 	TAW_PREDICTOR_ORDER0, /* arith profile 0 */
 	TAW_PREDICTOR_MIX,    /* arith profile 1; TAW_E_ARG if the input is
 	                         too small for any model */
+	TAW_PREDICTOR_CHAIN,  /* arith profile 10: chained tiny predictors;
+	                         experimental */
 } taw_predictor;
 
 /* Weight format for the mixer (docs/format.md §3). AUTO lets the encoder

@@ -1,6 +1,6 @@
 # tar_aw container format, version 1
 
-Status: draft. Normative for everything implemented (profiles 0 and 1);
+Status: draft. Normative for everything implemented (profiles 0, 1 and 10);
 reserved values are listed so that decoders can refuse them.
 `tests/test_p1.c` pins profile 1 with golden vectors: a change that breaks
 them changes the format.
@@ -52,7 +52,15 @@ identical probabilities for every bit.
 |----|-----------------|---------------|--------|
 | 0  | `INT_ORDER0`    | empty (`model_size = 0`, `quant = 0`) | implemented, placeholder |
 | 1  | `F32_STRICT_MIX`| mixer shape and weights, §5.1; quant `F16`, `Q8`, `Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4` or `IQ2` | implemented |
-| 2..255 | — | — | reserved, refuse |
+| 10 | `F32_CHAINED_MIX`| chain of 3 tiny predictors, §2.3 and §5.2; quant `F16` or `Q8` | implemented (experimental) |
+| 2..9, 11..255 | — | — | reserved, refuse |
+
+Profile 10 is the experimental profile of arXiv:2604.15472 (chained
+lightweight predictors with information inheritance). It reuses profile 1's
+integer context models (§2.2.1–§2.2.7), squash/stretch, APM stages (§2.2.9),
+per-bit sequence (§2.2.10) and range coder (§4) *exactly*; only the mixing
+step differs. Profiles 1 and 10 therefore share one context-model and APM
+implementation.
 
 ### 2.1 Profile 0: `INT_ORDER0`
 
@@ -306,6 +314,72 @@ and the same `A2` entry are updated: `e += (65535 - e) >> 6` if `b`, else
    `nib = 1` and select lines with `q = c0`. At `bitpos` 8: byte end
    (§2.2.5).
 
+### 2.3 Profile 10: `F32_CHAINED_MIX`
+
+This profile replaces §2.2.8 (the single frozen MLP) with a chain of three
+frozen single-layer predictors. Everything else in §2.2 is normative here as
+well: the 12 context models, their 25 stretched inputs `x[0..24]` and the
+bias `x[25] = 1`, the selectors (§2.2.7), `squash`, and the two APM stages.
+The three units are fixed to a low-, mid- and high-order view of the
+contexts; each higher unit additionally receives the previous unit's
+probability estimate as one extra input ("information inheritance").
+
+Arithmetic conventions are those of §2.2: binary32, round-to-nearest-even,
+one operation at a time, no FMA, no reassociation, no libm. Quantized rows
+are dequantized as in §5.2 before any inference.
+
+#### 2.3.1 Unit layout (normative)
+
+Input indices refer to `x[0..25]` from §2.2.8 (`k` and `12+k` are model `k`'s
+direct and history estimates; 24 is the match model, 25 the bias). The
+subsets are fixed by the profile, not stored in the archive:
+
+| unit | name        | input indices, in this order                                                                 | own inputs | row length |
+|------|-------------|----------------------------------------------------------------------------------------------|------------|------------|
+| 0    | low order   | 0, 12, 25                                                                                     | 3          | 3          |
+| 1    | mid order   | 0, 12, 1, 13, 2, 14, 3, 15, 6, 18, 25                                                          | 11         | 12         |
+| 2    | high order  | 0, 1, 2, ..., 24, 25 (all inputs)                                                              | 26         | 27         |
+
+The subsets are nested: a higher-order unit sees all the lower-order
+inputs as well, which is what lets it correct the inherited estimate rather
+than having to reconstruct low-order statistics through it alone.
+
+A row length is the own-input count plus one inheritance input for units 1
+and 2. Unit 0 has no inheritance input (its predecessor is the constant 0,
+so storing a weight for it would be pointless). The inheritance input of
+unit `u > 0` is the **clamped binary32 estimate** `c[u-1]` defined below,
+appended after that unit's own inputs. Its weight is the last weight of the
+row.
+
+#### 2.3.2 Inference (normative)
+
+For each bit, with `x[0..25]` as in §2.2.8 and selector values `a[u]` from
+unit `u`'s selector (§5.2), let `L = 2047/256` and let `dot4` be the exact
+four-partial-sum product of §2.2.8:
+
+```
+prev = +0.0f
+for u = 0 .. 2:
+    v[0..m_u-1] = x[subset_u[0..m_u-1]]
+    if u > 0: v[m_u] = prev
+    z = dot4(W[u][a[u]], v, row_length_u)
+    c[u] = min(max(z, -L), L)          (binary32 clamp; no rounding)
+    prev = c[u]
+t = trunc(c[2] * 256)                 (toward zero, exact, |t| <= 2047)
+p_mix = squash(t)
+```
+
+`c[u]` is the unit's probability estimate in stretch units; passing the
+clamped float (rather than the truncated integer `t`) preserves all bits of
+the estimate. Only the final unit's estimate is used: units 0 and 1 act as
+information inherited by the next unit. The result `p_mix` then goes through
+§2.2.9 unchanged, using the same `sc` as profile 1.
+
+The order of units, of inputs inside each subset, of weights inside each
+row, and of the four `dot4` partial sums are all normative. The rows of a
+unit are independent, so their order in the archive is just the serialized
+order of §5.2.
+
 ## 3. Quantization formats
 
 The format in which model weights are stored. Encoders may pick any format
@@ -442,6 +516,43 @@ code bits. Profile 1 accepts the row formats (`quant` 1 and 4..11);
 A decoder needs about `10 * 2^L * 64 + 2^HB + 4 * 2^MB` bytes of tables
 plus about 4.6 MB fixed (o1 table and APM), and resets them per coding
 unit.
+
+### 5.2 Profile 10 model
+
+An 8-byte head, then the weight payload. The geometry bytes are identical
+to §5.1; the selector bytes are the three chain units' selectors.
+
+| off | size | field | valid range |
+|-----|------|-------|-------------|
+| 0 | 1 | `lines_log2` (L) | 8..22 |
+| 1 | 1 | `hist_log2` (HB) | 12..26 |
+| 2 | 1 | `match_log2` (MB) | 10..24 |
+| 3 | 1 | `sel[0]`, low-order unit selector | 0..5 |
+| 4 | 1 | `sel[1]`, mid-order unit selector | 0..5 |
+| 5 | 1 | `sel[2]`, high-order unit selector | 0..5 |
+| 6 | 2 | reserved | `0` |
+
+The payload is, in this exact order, for `u = 0, 1, 2`, for each set `a` of
+`sel[u]` in increasing order, one row of `row_length_u` weights
+(§2.3.1). Row encodings are the same as in §5.1:
+
+- `F16`: one little-endian binary16 per weight, finite, converted exactly.
+- `Q8`: a little-endian finite binary16 `scale`, then one int8 `q != -128`
+  per weight; the weight is the binary32 product `float(q) * float(scale)`,
+  rounded once.
+
+The size is therefore
+
+```
+8 + sum_u |sel[u]| * (2 * row_length_u)                  (F16)
+8 + sum_u |sel[u]| * (2 + row_length_u)                  (Q8)
+```
+
+`model_size` MUST equal that value exactly. A decoder MUST refuse any field
+out of range, non-zero reserved bytes, a size mismatch, a non-finite F16
+value or scale, or a Q8 value of -128. Profile 10 accepts quant `F16` and
+`Q8` only. The context tables are the same size as profile 1's; there are
+no hidden-unit buffers.
 
 ## 6. aw body (kind 0)
 
