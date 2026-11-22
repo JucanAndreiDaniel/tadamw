@@ -398,6 +398,24 @@ raw context mixture** `V[0][i] = 1/25` for `i = 0..24` (bias 0), so the gate
 can move weight to the plain context average when the contexts agree; this
 variant is only valid when `H = 0`.
 
+### 2.4 Profile 7: `SOFT_GATED_CAL`
+
+Profile 7 is profile 3 with one change after the APM stages: the fixed blend
+`(2 * p_mix + q1 + q2) >> 2` of §2.2.9 is replaced by four-bit fitted integer
+weights `w0`, `w1`, `w2` (§5.3):
+
+```
+p = (w0 * p_mix + w1 * q1 + w2 * q2) / (w0 + w1 + w2)   (integer division)
+```
+
+The sum is at least 1 and the numerator is below 2^22, so the result is an
+exact unsigned division in `[0, 65535]`. The identity weights `(2, 1, 1)`
+reproduce profile 3's blend exactly (truncating division by 4 equals `>> 2`).
+Everything before the blend — context models, gate, experts, `squash`,
+`stretch`, both APM tables and their updates — is byte-for-byte profile 3.
+The APM bin lookup and update use `p_mix`, not the blended `p`, exactly as in
+profiles 1 and 3. All arithmetic remains integer with a fixed order.
+
 ## 3. Quantization formats
 
 The format in which model weights are stored. Encoders may pick any format
@@ -568,6 +586,32 @@ weight or Q8 scale, or a Q8 value of -128. Profile 3 accepts `quant` `F16`
 and `Q8` only; other quant values are unsupported.
 
 `model_size` is still bounded by `floor(raw_size / 32)` (§5).
+
+### 5.3 Profile 7 model
+
+Profile 7 shares profile 3's weight payload and `quant` values (`F16`, `Q8`),
+but its head is 16 bytes: the 8-byte profile 3 head (§5.2) followed by an
+8-byte blend block.
+
+| off | size | field | valid range |
+|-----|------|-------|-------------|
+| 0 | 8 | profile 3 head | §5.2 |
+| 8 | 1 | `w0` | 0..15, weight of `p_mix` |
+| 9 | 1 | `w1` | 0..15, weight of APM1 |
+| 10 | 1 | `w2` | 0..15, weight of APM2; not all three zero |
+| 11 | 5 | reserved | `0` |
+
+`model_size` MUST equal `16` plus the profile 3 payload size for the chosen
+shape and `quant`. A decoder MUST refuse any field out of range, a non-zero
+reserved byte, a size mismatch, or any profile 3 payload error (§5.2). The
+identity blend is `w0 = 2, w1 = 1, w2 = 1`; it is what makes a profile 7 model
+code identically to its profile 3 counterpart.
+
+Encoder-side fitting (not part of the format): the network is fitted exactly
+as for profile 3; the blend weights are then chosen from a small fixed set of
+4-bit triples by coding cost on a 16 KiB probe of the source, with the real
+predictor (including APM adaptation). The result does not depend on thread
+count or GPU use.
 
 ## 6. aw body (kind 0)
 

@@ -25,7 +25,8 @@ static void roundtrip_p(const uint8_t *src, size_t n, const taw_params *p)
 	CHECK(info.model_size <= n / 32);
 	if (p && p->predictor == TAW_PREDICTOR_MIX)
 		CHECK(info.arith_profile == TAW_PROFILE_F32_STRICT_MIX ||
-		    info.arith_profile == TAW_PROFILE_SOFT_GATED);
+		    info.arith_profile == TAW_PROFILE_SOFT_GATED ||
+		    info.arith_profile == TAW_PROFILE_SOFT_GATED_CAL);
 	CHECK(taw_decompress(arc, arc_n, &dec, &dec_n) == TAW_OK);
 	CHECK(dec_n == n);
 	CHECK(dec_n == n && memcmp(src, dec, n) == 0);

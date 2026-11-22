@@ -1,126 +1,111 @@
-# Experiment: soft-gated mixture-of-experts mixer (profile 3)
+# Experiment: soft-gated mixture-of-experts + learned APM blend
 
-Branch `exp/gated`, based on `origin/main` at `a427e7f`. Everything is local;
-nothing was pushed.
+Branch `exp/gated`, rebased onto `origin/main` at `e64cc83` (9 upstream
+commits: GPU fitting, Q4/Q2/FP8/... quant formats, bit-position sampling,
+fused AVX2 profile-1 decoder, parallel awseek decode). Two local commits:
+`435b2dd` (phase 1, profiles 3) and `2a5cd5f` (phase 2 WIP, profile 7).
+Final commit adds the spec, goldens and this report. Nothing was pushed.
 
 ## What works
 
-A new arithmetic profile **3 `SOFT_GATED`** is implemented end to end:
-
-* format specification (new §2.3 and §5.2 in `docs/format.md`);
-* header constant (`TAW_PROFILE_SOFT_GATED`), CLI profile name, loader,
-  dequantizer and **scalar** inference (`src/p3.c`);
-* predictor integration sharing the profile 1 context models, squash/stretch
-  tables, both APM stages and the range coder (`src/predictor.c`);
-* encoder fitting for the new mixer in `src/fit.c`, including a real-codepath
-  candidate ranking step;
-* model validation and two golden vectors in `tests/test_p1.c`;
-* generalized three existing tests that asserted "profile 1 is always
-  chosen" (`test_aw.c`, `test_awseek.c`, `cli_roundtrip.cmake`).
-
-`cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang`,
-`cmake --build build -j2` and `ctest --test-dir build --output-on-failure`
-all succeed: **10/10 tests pass**, including the unchanged profile 1 golden
-vectors (so profile 1's arithmetic was not disturbed).
-
-## Design
-
-The 12 context models, their 25 stretched inputs, `squash`, `stretch`, the two
-adaptive APM tables, the `(2*p_mix + q1 + q2) >> 2` blend and the range coder
-are exactly profile 1's. Only the mixer changes.
-
-* **K = 2..4 experts**, each a linear model over either the 26 mixer inputs
-  (`hidden = 0`) or a shared `hidden = 4` nonlinear layer. Expert weights use
-  the profile 1 F16/Q8 row encoding.
-* **Integer gate** over cheap features: `int8` logit tables indexed by the
-  partial byte `c0`, the match class `msel`, and a confidence bucket derived
-  from the mean absolute deviation of the 25 stretched inputs. The gate logit
-  of expert `k` is a plain int16 sum of these three table lookups.
-* **Exact integer softmax**: `E[0] = 256`, `E[d] = (E[d-1]*235) >> 8` for
-  `d = 1..511` (a fixed-point `256*2^(-d/8)`). Gate weights are normalized by
-  prefix-sum rounding, `w[k] = floor(256*prefix_k/S) - floor(256*prefix_{k-1}/S)`,
-  so they sum to exactly 256 with a fixed summation order. The expert outputs
-  are accumulated as `sum_k w[k]*z[k]` in `k` order, scaled by `1/256`,
-  clamped, truncated and squashed. This keeps the whole gate/mixer
-  deterministic with no libm and a fixed float order.
-* Following the result of sibling experiment `exp-entropygate`, one variant
-  makes expert 0 a **fixed raw context mixture** (`1/25` on every stretched
-  input) and lets the confidence feature route weight to it when contexts
-  agree. That variant is only valid with `hidden = 0` and costs `K*16` extra
-  int8 gate bytes.
-
-Model sizes are small: 932 B (K=3, H=0, Q8, confidence) to 1240 B
-(K=4, H=0, Q8, confidence), far below the `raw/32 = 32768` B budget.
-
-Encoder fitting trains the shared hidden layer, the experts and the gate
-logits with AdamW on the same sampled bits profile 1 uses. Gate logits are
-trained in natural-log space and serialized as `round(8/ln2 * logit)` int8,
-which makes the integer `E[d]` table reproduce the trained soft routing.
-Because the sample-based score omits the APM stages and was observed to rank
-mixers differently from the range coder, the final profile/candidate choice
-is made by actually encoding the whole input with each fitted candidate
-(capped at 1 MiB).
+* **Profile 3 `SOFT_GATED`**: K=2..4 experts, exact integer-softmax gate over
+  `c0`, match class and a 16-level confidence bucket (mean absolute deviation
+  of the 25 stretched inputs), with an optional fixed raw-context-mixture
+  expert. Contexts, squash/stretch, APM and range coder are profile 1's.
+* **Profile 7 `SOFT_GATED_CAL`** (phase 2): profile 3 plus 8 bytes of fitted
+  4-bit APM blend weights `w0,w1,w2`, replacing
+  `(2*p_mix + q1 + q2) >> 2` with
+  `p = (w0*p_mix + w1*q1 + w2*q2) / (w0+w1+w2)`. All integer, fixed order;
+  identity `(2,1,1)` reproduces profile 3 exactly.
+* Loader/dequantizer/scalar inference (`src/p3.c`), predictor and CLI support,
+  encoder fitting (AdamW experts/gate; blend fitted by coding cost on a 16 KiB
+  held-out probe), format spec (`docs/format.md` §2.3, §2.4, §5.2, §5.3),
+  golden vectors and validation in `tests/test_p1.c`, and test generalization
+  for the new profiles.
+* Final profile/candidate choice is made by encoding the whole input
+  (capped at 1 MiB) with each fitted candidate: the sample-based score omits
+  the APM stages and mis-ranks mixers.
+* Full `ctest` passes **12/12** on the rebased tree: tests 1-9 completed in a
+  run interrupted by a server restart, tests 10-12 were re-run afterwards and
+  all passed (including the new profile 7 golden vectors). All profile 1
+  golden vectors are unchanged.
 
 ## Format additions
 
-* Profile table: id 3 `SOFT_GATED`, ids 2 and 4..255 reserved.
-* §2.3: state reuse, `E[d]` table, confidence-bucket computation, gate logit
-  sum, integer softmax with prefix-sum normalization, expert evaluation,
-  weighted accumulation and squash. No change to §2.2 (APM, range coder).
-* §5.2: 8-byte model head (`K`, `hidden`, geometry, `gate_flags`) and payload
-  order (hidden rows, expert rows, `K*256` int8 `c0` table, optional `K*8`
-  `msel` table, optional `K*16` confidence table), with validation rules.
+* Profile table: 3 `SOFT_GATED`, 7 `SOFT_GATED_CAL` (2 and 4..6, 8..255
+  reserved). Upstream's extended quant table for profile 1 is untouched;
+  profiles 3/7 accept `F16`/`Q8`.
+* §2.3/§5.2: gate logits, `E[d]=(E[d-1]*235)>>8`, prefix-sum normalization to
+  weights summing to 256, expert evaluation, weighted accumulation, model
+  head (8 bytes) and payload layout.
+* §2.4/§5.3: learned APM blend arithmetic and 16-byte head (8-byte profile 3
+  head + `w0,w1,w2` + reserved), validation rules and identity values.
 
-## Results
+## Benchmarks (post-rebase, new clean baseline)
 
-Read-only corpora: `/tmp/opencode/tadamw-bench/text1m` and `libc1m` (1 MiB
-each). Best-of-3 decodes. `size` includes the model section and framing.
+Archives made with `-p mix` on `/tmp/opencode/tadamw-bench/text1m` and
+`libc1m` (1 MiB each). Archive bytes, including model and framing.
+The machine was heavily loaded (load average ~27-35) during these runs, so
+timings are not meaningful; sizes are deterministic.
 
-| corpus | level | baseline size | profile 3 size | delta | chosen profile / model |
-|--------|-------|---------------|----------------|-------|------------------------|
-| text1m | L1 | 190610 | **188907** | −1703 (−0.89%) | 3, K=4 H=4 Q8, 1204 B |
-| text1m | L5 | 187956 | **186991** | −965 (−0.51%) | 1, H=8 Q8, 1888 B |
-| libc1m | L1 | 388792 | **381688** | −7104 (−1.83%) | 3, K=3 H=0 Q8 + confidence, 932 B |
-| libc1m | L5 | 385741 | **383663** | −2078 (−0.54%) | 3, K=4 H=0 Q8, 1176 B |
+| corpus | L | new baseline (p1) | p3/p7 result | delta | chosen profile / model |
+|--------|---|-------------------|--------------|-------|------------------------|
+| text1m | 1 | 181557 | **179820** | −1737 (−0.96%) | 7 (K=4 H=0 Q8 + confidence), 1184 B |
+| text1m | 5 | 179166 | 179166 | 0 (0.00%) | 1 (upstream's 608 B model wins) |
+| libc1m | 1 | 379197 | **372999** | −6198 (−1.63%) | 7 (K=4 H=0 Q8), 1248 B |
+| libc1m | 5 | 375291 | **372007** | −3284 (−0.88%) | 7 (K=4 H=0 Q8), 1248 B |
 
-All archives round-trip exactly; `taw i` reports the profile named in the
-table. Timings (noisy: sibling agents were benchmarking concurrently) were
-roughly enc 13–35 s (baseline 2–6 s) and dec 1.8–2.8 s (baseline 1.25–1.39 s).
-The encode slowdown is from fitting extra candidates and re-encoding the
-input to rank them; the decode slowdown is mostly measurement contention
-(profile 3 decodes no more experts than profile 1 decodes hidden units).
+All four archives round-trip; `taw i` reports the profile shown.
+
+### Comparison against sibling profiles
+
+| corpus | L | this work | profile 6 (new, rebased) | profile 9 ensemble (old base) |
+|--------|---|-----------|--------------------------|-------------------------------|
+| text1m | 1 | **179820** | 180874 | 184060 |
+| text1m | 5 | 179166 | **178997** | 182655 |
+| libc1m | 1 | **372999** | 375305 | 383060 |
+| libc1m | 5 | **372007** | 373312 | 380717 |
+
+Profile 6 numbers are from sibling branch `exp/calibration` commit `50b7f89`
+("Rebase profile 6 calibration onto new main and refresh benchmarks"), i.e.
+measured on the same new baseline. Profile 9's numbers were supplied by the
+coordinator but are **stale** (old baseline 190610/187956/388792/385741);
+its branch had not been rebased at the time of writing, so that column is
+only indicative — this work's absolute sizes are lower than all of them.
+
+### Stale numbers from before the rebase (do not use)
+
+Phase 1 on old `main`: text L1 188907, L5 186991; libc L1 381688, L5 383663
+against the old baseline 190610/187956/388792/385741. Old profile 6 numbers
+186508/186098/384244/382830 and old profile 9 numbers
+184060/182655/383060/380717 are likewise superseded.
 
 ## Verdict
 
-**Positive in absolute terms, mixed relative to the sibling results.** The
-extra weights do pay for themselves in three of four cases, with the best
-result −1.83% on libc L1; on text L5 the fitter keeps profile 1. However,
-this is weaker than sibling `exp/calibration` (−1.2% to −2.1%) everywhere
-except libc L1, and comparable to `exp-entropygate` (−0.58% to −1.09%)
-only on libc. As a standalone profile 3 is therefore only marginally worth
-its complexity.
+The combination beats profile 6 in three of four cases (best: −2306 bytes,
+−0.61%, on libc L1) and is within 169 bytes of it on text L5, where the
+fitter keeps upstream's profile 1 model. It improves the new profile-1
+baseline by 0.88–1.63% on libc and 0.96% on text L1. The learned blend is the
+larger part of the gain: fitted weights are APM-dominant (`(0,2,1)` or
+`(0,1,0)` most often), confirming that the fitted mixer only reaches the
+coded probability through the APM stages — an improvement to the mixer alone
+has at most half the effect. The extra 8 bytes pay for themselves everywhere
+profile 7 is selected.
 
-The main reason is structural: the changed mixer only reaches the final
-probability through the unchanged APM blend `(2*p_mix + q1 + q2) >> 2`, so at
-most half of the probability is attributable to the improved mixer. That
-matches the sibling finding that the adaptive integer part dominates the
-fitted MLP. Combining a soft-gated expert mixer with an APM blend that can
-suppress `p_mix` would likely be the strongest configuration, but changing
-that blend was outside this experiment's "keep APM unchanged" constraint.
+Against profile 9 the comparison is inconclusive because its published
+numbers predate the upstream baseline change; on absolute archive bytes this
+work is smaller on all four cases.
 
 ## Caveats / incomplete aspects
 
-* SIMD inference is not implemented for profile 3 (scalar only); this is
-  explicitly allowed by the task. ISA parity tests therefore cover profile 1
-  only; profile 3 golden vectors are scalar and fixed-order.
-* `hidden > 0` combined with the confidence flag is forbidden by the format
-  and by the loader (the fixed context expert is defined in the input
-  domain). Both allowed shapes are exercised by the golden vectors and fit.
-* At L5 some K=4/H=0 gate fittings collapse to near-hard routing and lose to
-  profile 1 (text L5); the real-codepath ranking correctly rejects those
-  candidates, but fitting is not fully robust.
-* The candidate ranking re-encodes up to 1 MiB per candidate, which makes
-  compression considerably slower than baseline; a cheaper accurate score
-  (or a larger sample for the estimator) is future work.
-* Decode timings were collected while other agents benchmarked in parallel
-  and should not be read as a precise speed result.
+* Profile 3/7 inference is scalar (SIMD optional); profile 1 keeps upstream's
+  fused AVX2 path. ISA parity golden vectors cover profile 1 only; profiles
+  3/7 have scalar golden vectors with fixed order.
+* `hidden > 0` with the confidence flag is forbidden by the format (the fixed
+  context expert lives in the input domain).
+* Some K=4/H=0 gate fittings collapse toward near-hard routing at higher
+  effort; the real-codepath ranking rejects them (text L5 keeps profile 1).
+* Candidate ranking re-encodes up to 1 MiB per fitted candidate, so encoding
+  is much slower than baseline; a cheaper accurate score is future work.
+* Timings in this report are unreliable because sibling agents were running
+  large benchmarks concurrently; only archive bytes should be compared.

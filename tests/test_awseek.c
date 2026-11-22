@@ -73,7 +73,8 @@ static void random_access_mix(void)
 	taw_info info;
 	CHECK(taw_read_info(arc, arc_n, &info) == TAW_OK);
 	CHECK(info.arith_profile == TAW_PROFILE_F32_STRICT_MIX ||
-	    info.arith_profile == TAW_PROFILE_SOFT_GATED);
+	    info.arith_profile == TAW_PROFILE_SOFT_GATED ||
+	    info.arith_profile == TAW_PROFILE_SOFT_GATED_CAL);
 	taw_source mem;
 	taw_source_memory(&mem, arc, arc_n);
 	taw_seek *s;
