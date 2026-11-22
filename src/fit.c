@@ -266,10 +266,14 @@ static void tnet_free(tnet *t)
 	free(t->m);
 	free(t->v);
 	free(t->g);
+	free(t->m1);
+	free(t->v1);
 	free(t->touched1);
 	free(t->touched2);
 	free(t->list1);
 	free(t->list2);
+	free(t->cnt1);
+	free(t->route1);
 	memset(t, 0, sizeof *t);
 }
 
@@ -289,12 +293,17 @@ static taw_status tnet_init(tnet *t, const p1_shape *s, uint64_t seed)
 	t->m = calloc(np, sizeof(float));
 	t->v = calloc(np, sizeof(float));
 	t->g = calloc(np, sizeof(float));
+	t->m1 = calloc(t->n1 ? t->n1 : 1, sizeof(float));
+	t->v1 = calloc(t->n1 ? t->n1 : 1, sizeof(float));
 	t->touched1 = calloc(t->s1 + 1, 1);
 	t->touched2 = calloc(t->s2, 1);
 	t->list1 = malloc((t->s1 + 1) * sizeof(uint32_t));
 	t->list2 = malloc(t->s2 * sizeof(uint32_t));
-	if (!t->w || !t->m || !t->v || !t->g || !t->touched1 || !t->touched2 ||
-	    !t->list1 || !t->list2) {
+	t->cnt1 = calloc(t->s1 ? t->s1 : 1, sizeof(uint32_t));
+	t->route1 = calloc(t->s1 ? t->s1 : 1, 1);
+	if (!t->w || !t->m || !t->v || !t->g || !t->m1 || !t->v1 ||
+	    !t->touched1 || !t->touched2 || !t->list1 || !t->list2 ||
+	    !t->cnt1 || !t->route1) {
 		tnet_free(t);
 		return TAW_E_NOMEM;
 	}
@@ -384,11 +393,13 @@ static void tnet_step(tnet *t, const sample *smp)
 /* End of warm-up: copy set 0 (weights and moments) to every set. */
 static void tnet_untie(tnet *t)
 {
-	float *arr[3] = {t->w, t->m, t->v};
-	for (int a = 0; a < 3; a++) {
+	float *arr[5] = {t->w, t->m, t->v, t->m1, t->v1};
+	for (int a = 0; a < 5; a++) {
 		float *b = arr[a];
 		for (size_t set = 1; set < t->s1; set++)
 			memcpy(b + set * t->row1, b, t->row1 * sizeof(float));
+		if (a >= 3)
+			continue; /* W1-only buffers */
 		for (size_t set = 1; set < t->s2; set++)
 			memcpy(b + t->n1 + set * t->row2, b + t->n1,
 			    t->row2 * sizeof(float));
@@ -396,42 +407,226 @@ static void tnet_untie(tnet *t)
 	t->tied = false;
 }
 
-typedef struct {
-	float lr, b1, b2, eps, wd;
-	float b1t, b2t; /* b1^t, b2^t */
-} adamw;
+/* ---- optimizers: AdamW, Muon and hybrids -------------------------------------
+ *
+ * W1 of the fitted mixer is a per-set H x P1_F matrix (one row per hidden
+ * unit); W2 rows are vectors (and include the output bias). Muon keeps one
+ * momentum buffer and orthogonalizes the (Nesterov-extrapolated) matrix
+ * update with Newton-Schulz; W2 stays on AdamW. Hybrid modes either blend the
+ * two W1 updates, alternate them per step, or route each W1 set to one of
+ * them. AdamW state for W1 is kept in t->m1/t->v1 so it never aliases Muon's
+ * momentum in t->m.
+ */
+enum { MUON_MAXDIM = 32, MUON_MAXEL = MUON_MAXDIM * MUON_MAXDIM };
 
-static void adam_rows(tnet *t, adamw *o, float *w, float *m, float *v,
-    float *g, size_t len, float scale)
+typedef enum {
+	HYB_ADAM = 0, /* the shipped optimizer: AdamW everywhere */
+	HYB_MUON,     /* Muon on W1 matrices, AdamW on W2 vectors */
+	HYB_BLEND,    /* W1: alpha*Muon + (1-alpha)*AdamW */
+	HYB_ALT,      /* W1: alternate Muon / AdamW by step or by half */
+	HYB_ROUTE     /* W1: Muon for hot sets, AdamW for cold sets */
+} hyb_mode;
+
+typedef struct {
+	float lr, lrvec, lr1;  /* current LRs: Muon W1, Adam W2, Adam W1 */
+	float wd, vecwd, wd1;  /* decoupled weight decay */
+	float b1, b2, eps;     /* Adam */
+	float mom, gain;       /* Muon */
+	float b1t, b2t;        /* b1^t, b2^t */
+	unsigned ns_steps;
+	bool nesterov;
+} optcfg;
+
+/* Tuning hooks (encoder-only; unset = shipped behaviour). */
+static float fit_env_float(const char *name, float def)
+{
+	const char *s = getenv(name);
+	if (!s || !*s)
+		return def;
+	char *end;
+	float v = strtof(s, &end);
+	return end != s ? v : def;
+}
+
+static unsigned fit_env_uint(const char *name, unsigned def)
+{
+	const char *s = getenv(name);
+	if (!s || !*s)
+		return def;
+	char *end;
+	unsigned long v = strtoul(s, &end, 10);
+	return end != s ? (unsigned)v : def;
+}
+
+/* AdamW on a flat vector. `mix` scales the whole update (1 for plain AdamW,
+ * 1-alpha for the Adam half of a blend). Gradients are cleared by caller. */
+static void adam_rows(optcfg *o, float *w, float *m, float *v, const float *g,
+    size_t len, float scale, float lr, float wd, float mix)
 {
 	const float c1 = 1.0f / (1.0f - o->b1t), c2 = 1.0f / (1.0f - o->b2t);
 	for (size_t k = 0; k < len; k++) {
 		float gk = g[k] * scale;
-		g[k] = 0.0f;
 		m[k] = o->b1 * m[k] + (1.0f - o->b1) * gk;
 		v[k] = o->b2 * v[k] + (1.0f - o->b2) * gk * gk;
 		float mh = m[k] * c1, vh = v[k] * c2;
-		w[k] -= o->lr * (mh / (fsqrt(vh) + o->eps) + o->wd * w[k]);
+		w[k] -= mix * lr * (mh / (fsqrt(vh) + o->eps) + wd * w[k]);
 	}
-	(void)t;
+}
+
+/* Muon on a row-major rows x cols matrix. Largest shape here is
+ * P1_HMAX x P1_F = 32 x 26, so scratch fits on the stack. */
+static void muon_rows(const optcfg *o, float *w, float *m, const float *g,
+    size_t rows, size_t cols, float scale, float lr, float wd, float mix)
+{
+	float x[MUON_MAXEL], a[MUON_MAXEL], b[MUON_MAXEL], y[MUON_MAXEL];
+	const bool tr = rows > cols; /* work with the shorter dimension first */
+	const size_t mr = tr ? cols : rows, mc = tr ? rows : cols;
+	if (rows * cols > MUON_MAXEL || mr == 0 || mc == 0)
+		return;
+	for (size_t i = 0; i < rows * cols; i++) {
+		float gi = g[i] * scale;
+		m[i] = o->mom * m[i] + gi;
+		float u = o->nesterov ? o->mom * m[i] + gi : m[i];
+		size_t at = tr ? (i % cols) * mc + i / cols : i;
+		x[at] = u;
+	}
+	float ss = 0.0f;
+	for (size_t i = 0; i < mr * mc; i++)
+		ss += x[i] * x[i];
+	float norm = fsqrt(ss);
+	if (!(norm > 1e-12f))
+		return; /* zero gradient: leave weights alone */
+	for (size_t i = 0; i < mr * mc; i++)
+		x[i] *= 1.0f / norm;
+	for (unsigned it = 0; it < o->ns_steps; it++) {
+		for (size_t i = 0; i < mr; i++)
+			for (size_t j = 0; j < mr; j++) {
+				float s = 0.0f;
+				for (size_t k = 0; k < mc; k++)
+					s += x[i * mc + k] * x[j * mc + k];
+				a[i * mr + j] = s;
+			}
+		for (size_t i = 0; i < mr; i++)
+			for (size_t j = 0; j < mr; j++) {
+				float s = 0.0f;
+				for (size_t k = 0; k < mr; k++)
+					s += a[i * mr + k] * a[k * mr + j];
+				b[i * mr + j] = -4.7750f * a[i * mr + j] + 2.0315f * s;
+			}
+		for (size_t i = 0; i < mr; i++)
+			for (size_t k = 0; k < mc; k++) {
+				float s = 0.0f;
+				for (size_t j = 0; j < mr; j++)
+					s += b[i * mr + j] * x[j * mc + k];
+				y[i * mc + k] = s;
+			}
+		for (size_t i = 0; i < mr * mc; i++)
+			x[i] = 3.4445f * x[i] + y[i];
+	}
+	const size_t dmax = rows > cols ? rows : cols;
+	const float factor = mix * lr * o->gain * fsqrt((float)dmax);
+	for (size_t i = 0; i < rows * cols; i++) {
+		size_t at = tr ? (i % cols) * mc + i / cols : i;
+		w[i] -= factor * x[at] + mix * lr * wd * w[i];
+	}
+}
+
+static const char *fit_env_str(const char *name, const char *def)
+{
+	const char *s = getenv(name);
+	return s && *s ? s : def;
 }
 
 /* Train on samples for the given epochs. Batches touch few weight sets, so
- * only those rows are updated ("lazy" AdamW). */
+ * only those rows are updated ("lazy" optimizer state). With no environment
+ * overrides this is the shipped AdamW fitter, bit for bit. */
 static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
     uint64_t seed)
 {
 	enum { BATCH = FIT_BATCH };
-	adamw o = {.b1 = 0.9f, .b2 = 0.999f, .eps = 1e-6f, .wd = 1e-5f,
-		.b1t = 1.0f, .b2t = 1.0f};
-	const float lr0 = 0.02f, lr1 = 0.001f;
+	const char *hs = fit_env_str("TAW_HYBRID", "adam");
+	hyb_mode mode = HYB_ADAM;
+	if (!strcmp(hs, "muon"))
+		mode = HYB_MUON;
+	else if (!strcmp(hs, "blend"))
+		mode = HYB_BLEND;
+	else if (!strcmp(hs, "alt"))
+		mode = HYB_ALT;
+	else if (!strcmp(hs, "route"))
+		mode = HYB_ROUTE;
+
+	/* LR endpoints. Plain AdamW defaults to the shipped schedule; each
+	 * other component has its own knob so the two LRs can be tuned apart. */
+	const float lr0 = fit_env_float("TAW_LR0", 0.02f);
+	const float lr1 = fit_env_float("TAW_LR1", lr0 / 20.0f);
+	const float vec_lr0 = fit_env_float("TAW_VEC_LR0", lr0);
+	const float vec_lr1 = fit_env_float("TAW_VEC_LR1", lr1);
+	const float m_lr0 = fit_env_float("TAW_MUON_LR0", 0.01f);
+	const float m_lr1 = fit_env_float("TAW_MUON_LR1", m_lr0 / 20.0f);
+	const float a1_lr0 = fit_env_float("TAW_ADAM1_LR0", vec_lr0);
+	const float a1_lr1 = fit_env_float("TAW_ADAM1_LR1", vec_lr1);
+	optcfg o = {.b1 = fit_env_float("TAW_B1", 0.9f),
+		.b2 = fit_env_float("TAW_B2", 0.999f),
+		.eps = 1e-6f,
+		.mom = fit_env_float("TAW_MUON_MOM", 0.95f),
+		.gain = fit_env_float("TAW_MUON_GAIN", 0.2f),
+		.b1t = 1.0f, .b2t = 1.0f,
+		.ns_steps = fit_env_uint("TAW_MUON_NS", 5),
+		.nesterov = fit_env_uint("TAW_MUON_NEST", 1) != 0};
+	o.vecwd = fit_env_float("TAW_WD", 1e-5f);
+	o.wd = fit_env_float("TAW_MUON_WD", mode == HYB_ADAM ? o.vecwd : 1e-3f);
+	o.wd1 = fit_env_float("TAW_ADAM1_WD", o.vecwd);
+	const float alpha = fit_env_float("TAW_ALPHA", 0.5f);
+	const bool warm_adam = !strcmp(fit_env_str("TAW_WARM", "muon"), "adam");
+	const bool alt_step = strcmp(fit_env_str("TAW_ALT", "step"), "half") != 0;
+	const bool alt_first_muon =
+	    strcmp(fit_env_str("TAW_ALT_FIRST", "muon"), "adam") != 0;
+
+	/* Per-set frequency for routing: count the same samples the epoch loop
+	 * strides through (order does not matter for a count). */
+	if (mode == HYB_ROUTE && t->s1 > 1) {
+		for (size_t k = 0; k < ns; k++) {
+			const p1_sel_ctx sc = sample_sc(&sm[k]);
+			t->cnt1[p1_sel_value(t->s.sel1, &sc)]++;
+		}
+		uint32_t *sorted = malloc(t->s1 * sizeof *sorted);
+		if (sorted) {
+			memcpy(sorted, t->cnt1, t->s1 * sizeof *sorted);
+			/* comparator: ascending count, then lower index first */
+			/* qsort via a small insertion sort (s1 <= 4096) */
+			for (size_t i = 1; i < t->s1; i++) {
+				uint32_t v = sorted[i];
+				size_t j = i;
+				while (j && sorted[j - 1] > v) {
+					sorted[j] = sorted[j - 1];
+					j--;
+				}
+				sorted[j] = v;
+			}
+			float q = fit_env_float("TAW_ROUTE_Q", 0.5f);
+			if (q <= 0.0f)
+				memset(t->route1, 0, t->s1);
+			else if (q >= 1.0f)
+				memset(t->route1, 1, t->s1);
+			else {
+				double f = (1.0 - (double)q) * (double)(t->s1 - 1);
+				size_t idx = (size_t)(f + 0.5);
+				uint32_t thr = sorted[idx];
+				for (size_t set = 0; set < t->s1; set++)
+					t->route1[set] = t->cnt1[set] >= thr;
+			}
+			free(sorted);
+		} else {
+			memset(t->route1, 1, t->s1);
+		}
+	} else if (mode == HYB_ROUTE) {
+		memset(t->route1, 1, t->s1 ? t->s1 : 1);
+	}
+
 	const uint64_t steps_total = (uint64_t)epochs * ((ns + BATCH - 1) / BATCH);
 	uint64_t step = 0;
-	/* Stride through the samples (fit_stride). */
 	uint64_t rs = seed;
 	const unsigned H = t->s.hidden;
-	/* Warm-up: the first epochs train one shared set, which then seeds
-	 * every selected set. */
 	const int warm = fit_warm_epochs(epochs);
 	t->tied = t->s1 > 1 || t->s2 > 1;
 	for (int ep = 0; ep < epochs; ep++) {
@@ -465,22 +660,54 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 			done += nb;
 			step++;
 			float frac = (float)step / (float)steps_total;
-			o.lr = lr0 + (lr1 - lr0) * frac;
+			o.lr = m_lr0 + (m_lr1 - m_lr0) * frac;
+			o.lrvec = vec_lr0 + (vec_lr1 - vec_lr0) * frac;
+			o.lr1 = a1_lr0 + (a1_lr1 - a1_lr0) * frac;
 			o.b1t *= o.b1;
 			o.b2t *= o.b2;
+			bool alt_muon = alt_step ? (step & 1) == 1
+						 : (frac < 0.5f);
+			if (!alt_first_muon)
+				alt_muon = !alt_muon;
 			const float scale = 1.0f / (float)nb;
 			for (size_t k = 0; k < n1; k++) {
-				size_t off = t->list1[k] * t->row1;
-				adam_rows(t, &o, t->w + off, t->m + off, t->v + off,
-				    t->g + off, t->row1, scale);
-				t->touched1[t->list1[k]] = 0;
+				size_t set = t->list1[k], off = set * t->row1;
+				bool muon = mode == HYB_MUON ||
+				    (mode == HYB_ALT && alt_muon) ||
+				    (mode == HYB_ROUTE && t->route1[set]);
+				if (t->tied && warm_adam)
+					muon = false;
+				if (mode == HYB_ADAM) {
+					/* The shipped path, using the original m/v. */
+					adam_rows(&o, t->w + off, t->m + off,
+					    t->v + off, t->g + off, t->row1,
+					    scale, o.lrvec, o.vecwd, 1.0f);
+				} else if (mode == HYB_BLEND) {
+					adam_rows(&o, t->w + off, t->m1 + off,
+					    t->v1 + off, t->g + off, t->row1,
+					    scale, o.lr1, o.wd1, 1.0f - alpha);
+					muon_rows(&o, t->w + off, t->m + off,
+					    t->g + off, H, P1_F, scale, o.lr,
+					    o.wd, alpha);
+				} else if (muon) {
+					muon_rows(&o, t->w + off, t->m + off,
+					    t->g + off, H, P1_F, scale, o.lr,
+					    o.wd, 1.0f);
+				} else {
+					adam_rows(&o, t->w + off, t->m1 + off,
+					    t->v1 + off, t->g + off, t->row1,
+					    scale, o.lr1, o.wd1, 1.0f);
+				}
+				t->touched1[set] = 0;
 			}
 			for (size_t k = 0; k < n2; k++) {
 				size_t off = t->n1 + t->list2[k] * t->row2;
-				adam_rows(t, &o, t->w + off, t->m + off, t->v + off,
-				    t->g + off, t->row2, scale);
+				adam_rows(&o, t->w + off, t->m + off, t->v + off,
+				    t->g + off, t->row2, scale, o.lrvec,
+				    o.vecwd, 1.0f);
 				t->touched2[t->list2[k]] = 0;
 			}
+			memset(t->g, 0, (t->n1 + t->n2) * sizeof(float));
 		}
 	}
 }
