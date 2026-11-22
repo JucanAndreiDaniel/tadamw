@@ -1,4 +1,8 @@
 add_library(taw STATIC
+  buf.c
+  crc32c.c
+  predictor.c
+  rc.c
   version.c
 )
 target_include_directories(taw

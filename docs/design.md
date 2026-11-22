@@ -89,3 +89,5 @@ can run in parallel later.
 - Streaming encode for inputs larger than memory. (Fitting needs a pass
   over the data, so this probably means fitting on a sample.)
 - Parallel block coding for awseek.
+- A stored (uncoded) mode for incompressible chunks/blocks. Profile 0 grows
+  random data by about 2.4%.
