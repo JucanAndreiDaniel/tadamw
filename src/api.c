@@ -37,11 +37,28 @@ taw_status taw_compress(const void *src, size_t n, const taw_params *params,
 	taw_status st = taw_params_resolve(params, &p);
 	if (st != TAW_OK)
 		return st;
-	/* Profile 1 decodes; the encoder emits profile 0 until it can fit. */
-	const taw_model_choice m = {.profile = TAW_PROFILE_INT_ORDER0,
-		.quant = TAW_QUANT_NONE};
+	const size_t unit = p.seekable && p.block_size < n ? p.block_size : n;
+	taw_model_choice m;
+	st = taw_model_fit(src, n, unit, &p, &m);
+	if (st != TAW_OK)
+		return st;
 	taw_buf b = {0};
 	st = encode_with(src, n, &p, &m, &b);
+	if (st == TAW_OK && m.profile != TAW_PROFILE_INT_ORDER0 &&
+	    p.predictor == TAW_PREDICTOR_AUTO) {
+		/* Keep the mixer only if it beats the placeholder. */
+		const taw_model_choice z = {.profile = TAW_PROFILE_INT_ORDER0,
+			.quant = TAW_QUANT_NONE};
+		taw_buf b0 = {0};
+		if (encode_with(src, n, &p, &z, &b0) == TAW_OK && !b0.oom &&
+		    b0.n <= b.n) {
+			taw_buf_free(&b);
+			b = b0;
+		} else {
+			taw_buf_free(&b0);
+		}
+	}
+	free(m.model);
 	return finish(st, &b, out, out_n);
 }
 

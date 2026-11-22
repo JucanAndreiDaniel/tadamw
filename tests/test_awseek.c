@@ -21,19 +21,28 @@ static taw_status count_read(void *ctx, uint64_t off, void *dst, size_t n)
 	return TAW_OK;
 }
 
-static void *compress_seek(const uint8_t *src, size_t n, uint32_t bs,
-    size_t *arc_n)
+static void *compress_seek_p(const uint8_t *src, size_t n, uint32_t bs,
+    taw_predictor pred, size_t *arc_n)
 {
-	taw_params p = {.seekable = true, .block_size = bs};
+	taw_params p = {.seekable = true, .block_size = bs, .predictor = pred,
+		.level = pred == TAW_PREDICTOR_MIX ? 1 : 0};
 	void *arc;
 	REQUIRE(taw_compress(src, n, &p, &arc, arc_n) == TAW_OK);
 	return arc;
 }
 
-static void roundtrip(const uint8_t *src, size_t n, uint32_t bs)
+/* Container tests use the fast order-0 predictor. */
+static void *compress_seek(const uint8_t *src, size_t n, uint32_t bs,
+    size_t *arc_n)
+{
+	return compress_seek_p(src, n, bs, TAW_PREDICTOR_ORDER0, arc_n);
+}
+
+static void roundtrip_p(const uint8_t *src, size_t n, uint32_t bs,
+    taw_predictor pred)
 {
 	size_t arc_n;
-	void *arc = compress_seek(src, n, bs, &arc_n);
+	void *arc = compress_seek_p(src, n, bs, pred, &arc_n);
 	taw_info info;
 	CHECK(taw_read_info(arc, arc_n, &info) == TAW_OK);
 	CHECK(info.kind == TAW_KIND_SEEKABLE);
@@ -44,6 +53,42 @@ static void roundtrip(const uint8_t *src, size_t n, uint32_t bs)
 	CHECK(dec_n == n && memcmp(src, dec, n) == 0);
 	free(dec);
 	free(arc);
+}
+
+static void roundtrip(const uint8_t *src, size_t n, uint32_t bs)
+{
+	roundtrip_p(src, n, bs, TAW_PREDICTOR_ORDER0);
+}
+
+/* Profile 1: one shared model, history reset per block. */
+static void random_access_mix(void)
+{
+	enum { N = 300000, BS = 1 << 15 };
+	uint8_t *src = malloc(N), *buf = malloc(2 * BS);
+	REQUIRE(src && buf);
+	td_fill(src, N, TD_TEXT, 12);
+	size_t arc_n;
+	void *arc = compress_seek_p(src, N, BS, TAW_PREDICTOR_MIX, &arc_n);
+	taw_info info;
+	CHECK(taw_read_info(arc, arc_n, &info) == TAW_OK);
+	CHECK(info.arith_profile == TAW_PROFILE_F32_STRICT_MIX);
+	taw_source mem;
+	taw_source_memory(&mem, arc, arc_n);
+	taw_seek *s;
+	REQUIRE(taw_seek_open(&mem, &s) == TAW_OK);
+	uint64_t r = 5;
+	for (int t = 0; t < 40; t++) {
+		uint64_t off = td_next(&r) % N;
+		size_t len = (size_t)(td_next(&r) % (2 * BS));
+		if (len > N - off)
+			len = (size_t)(N - off);
+		REQUIRE(taw_seek_read(s, off, buf, len) == TAW_OK);
+		CHECK(memcmp(buf, src + off, len) == 0);
+	}
+	taw_seek_close(s);
+	free(arc);
+	free(buf);
+	free(src);
 }
 
 static void random_access(void)
@@ -120,7 +165,8 @@ static void random_access(void)
 	/* A stream archive is not seekable. */
 	void *aw;
 	size_t aw_n;
-	REQUIRE(taw_compress(src, 1000, nullptr, &aw, &aw_n) == TAW_OK);
+	REQUIRE(taw_compress(src, 1000, &(taw_params){.predictor =
+	    TAW_PREDICTOR_ORDER0}, &aw, &aw_n) == TAW_OK);
 	taw_source_memory(&mem, aw, aw_n);
 	CHECK(taw_seek_open(&mem, &s) == TAW_E_ARG);
 
@@ -158,6 +204,21 @@ int main(void)
 	bad.block_size = 2048;
 	CHECK(taw_compress(big, 10, &bad, &o, &on) == TAW_E_ARG);
 
+	/* Profile 1 roundtrips, including a partial last block. */
+	{
+		enum { N = 100000 };
+		uint8_t *src = malloc(N);
+		REQUIRE(src);
+		for (int kind = 0; kind < TD_KINDS; kind++) {
+			td_fill(src, N, kind, 40 + (size_t)kind);
+			roundtrip_p(src, N, 1u << 14, TAW_PREDICTOR_MIX);
+		}
+		td_fill(src, N, TD_TEXT, 3);
+		roundtrip_p(src, N, 4096, TAW_PREDICTOR_AUTO);
+		free(src);
+	}
+
 	random_access();
+	random_access_mix();
 	return CHECK_DONE();
 }

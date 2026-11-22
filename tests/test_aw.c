@@ -7,21 +7,33 @@
 #include "taw_internal.h"
 #include "testdata.h"
 
-static void roundtrip(const uint8_t *src, size_t n)
+/* Container tests use the fast order-0 predictor; profile 1 gets its own
+ * cases below and in test_p1. */
+static const taw_params order0 = {.predictor = TAW_PREDICTOR_ORDER0};
+
+static void roundtrip_p(const uint8_t *src, size_t n, const taw_params *p)
 {
 	void *arc, *dec;
 	size_t arc_n, dec_n;
-	REQUIRE(taw_compress(src, n, nullptr, &arc, &arc_n) == TAW_OK);
+	REQUIRE(taw_compress(src, n, p, &arc, &arc_n) == TAW_OK);
 	taw_info info;
 	CHECK(taw_read_info(arc, arc_n, &info) == TAW_OK);
 	CHECK(info.kind == TAW_KIND_STREAM);
-	CHECK(info.level == TAW_LEVEL_DEFAULT);
+	CHECK(info.level == (p && p->level ? p->level : TAW_LEVEL_DEFAULT));
 	CHECK(info.block_size == 0);
+	CHECK(info.model_size <= n / 32);
+	if (p && p->predictor == TAW_PREDICTOR_MIX)
+		CHECK(info.arith_profile == TAW_PROFILE_F32_STRICT_MIX);
 	CHECK(taw_decompress(arc, arc_n, &dec, &dec_n) == TAW_OK);
 	CHECK(dec_n == n);
 	CHECK(dec_n == n && memcmp(src, dec, n) == 0);
 	free(arc);
 	free(dec);
+}
+
+static void roundtrip(const uint8_t *src, size_t n)
+{
+	roundtrip_p(src, n, &order0);
 }
 
 /* Patch the header and fix its CRC, to test semantic refusals. */
@@ -49,7 +61,7 @@ static void corruption(void)
 	td_fill(src, N, TD_TEXT, 3);
 	void *arc_v;
 	size_t n;
-	REQUIRE(taw_compress(src, N, nullptr, &arc_v, &n) == TAW_OK);
+	REQUIRE(taw_compress(src, N, &order0, &arc_v, &n) == TAW_OK);
 	uint8_t *arc = arc_v;
 	void *dec = nullptr;
 	size_t dec_n;
@@ -108,9 +120,38 @@ int main(void)
 		free(src);
 	}
 
+	/* Defaults (auto predictor, level 5) on small inputs. */
+	{
+		uint8_t src[20000];
+		for (int kind = 0; kind < TD_KINDS; kind++) {
+			td_fill(src, sizeof src, kind, 77 + (size_t)kind);
+			roundtrip_p(src, sizeof src, nullptr);
+		}
+	}
+
+	/* Profile 1 across a chunk boundary: the predictor state must carry
+	 * over while the range coder restarts. */
+	{
+		const size_t n = (1u << 20) + 4321;
+		uint8_t *src = malloc(n);
+		REQUIRE(src);
+		td_fill(src, n, TD_TEXT, 4);
+		const taw_params mix = {.level = 1,
+			.predictor = TAW_PREDICTOR_MIX};
+		roundtrip_p(src, n, &mix);
+		free(src);
+	}
+
 	taw_params bad = {.level = 10};
 	void *o;
 	size_t on;
+	CHECK(taw_compress(&one, 1, &bad, &o, &on) == TAW_E_ARG);
+	bad = (taw_params){.predictor = (taw_predictor)7};
+	CHECK(taw_compress(&one, 1, &bad, &o, &on) == TAW_E_ARG);
+	bad = (taw_params){.weights = (taw_weights)7};
+	CHECK(taw_compress(&one, 1, &bad, &o, &on) == TAW_E_ARG);
+	/* Too small for any model inside the n/32 budget. */
+	bad = (taw_params){.predictor = TAW_PREDICTOR_MIX};
 	CHECK(taw_compress(&one, 1, &bad, &o, &on) == TAW_E_ARG);
 
 	corruption();

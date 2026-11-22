@@ -33,11 +33,29 @@ constexpr int TAW_LEVEL_MAX = 9;
 constexpr int TAW_LEVEL_DEFAULT = 5;
 constexpr uint32_t TAW_BLOCK_DEFAULT = 1u << 20;
 
+/* Predictor choice. AUTO fits the mixer and keeps it only if the archive
+ * comes out smaller than with the order-0 placeholder. */
+typedef enum {
+	TAW_PREDICTOR_AUTO = 0,
+	TAW_PREDICTOR_ORDER0, /* arith profile 0 */
+	TAW_PREDICTOR_MIX,    /* arith profile 1; TAW_E_ARG if the input is
+	                         too small for any model */
+} taw_predictor;
+
+/* Weight format for the mixer. AUTO lets the encoder choose. */
+typedef enum {
+	TAW_WEIGHTS_AUTO = 0,
+	TAW_WEIGHTS_F16,
+	TAW_WEIGHTS_Q8,
+} taw_weights;
+
 typedef struct {
 	int level;           /* fitting effort 1..9; 0 = TAW_LEVEL_DEFAULT */
 	bool seekable;       /* produce .awseek instead of .aw */
 	uint32_t block_size; /* .awseek block size (power of two, 4 KiB..1 GiB);
 	                        0 = TAW_BLOCK_DEFAULT */
+	taw_predictor predictor;
+	taw_weights weights;
 } taw_params;
 
 /* Compress src[0..n) into a new malloc'd buffer *out of *out_n bytes.

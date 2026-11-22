@@ -4,6 +4,7 @@ add_library(taw STATIC
   awseek.c
   buf.c
   crc32c.c
+  fit.c
   header.c
   p1_ctx.c
   p1_net.c
