@@ -55,6 +55,10 @@ declared. A shared library exports the `taw_*` API alone.
 - `taw_seek_encode`: a `.awseek` from any byte source to any sink, in
   parallel and with bounded memory, optionally with named files.
 - `taw_seek_open` / `taw_seek_read` / `taw_seek_files`: random access.
+- `taw_params.gpu` (`TAW_GPU_OFF`/`AUTO`/`ON`): fit the model on a GPU
+  through Vulkan, opened at run time; about 4x faster encoding at level 9
+  on a GT 1030 (docs/design.md, "GPU fitting"). `<tadamw/config.h>` says
+  whether the library has it (`TAW_HAVE_GPU`).
 
 ## Usage
 

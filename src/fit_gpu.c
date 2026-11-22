@@ -41,7 +41,7 @@ enum {
 	GPU_DESC = 4096,      /* meta: squash table, then descriptors */
 	GPU_CHUNK = 256,      /* steps per dispatch */
 	GPU_BLK = 1088,       /* words per prepared batch */
-	GPU_SHARED = 49152,   /* shared memory fit_gpu.comp needs, rounded up */
+	GPU_SHARED = 46080,   /* shared memory fit_gpu.comp needs (45200), rounded up */
 };
 static_assert(GPU_NB == FIT_BATCH, "the CPU trainer's batch");
 #define GPU_STAGE ((VkDeviceSize)32 << 20) /* staging buffer bytes */
