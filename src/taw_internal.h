@@ -152,5 +152,9 @@ void taw_pred_encode(taw_pred *pr, taw_rc_enc *e, const uint8_t *src,
 void taw_pred_decode(taw_pred *pr, taw_rc_dec *d, uint8_t *dst, size_t n);
 /* Advance the state over n known bytes without a coder (stored aw chunks). */
 void taw_pred_skip(taw_pred *pr, const uint8_t *src, size_t n);
+/* Encoder fitting: the exact coded probability of the next bit, and the
+ * state update after a known bit. */
+uint32_t taw_pred_prob(taw_pred *pr);
+void taw_pred_advance(taw_pred *pr, int bit);
 
 #endif

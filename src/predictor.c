@@ -55,7 +55,8 @@ bool taw_pred_supported(uint8_t profile, uint8_t quant)
 	switch (profile) {
 	case TAW_PROFILE_INT_ORDER0: return quant == TAW_QUANT_NONE;
 	case TAW_PROFILE_F32_STRICT_MIX: return p1_quant_supported(quant);
-	case TAW_PROFILE_SOFT_GATED: return p3_quant_supported(quant);
+	case TAW_PROFILE_SOFT_GATED:
+	case TAW_PROFILE_SOFT_GATED_CAL: return p3_quant_supported(quant);
 	default: return false;
 	}
 }
@@ -90,8 +91,8 @@ static taw_status p1_init(taw_pred *pr, uint8_t quant, const uint8_t *model,
 	return TAW_OK;
 }
 
-static taw_status p3_init(taw_pred *pr, uint8_t quant, const uint8_t *model,
-    size_t model_size)
+static taw_status p3_init(taw_pred *pr, uint8_t profile, uint8_t quant,
+    const uint8_t *model, size_t model_size)
 {
 	struct taw_p3 *m = aligned_alloc(_Alignof(struct taw_p3), sizeof *m);
 	if (!m)
@@ -102,7 +103,10 @@ static taw_status p3_init(taw_pred *pr, uint8_t quant, const uint8_t *model,
 		free(m);
 		return TAW_E_NOMEM;
 	}
-	taw_status st = p3_net_load(&m->net, quant, model, model_size);
+	m->calibrated = profile == TAW_PROFILE_SOFT_GATED_CAL;
+	taw_status st = m->calibrated
+	    ? p3_cal_net_load(&m->net, quant, model, model_size)
+	    : p3_net_load(&m->net, quant, model, model_size);
 	if (st == TAW_OK) {
 		p1_shape geo = {
 			.lines_log2 = m->net.s.lines_log2,
@@ -135,8 +139,9 @@ taw_status taw_pred_init(taw_pred *pr, uint8_t profile, uint8_t quant,
 		taw_pred_reset(pr);
 		return TAW_OK;
 	}
-	return profile == TAW_PROFILE_SOFT_GATED
-	    ? p3_init(pr, quant, model, model_size)
+	return profile == TAW_PROFILE_SOFT_GATED ||
+	    profile == TAW_PROFILE_SOFT_GATED_CAL
+	    ? p3_init(pr, profile, quant, model, model_size)
 	    : p1_init(pr, quant, model, model_size);
 }
 
@@ -228,6 +233,8 @@ static inline uint32_t p3_p16(struct taw_p3 *m)
 	const uint32_t q1 = apm_p(m->apm1, sc.c0, s12, &m->a1);
 	const uint32_t q2 =
 	    apm_p(m->apm2, (size_t)sc.c1 << 8 | sc.c0, s12, &m->a2);
+	if (m->calibrated)
+		return p3_cal_prob(&m->net.cal, p, q1, q2);
 	return (2 * p + q1 + q2) >> 2;
 }
 
@@ -236,6 +243,27 @@ static inline void p3_update(struct taw_p3 *m, int bit)
 	apm_update(&m->apm1[m->a1], bit);
 	apm_update(&m->apm2[m->a2], bit);
 	p1_ctx_update(&m->ctx, bit);
+}
+
+/* Encoder-side fitting needs the exact coded probability and a way to
+ * advance the predictor over a known bit (used by the blend probe). */
+uint32_t taw_pred_prob(taw_pred *pr)
+{
+	if (pr->p3)
+		return p3_p16(pr->p3);
+	if (pr->p1)
+		return p1_p16(pr->p1);
+	return pr->p[pr->c0];
+}
+
+void taw_pred_advance(taw_pred *pr, int bit)
+{
+	if (pr->p3)
+		p3_update(pr->p3, bit);
+	else if (pr->p1)
+		p1_update(pr->p1, bit);
+	else
+		o0_update(pr, bit);
 }
 
 #if TAW_HAVE_ENCODER

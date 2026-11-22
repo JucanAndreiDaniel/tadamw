@@ -63,6 +63,37 @@ bool p3_quant_supported(uint8_t quant)
 	return quant == TAW_QUANT_F16 || quant == TAW_QUANT_Q8;
 }
 
+uint64_t p3_model_size(const p3_shape *s, uint8_t quant, bool calibrated)
+{
+	return (calibrated ? P3_CAL_HEAD : P3_HEAD) + p3_weights_size(s, quant);
+}
+
+void p3_cal_head_write(uint8_t out[P3_CAL_HEAD], const p3_shape *s,
+    const p3_cal *cal)
+{
+	p3_head_write(out, s);
+	out[8] = cal->w0;
+	out[9] = cal->w1;
+	out[10] = cal->w2;
+	for (unsigned i = 11; i < P3_CAL_HEAD; i++)
+		out[i] = 0;
+}
+
+taw_status p3_cal_head_parse(const uint8_t *p, size_t n, p3_shape *s,
+    p3_cal *cal)
+{
+	if (n < P3_CAL_HEAD || p3_head_parse(p, n, s) != TAW_OK)
+		return TAW_E_FORMAT;
+	*cal = (p3_cal){.w0 = p[8], .w1 = p[9], .w2 = p[10]};
+	if (cal->w0 > P3_W_MAX || cal->w1 > P3_W_MAX || cal->w2 > P3_W_MAX ||
+	    (cal->w0 == 0 && cal->w1 == 0 && cal->w2 == 0))
+		return TAW_E_FORMAT;
+	for (unsigned i = 11; i < P3_CAL_HEAD; i++)
+		if (p[i])
+			return TAW_E_FORMAT;
+	return TAW_OK;
+}
+
 uint64_t p3_weights_size(const p3_shape *s, uint8_t quant)
 {
 	const unsigned H = s->hidden;
@@ -123,17 +154,21 @@ static taw_status read_row(const uint8_t **pp, uint8_t quant, unsigned len,
 	return TAW_OK;
 }
 
-taw_status p3_net_load(p3_net *n, uint8_t quant, const uint8_t *model,
-    size_t size)
+/* Shared by profiles 3 and 7; head_len is P3_HEAD or P3_CAL_HEAD. */
+static taw_status net_load(p3_net *n, uint8_t quant, const uint8_t *model,
+    size_t size, size_t head_len)
 {
 	p3_tables_init();
 	memset(n, 0, sizeof *n);
+	n->cal = P3_CAL_IDENTITY;
 	if (!p3_quant_supported(quant))
 		return TAW_E_UNSUPPORTED;
+	if (size < head_len)
+		return TAW_E_FORMAT;
 	taw_status st = p3_head_parse(model, size, &n->s);
 	if (st != TAW_OK)
 		return st;
-	if (size - P3_HEAD != p3_weights_size(&n->s, quant))
+	if (size - head_len != p3_weights_size(&n->s, quant))
 		return TAW_E_FORMAT;
 
 	const unsigned H = n->s.hidden, K = n->s.K;
@@ -158,7 +193,7 @@ taw_status p3_net_load(p3_net *n, uint8_t quant, const uint8_t *model,
 	memset(n->w1, 0, w1n * sizeof(float));
 	memset(n->v, 0, vn * sizeof(float));
 
-	const uint8_t *p = model + P3_HEAD;
+	const uint8_t *p = model + head_len;
 	float row[P1_HMAX + P1_F];
 	/* Shared hidden layer. */
 	for (unsigned j = 0; j < H; j++) {
@@ -196,6 +231,26 @@ taw_status p3_net_load(p3_net *n, uint8_t quant, const uint8_t *model,
 	return TAW_OK;
 fail:
 	p3_net_free(n);
+	return st;
+}
+
+taw_status p3_net_load(p3_net *n, uint8_t quant, const uint8_t *model,
+    size_t size)
+{
+	return net_load(n, quant, model, size, P3_HEAD);
+}
+
+taw_status p3_cal_net_load(p3_net *n, uint8_t quant, const uint8_t *model,
+    size_t size)
+{
+	p3_shape s;
+	p3_cal cal;
+	taw_status st = p3_cal_head_parse(model, size, &s, &cal);
+	if (st != TAW_OK)
+		return st;
+	st = net_load(n, quant, model, size, P3_CAL_HEAD);
+	if (st == TAW_OK)
+		n->cal = cal;
 	return st;
 }
 

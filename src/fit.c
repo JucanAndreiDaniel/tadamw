@@ -1233,6 +1233,85 @@ static void p3fit_one(void *arg, size_t ci, unsigned w)
 	J->st[ci] = st;
 }
 
+/* ---- profile 7: learned APM blend ------------------------------------------
+ * A profile 7 model is a profile 3 model with an 8-byte blend block after
+ * the head. The network is already fitted; only w0/w1/w2 remain. They are
+ * chosen by real coding cost on a fixed probe of the source (bits the
+ * expert fitting never saw directly), from a small set of 4-bit triples. */
+
+static void fit_p3_blend(const taw_source *in, uint64_t unit, uint8_t quant,
+    taw_buf *m7, p3_cal *cal)
+{
+	enum { PROBE = 1u << 14 };
+	const uint64_t take = in->size < PROBE ? in->size : PROBE;
+	const float *ct = cost_tab();
+	if (!take || !ct)
+		return;
+	uint8_t *buf = malloc((size_t)take);
+	if (!buf || in->read_at(in->ctx, 0, buf, (size_t)take) != TAW_OK) {
+		free(buf);
+		return;
+	}
+	static const uint8_t triples[][3] = {
+		{2,1,1}, {1,1,1}, {0,1,1}, {0,2,1}, {0,1,2}, {0,2,2},
+		{0,3,2}, {0,2,3}, {1,2,2}, {1,1,2}, {1,2,1}, {2,1,2},
+		{1,0,0}, {0,1,0}, {0,0,1}, {4,1,1}, {1,3,3}, {2,3,3},
+	};
+	uint8_t bw[3] = {cal->w0, cal->w1, cal->w2};
+	double best = 1e300;
+	for (size_t k = 0; k < sizeof triples / sizeof *triples; k++) {
+		const uint8_t *t = triples[k];
+		m7->p[8] = t[0];
+		m7->p[9] = t[1];
+		m7->p[10] = t[2];
+		taw_pred pr;
+		if (taw_pred_init(&pr, TAW_PROFILE_SOFT_GATED_CAL, quant,
+		    m7->p, m7->n) != TAW_OK)
+			continue;
+		double sum = 0.0;
+		for (uint64_t i = 0; i < take; i++) {
+			if (unit && i % unit == 0)
+				taw_pred_reset(&pr);
+			for (int b = 7; b >= 0; b--) {
+				const int bit = (buf[i] >> b) & 1;
+				const uint32_t p = taw_pred_prob(&pr);
+				sum += ct[bit ? p : 65536u - p];
+				taw_pred_advance(&pr, bit);
+			}
+		}
+		taw_pred_free(&pr);
+		if (sum < best) {
+			best = sum;
+			bw[0] = t[0]; bw[1] = t[1]; bw[2] = t[2];
+		}
+	}
+	cal->w0 = bw[0]; cal->w1 = bw[1]; cal->w2 = bw[2];
+	m7->p[8] = bw[0]; m7->p[9] = bw[1]; m7->p[10] = bw[2];
+	free(buf);
+}
+
+static taw_status make_p7_model(const taw_source *in, uint64_t unit,
+    uint8_t quant, const taw_buf *m3, taw_buf *out)
+{
+	p3_shape s;
+	if (p3_head_parse(m3->p, m3->n, &s) != TAW_OK)
+		return TAW_E_FORMAT;
+	p3_cal cal = P3_CAL_IDENTITY;
+	taw_buf b = {0};
+	uint8_t head[P3_CAL_HEAD];
+	p3_cal_head_write(head, &s, &cal);
+	taw_buf_put(&b, head, sizeof head);
+	taw_buf_put(&b, m3->p + P3_HEAD, m3->n - P3_HEAD);
+	if (b.oom) {
+		taw_buf_free(&b);
+		return TAW_E_NOMEM;
+	}
+	fit_p3_blend(in, unit, quant, &b, &cal);
+	p3_cal_head_write(b.p, &s, &cal);
+	*out = b;
+	return TAW_OK;
+}
+
 /* Codelength of a middle slice with the real predictor (context models,
  * squash, APM and range coder), including the whole model section. The
  * sample-based estimate above ignores the APM stages, so it is not reliable
@@ -1357,11 +1436,30 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 			st = taw_parallel(threads, ptries, 0, p3fit_one,
 			    nullptr, &G);
 	}
+	/* Derive profile 7 candidates from the fitted profile 3 models: the
+	 * network is unchanged, only the APM blend weights are fitted. */
+	taw_buf *H = NULL;
+	if (st == TAW_OK && ptries) {
+		H = calloc(ptries, sizeof *H);
+		if (!H)
+			st = TAW_E_NOMEM;
+		else
+			for (size_t ci = 0; ci < ptries; ci++) {
+				if (G.st[ci] != TAW_OK)
+					continue;
+				taw_status hs = make_p7_model(in, unit,
+				    pcs[ci].quant, &G.model[ci], &H[ci]);
+				if (hs != TAW_OK) {
+					st = hs;
+					break;
+				}
+			}
+	}
 	/* Rank every fitted candidate by its real coded cost over the whole
 	 * input. The sample estimate omits the APM stages, so it can rank two
 	 * mixers differently from the range coder that actually writes them. */
 	uint64_t best_cost = UINT64_MAX;
-	bool best_is_p3 = false;
+	uint8_t best_prof = 0;
 	size_t best_i = SIZE_MAX;
 	for (size_t ci = 0; st == TAW_OK && ci < tries; ci++) {
 		if (F.st[ci] != TAW_OK)
@@ -1376,7 +1474,7 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 			    ci, cs[ci].s.hidden, cs[ci].quant,
 			    F.model[ci].n, (unsigned long long)cost);
 		if (cost < best_cost) {
-			best_cost = cost; best_is_p3 = false; best_i = ci;
+			best_cost = cost; best_prof = c.profile; best_i = ci;
 		}
 	}
 	for (size_t ci = 0; st == TAW_OK && ci < ptries; ci++) {
@@ -1393,16 +1491,40 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 			    ci, pcs[ci].s.K, pcs[ci].s.hidden, pcs[ci].quant,
 			    G.model[ci].n, (unsigned long long)cost);
 		if (cost < best_cost) {
-			best_cost = cost; best_is_p3 = true; best_i = ci;
+			best_cost = cost; best_prof = c.profile; best_i = ci;
+		}
+	}
+	for (size_t ci = 0; st == TAW_OK && H && ci < ptries; ci++) {
+		if (!H[ci].p)
+			continue;
+		taw_model_choice c = {.profile = TAW_PROFILE_SOFT_GATED_CAL,
+			.quant = pcs[ci].quant, .model = H[ci].p,
+			.model_size = H[ci].n};
+		uint64_t cost = real_cost(&c, in, n, unit);
+		if (dbg)
+			fprintf(stderr,
+			    "taw real p7[%zu] K=%u H=%u q=%u w=%u,%u,%u "
+			    "model=%zu cost=%llu\n",
+			    ci, pcs[ci].s.K, pcs[ci].s.hidden, pcs[ci].quant,
+			    H[ci].p[8], H[ci].p[9], H[ci].p[10],
+			    H[ci].n, (unsigned long long)cost);
+		if (cost < best_cost) {
+			best_cost = cost; best_prof = c.profile; best_i = ci;
 		}
 	}
 	if (st == TAW_OK && best_i != SIZE_MAX) {
-		if (best_is_p3) {
+		if (best_prof == TAW_PROFILE_SOFT_GATED) {
 			out->profile = TAW_PROFILE_SOFT_GATED;
 			out->quant = pcs[best_i].quant;
 			out->model = G.model[best_i].p;
 			out->model_size = G.model[best_i].n;
 			G.model[best_i] = (taw_buf){0};
+		} else if (best_prof == TAW_PROFILE_SOFT_GATED_CAL) {
+			out->profile = TAW_PROFILE_SOFT_GATED_CAL;
+			out->quant = pcs[best_i].quant;
+			out->model = H[best_i].p;
+			out->model_size = H[best_i].n;
+			H[best_i] = (taw_buf){0};
 		} else {
 			out->profile = TAW_PROFILE_F32_STRICT_MIX;
 			out->quant = cs[best_i].quant;
@@ -1411,6 +1533,9 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 			F.model[best_i] = (taw_buf){0};
 		}
 	}
+	for (size_t ci = 0; H && ci < ptries; ci++)
+		taw_buf_free(&H[ci]);
+	free(H);
 	for (size_t ci = 0; G.model && ci < ptries; ci++)
 		taw_buf_free(&G.model[ci]);
 	free(G.model); free(G.est); free(G.bpb); free(G.st);
