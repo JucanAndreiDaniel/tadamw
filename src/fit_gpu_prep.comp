@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Batch preparation for the GPU trainer (fit_gpu.comp, fit_gpu.c).
+//
+// A batch's samples, and so their weight sets, follow from the schedule
+// alone, never from the weights. So this pass lays out every batch of a
+// dispatch ahead of training, with one workgroup per (step, candidate),
+// all in parallel: it sorts the batch by weight set per layer (bitonic,
+// stable through the thread index in the key) and writes a block that
+// the trainer reads in one go.
+//
+// Block (BLK words): [0, 256) sample index at each primary rank (layer 1's,
+// or layer 2's when H = 0) | its layer-2 rank << 24; [256, 512) set at
+// layer-1 rank r | set at layer-2 rank r << 16; then per layer: segment
+// counts [512, 514), split-run counts [514, 516), segments [516, 780) and
+// [780, 1044), split runs [1044, 1052) and [1052, 1060).
+//
+// A segment is a run of equal sets (start | end << 9 | slot << 18): the
+// trainer sums each gradient over it in one thread. Runs longer than SEGMAX
+// are split into pieces of at most 32 that leave partial sums in slots
+// (slot 31 = a whole run), and a split run (start | pieces << 9 |
+// first slot << 14) adds them up afterwards.
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Samples { uint smp[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Meta { uint meta[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer Blocks { uint blk[]; };
+
+layout(push_constant) uniform Push {
+	uint mode, nbatch, last_nb, step0, steps_total, ns, stride, step_nb,
+	    tied, pos_off, ncand;
+} pc;
+
+const uint NB = 256u;
+const uint SW = 14u;
+const uint DESC = 4096u;
+const uint BLK = 1088u;
+const uint SEGS = NB + 9u;
+
+const uint SEGMAX = 48u;
+const uint NSEG = NB + 8u;
+
+shared uint so1[NB], so2[NB], rk2[NB];
+shared uint fm[16];
+shared uint scan[2u * NB];
+
+uint selv(uint sel, uint c0, uint c1, uint msel)
+{
+	switch (sel) {
+	case 1u: return uint(findMSB(c0));
+	case 2u: return msel;
+	case 3u: return c0;
+	case 4u: return c1;
+	case 5u: return ((c1 >> 4) << 8) | c0;
+	default: return 0u;
+	}
+}
+
+void main()
+{
+	const uint b = gl_WorkGroupID.x, c = gl_WorkGroupID.y;
+	const uint t = gl_LocalInvocationID.x;
+	const uint d = DESC + c * 8u;
+	const uint H = meta[d], sel1 = meta[d + 1u], sel2 = meta[d + 2u];
+	const uint s1n = meta[d + 6u], s2n = meta[d + 7u];
+	const uint nb = b + 1u == pc.nbatch ? pc.last_nb : NB;
+	const bool tied = pc.tied != 0u;
+	const bool srt = !tied && ((H > 0u && s1n > 1u) || s2n > 1u);
+	const uint o = (c * pc.nbatch + b) * BLK;
+
+	// this step's first sample, then thread t's
+	const uint a = (meta[pc.pos_off + c] + b * pc.step_nb) % pc.ns;
+	uint k1 = 0xFFFFu, k2 = 0xFFFFu; // inactive threads sort last
+	if (t < nb) {
+		k1 = k2 = 0u;
+		if (!tied) {
+			const uint pos = (a + t * pc.stride) % pc.ns;
+			const uint cw = smp[pos * SW + 13u];
+			const uint c0 = cw & 255u, cc1 = (cw >> 8) & 255u;
+			const uint msel = (cw >> 16) & 255u;
+			k1 = H > 0u ? selv(sel1, c0, cc1, msel) : 0u;
+			k2 = selv(sel2, c0, cc1, msel);
+		}
+	}
+	so1[t] = k1 << 8 | t;
+	so2[t] = k2 << 8 | t;
+	if (t < 16u)
+		fm[t] = 0u;
+	barrier();
+	if (srt) {
+		for (uint k = 2u; k <= NB; k <<= 1) {
+			for (uint j = k >> 1; j > 0u; j >>= 1) {
+				const uint l = t ^ j;
+				if (l > t) {
+					const bool up = (t & k) == 0u;
+					const uint a1 = so1[t], b1 = so1[l];
+					if ((a1 > b1) == up) {
+						so1[t] = b1;
+						so1[l] = a1;
+					}
+					const uint a2 = so2[t], b2 = so2[l];
+					if ((a2 > b2) == up) {
+						so2[t] = b2;
+						so2[l] = a2;
+					}
+				}
+				barrier();
+			}
+		}
+	}
+	rk2[so2[t] & 255u] = t;
+	const uint e1 = so1[t], e2 = so2[t];
+	bool f1 = false, f2 = false;
+	if (t < nb) {
+		const uint m = 1u << (t & 31u), w = t >> 5;
+		f1 = t == 0u || (e1 >> 8) != (so1[t - 1u] >> 8);
+		f2 = t == 0u || (e2 >> 8) != (so2[t - 1u] >> 8);
+		if (f1)
+			atomicOr(fm[w], m);
+		if (f2)
+			atomicOr(fm[8u + w], m);
+	}
+	barrier();
+	// rank t: the sample there, and the sets
+	if (t < nb) {
+		const uint ts = (H > 0u ? e1 : e2) & 255u;
+		blk[o + t] = (a + ts * pc.stride) % pc.ns | rk2[ts] << 24;
+		blk[o + NB + t] = (e1 >> 8) | (e2 >> 8) << 16;
+	} else { // (the trainer prefetches every rank's sample)
+		blk[o + t] = 0u;
+		blk[o + NB + t] = 0u;
+	}
+	if (t < 16u)
+		blk[o + 512u + t] = fm[t];
+	// segments: each run start counts its pieces, slots and splits
+	const uint nchunk = (nb + 31u) >> 5;
+	uint val[2], len[2];
+	for (uint L = 0u; L < 2u; L++) {
+		val[L] = 0u;
+		len[L] = 0u;
+		if (L == 0u ? f1 : f2) {
+			const uint w = t >> 5;
+			const uint above = (t & 31u) == 31u ? 0u : ~((2u << (t & 31u)) - 1u);
+			uint e = nb, m = fm[L * 8u + w] & above;
+			if (m != 0u) {
+				e = 32u * w + uint(findLSB(m));
+			} else {
+				for (uint q = w + 1u; q < nchunk; q++) {
+					if (fm[L * 8u + q] != 0u) {
+						e = 32u * q + uint(findLSB(fm[L * 8u + q]));
+						break;
+					}
+				}
+			}
+			len[L] = e - t;
+			const uint pieces = len[L] > SEGMAX ? (len[L] + 31u) >> 5 : 1u;
+			val[L] = pieces | (pieces > 1u ? pieces << 10 | 1u << 15 : 0u);
+		}
+		scan[L * NB + t] = val[L];
+	}
+	barrier();
+	for (uint k = 1u; k < NB; k <<= 1) { // inclusive scans
+		const uint a0 = t >= k ? scan[t - k] : 0u;
+		const uint a1 = t >= k ? scan[NB + t - k] : 0u;
+		barrier();
+		scan[t] += a0;
+		scan[NB + t] += a1;
+		barrier();
+	}
+	for (uint L = 0u; L < 2u; L++) {
+		const uint v = val[L];
+		if (v != 0u) {
+			const uint ex = scan[L * NB + t] - v; // before this run
+			const uint pieces = v & 1023u;
+			uint segi = ex & 1023u;
+			const uint slot0 = (ex >> 10) & 31u, spl = ex >> 15;
+			const uint plen = (len[L] + pieces - 1u) / pieces;
+			for (uint p = 0u; p < pieces; p++, segi++) {
+				const uint s0 = t + p * plen, s1 = min(t + len[L], s0 + plen);
+				blk[o + 516u + L * NSEG + segi] =
+				    s0 | s1 << 9 | (pieces > 1u ? slot0 + p : 31u) << 18;
+			}
+			if (pieces > 1u)
+				blk[o + 1044u + L * 8u + spl] = t | pieces << 9 | slot0 << 14;
+		}
+		if (t == NB - 1u) {
+			const uint tot = scan[L * NB + t];
+			blk[o + 512u + L] = tot & 1023u;
+			blk[o + 514u + L] = tot >> 15;
+		}
+	}
+}

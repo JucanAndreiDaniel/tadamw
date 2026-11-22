@@ -4,15 +4,18 @@
  * Fitting may be sloppy (it is encoder-only and need not be reproducible);
  * the chosen weights are quantized and dequantized exactly as the decoder
  * does it, and the final estimate uses the real inference code. */
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
 
+#include "fit_internal.h"
 #include "format.h"
 #include "half.h"
 #include "p1.h"
@@ -76,27 +79,14 @@ static float *cost_tab(void)
 	return t;
 }
 
-/* ---- deterministic PRNG ------------------------------------------------------ */
-
-static uint64_t rng_next(uint64_t *s)
-{
-	uint64_t z = (*s += 0x9E3779B97F4A7C15ull);
-	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-	z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-	return z ^ (z >> 31);
-}
+/* ---- deterministic PRNG (rng_next: fit_internal.h) ----------------------------- */
 
 static float rng_unif(uint64_t *s) /* [-1, 1) */
 {
 	return (float)(int32_t)(uint32_t)(rng_next(s) >> 32) * (1.0f / 2147483648.0f);
 }
 
-/* ---- samples ------------------------------------------------------------------ */
-
-typedef struct {
-	int16_t st[P1_NCTX];
-	uint8_t c0, c1, msel, bit;
-} sample;
+/* ---- samples (the type: fit_internal.h) ---------------------------------------- */
 
 static inline p1_sel_ctx sample_sc(const sample *s)
 {
@@ -267,17 +257,7 @@ static taw_status collect(const taw_source *in, uint64_t unit,
 	return TAW_OK;
 }
 
-/* ---- the trainable network ------------------------------------------------------ */
-
-typedef struct {
-	p1_shape s;
-	size_t s1, s2, row1, row2; /* sets, params per set */
-	size_t n1, n2;             /* params per layer */
-	float *w, *m, *v, *g;      /* [n1 + n2] each */
-	uint8_t *touched1, *touched2;
-	bool tied; /* warm-up: every sample uses set 0 */
-	uint32_t *list1, *list2;
-} tnet;
+/* ---- the trainable network (tnet: fit_internal.h) ------------------------------- */
 
 static void tnet_free(tnet *t)
 {
@@ -440,36 +420,23 @@ static void adam_rows(tnet *t, adamw *o, float *w, float *m, float *v,
 static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
     uint64_t seed)
 {
-	enum { BATCH = 256 };
+	enum { BATCH = FIT_BATCH };
 	adamw o = {.b1 = 0.9f, .b2 = 0.999f, .eps = 1e-6f, .wd = 1e-5f,
 		.b1t = 1.0f, .b2t = 1.0f};
 	const float lr0 = 0.02f, lr1 = 0.001f;
 	const uint64_t steps_total = (uint64_t)epochs * ((ns + BATCH - 1) / BATCH);
 	uint64_t step = 0;
-	/* Stride through the samples with an odd step coprime to ns: a cheap
-	 * shuffle that keeps neighbouring (correlated) bits in different
-	 * batches. */
+	/* Stride through the samples (fit_stride). */
 	uint64_t rs = seed;
 	const unsigned H = t->s.hidden;
 	/* Warm-up: the first epochs train one shared set, which then seeds
 	 * every selected set. */
-	const int warm = epochs / 5 > 1 ? epochs / 5 : 1;
+	const int warm = fit_warm_epochs(epochs);
 	t->tied = t->s1 > 1 || t->s2 > 1;
 	for (int ep = 0; ep < epochs; ep++) {
 		if (t->tied && ep >= warm)
 			tnet_untie(t);
-		uint64_t stride = (uint64_t)((double)ns * 0.6180339887) | 1;
-		while (ns > 1) {
-			uint64_t a = stride, b = ns;
-			while (b) {
-				uint64_t r = a % b;
-				a = b;
-				b = r;
-			}
-			if (a == 1)
-				break;
-			stride += 2;
-		}
+		const uint64_t stride = fit_stride(ns);
 		uint64_t pos = rng_next(&rs) % (ns ? ns : 1);
 		for (size_t done = 0; done < ns;) {
 			size_t nb = ns - done < BATCH ? ns - done : BATCH;
@@ -692,6 +659,7 @@ typedef struct {
 	taw_buf *model; /* [tries] */
 	double *est, *bpb;
 	taw_status *st;
+	tnet *pre; /* [tries] or nullptr: nets already trained (on the GPU) */
 } fit_job;
 
 static void fit_one(void *arg, size_t ci, unsigned w)
@@ -699,9 +667,14 @@ static void fit_one(void *arg, size_t ci, unsigned w)
 	(void)w;
 	fit_job *F = arg;
 	tnet t;
-	taw_status st = tnet_init(&t, &F->cs[ci].s, 0x7A57A11ull + ci);
-	if (st == TAW_OK) {
+	taw_status st = TAW_OK;
+	if (F->pre && F->pre[ci].w) {
+		t = F->pre[ci];
+		F->pre[ci] = (tnet){0};
+	} else if ((st = tnet_init(&t, &F->cs[ci].s, 0x7A57A11ull + ci)) == TAW_OK) {
 		tnet_train(&t, F->sm, F->ns, F->epochs, 0xC0FFEEull + ci);
+	}
+	if (st == TAW_OK) {
 		st = serialize(&t, F->cs[ci].quant, &F->model[ci]);
 		tnet_free(&t);
 	}
@@ -710,6 +683,139 @@ static void fit_one(void *arg, size_t ci, unsigned w)
 		    F->sm, F->ns, &F->bpb[ci]);
 	F->est[ci] = F->bpb[ci] * 8.0 * (double)F->n + 8.0 * (double)F->model[ci].n;
 	F->st[ci] = st;
+}
+
+/* ---- hybrid fitting: the GPU trains some candidates, CPU workers the rest ---- */
+
+typedef struct {
+	fit_job *F;
+	const size_t *idx; /* the candidates of this list */
+} fit_list;
+
+static void fit_listed(void *arg, size_t i, unsigned w)
+{
+	const fit_list *L = arg;
+	fit_one(L->F, L->idx[i], w);
+}
+
+typedef struct {
+	taw_gpu *g;
+	tnet *nets;
+	size_t k;
+	int epochs;
+	const uint64_t *seeds;
+	taw_status st;
+} gpu_job;
+
+static void *gpu_main(void *arg)
+{
+	gpu_job *J = arg;
+	J->st = taw_gpu_train(J->g, J->nets, J->k, J->epochs, J->seeds);
+	return nullptr;
+}
+
+static double now_s(void)
+{
+	struct timespec ts;
+	timespec_get(&ts, TIME_UTC);
+	return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/* Fit candidates [0, tries). Which ones the GPU trains is a rule of the
+ * candidates alone (every shape it supports), so the archive does not depend
+ * on the thread count or on timing; CPU workers fit the others meanwhile. A
+ * failing GPU falls back to the CPU (TAW_GPU_AUTO) or fails (TAW_GPU_ON). */
+static taw_status fit_all(fit_job *F, size_t tries, unsigned threads,
+    taw_gpu_mode mode, bool dbg)
+{
+	const double t0 = dbg ? now_s() : 0.0;
+	/* AUTO leaves small fits to the CPU: opening a GPU takes about 0.2 s,
+	 * more than levels 1-2 spend fitting. A rule of the effort alone. */
+	if (mode == TAW_GPU_AUTO &&
+	    (uint64_t)F->ns * (uint64_t)F->epochs * tries < (1u << 22)) {
+		if (dbg)
+			fprintf(stderr, "taw fit: gpu: not worth it for this "
+					"little fitting\n");
+		mode = TAW_GPU_OFF;
+	}
+	size_t *idx = malloc(2 * tries * sizeof *idx), ng = 0, nc = 0;
+	if (!idx)
+		return TAW_E_NOMEM;
+	size_t *gi = idx, *ci = idx + tries;
+	for (size_t c = 0; c < tries; c++) {
+		if (mode != TAW_GPU_OFF && taw_gpu_fits(&F->cs[c].s))
+			gi[ng++] = c;
+		else
+			ci[nc++] = c;
+	}
+	taw_gpu *g = nullptr;
+	taw_status st = TAW_OK;
+	if (ng && (st = taw_gpu_open(F->sm, F->ns, dbg, &g)) != TAW_OK) {
+		if (mode == TAW_GPU_ON) {
+			free(idx);
+			return st;
+		}
+		nc = tries; /* auto: all on the CPU */
+		for (size_t c = 0; c < tries; c++)
+			ci[c] = c;
+		ng = 0;
+		st = TAW_OK;
+	}
+	tnet *nets = ng ? calloc(ng, sizeof *nets) : nullptr;
+	uint64_t *seeds = ng ? malloc(ng * sizeof *seeds) : nullptr;
+	F->pre = ng ? calloc(tries, sizeof *F->pre) : nullptr;
+	if (ng && (!nets || !seeds || !F->pre))
+		st = TAW_E_NOMEM;
+	for (size_t j = 0; j < ng && st == TAW_OK; j++) {
+		st = tnet_init(&nets[j], &F->cs[gi[j]].s, 0x7A57A11ull + gi[j]);
+		seeds[j] = 0xC0FFEEull + gi[j];
+	}
+	gpu_job J = {.g = g, .nets = nets, .k = ng, .epochs = F->epochs,
+		.seeds = seeds, .st = TAW_OK};
+	pthread_t th;
+	bool spawned = false;
+	if (st == TAW_OK && ng) {
+		spawned = pthread_create(&th, nullptr, gpu_main, &J) == 0;
+		if (!spawned)
+			gpu_main(&J);
+	}
+	if (st == TAW_OK)
+		st = taw_parallel(threads, nc, 0, fit_listed, nullptr,
+		    &(fit_list){F, ci});
+	if (spawned)
+		pthread_join(th, nullptr);
+	taw_gpu_close(g);
+	const double t1 = dbg ? now_s() : 0.0;
+	if (st == TAW_OK && ng) {
+		if (J.st == TAW_OK) {
+			for (size_t j = 0; j < ng; j++) {
+				F->pre[gi[j]] = nets[j];
+				nets[j] = (tnet){0};
+			}
+		} else if (mode == TAW_GPU_ON) {
+			st = J.st;
+		} else if (dbg) {
+			fprintf(stderr, "taw fit: gpu: training failed, "
+					"fitting on the CPU\n");
+		}
+		if (st == TAW_OK) /* quantize and score (or fit, after a failure) */
+			st = taw_parallel(threads, ng, 0, fit_listed, nullptr,
+			    &(fit_list){F, gi});
+	}
+	if (dbg)
+		fprintf(stderr, "taw fit: %zu candidates (%zu on the GPU): "
+				"training %.2f s, total %.2f s\n",
+		    tries, J.st == TAW_OK ? ng : 0, t1 - t0, now_s() - t0);
+	for (size_t j = 0; j < ng; j++)
+		tnet_free(&nets[j]);
+	for (size_t c = 0; F->pre && c < tries; c++)
+		tnet_free(&F->pre[c]);
+	free(F->pre);
+	F->pre = nullptr;
+	free(nets);
+	free(seeds);
+	free(idx);
+	return st;
 }
 
 taw_status taw_model_fit(const uint8_t *src, size_t n, size_t unit,
@@ -765,7 +871,7 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 	if (!F.model || !F.est || !F.bpb || !F.st)
 		st = TAW_E_NOMEM;
 	else
-		st = taw_parallel(threads, tries, 0, fit_one, nullptr, &F);
+		st = fit_all(&F, tries, threads, p->gpu, dbg != nullptr);
 	size_t best = SIZE_MAX;
 	for (size_t ci = 0; st == TAW_OK && ci < tries; ci++) {
 		if ((st = F.st[ci]) != TAW_OK)

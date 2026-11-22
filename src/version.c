@@ -21,6 +21,7 @@ const char *taw_strerror(taw_status s)
 	case TAW_E_CHECKSUM: return "checksum mismatch";
 	case TAW_E_RANGE: return "range out of bounds";
 	case TAW_E_IO: return "I/O error";
+	case TAW_E_GPU: return "no usable GPU";
 	}
 	return "unknown error";
 }

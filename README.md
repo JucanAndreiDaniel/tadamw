@@ -36,6 +36,7 @@ Sanitizer build: `-DTADAMW_SANITIZE=ON -DTADAMW_WERROR=ON`.
 | `TADAMW_NX` | ON | `taw-nx`, when OpenSSL 3 and LZ4 are found |
 | `TADAMW_TESTS` | ON | the tests (need both halves) |
 | `TADAMW_INSTALL` | ON | install rules |
+| `TADAMW_GPU` | ON if `vulkan/vulkan.h` and `glslangValidator` are found | GPU model fitting; Vulkan is opened at run time, so the library never links it |
 
 ## Library
 
@@ -60,6 +61,7 @@ declared. A shared library exports the `taw_*` API alone.
 ```sh
 taw c [-l 1..9] in out.aw              # stream
 taw c -p mix -w q8 in out.aw           # force the mixer, Q8 weights
+taw c -l 9 -g on in out.aw             # fit on a GPU (-g auto: if there is one)
 taw c [-B block_size] [-j N] in out.awseek   # seekable (or -s), N threads
 taw d archive out
 taw x archive.awseek OFFSET LENGTH out # random-access range

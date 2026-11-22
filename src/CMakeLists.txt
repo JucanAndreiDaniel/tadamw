@@ -12,6 +12,14 @@ if(TADAMW_DECODER)
 else()
   set(TAW_HAVE_DECODER 0)
 endif()
+if(TADAMW_ENCODER AND TADAMW_GPU)
+  if(NOT TADAMW_VULKAN_INCLUDE_DIR OR NOT TADAMW_GLSLANG)
+    message(FATAL_ERROR "TADAMW_GPU needs vulkan/vulkan.h and glslangValidator")
+  endif()
+  set(TAW_HAVE_GPU 1)
+else()
+  set(TAW_HAVE_GPU 0)
+endif()
 configure_file(${PROJECT_SOURCE_DIR}/cmake/config.h.in
                ${PROJECT_BINARY_DIR}/include/tadamw/config.h @ONLY)
 
@@ -19,7 +27,20 @@ set(tadamw_sources
   api.c aw.c awseek.c buf.c crc32c.c header.c p1_ctx.c p1_net.c pool.c
   predictor.c quant.c rc.c version.c)
 if(TADAMW_ENCODER)
-  list(APPEND tadamw_sources fit.c) # AdamW fitting, encoder only
+  list(APPEND tadamw_sources fit.c fit_gpu.c) # AdamW fitting, encoder only
+endif()
+if(TAW_HAVE_GPU)
+  # The trainer's compute shader, as SPIR-V words in a header.
+  set(gen ${PROJECT_BINARY_DIR}/gen)
+  foreach(shader fit_gpu fit_gpu_prep)
+    add_custom_command(OUTPUT ${gen}/${shader}_spv.h
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${gen}
+      COMMAND ${TADAMW_GLSLANG} -V --target-env vulkan1.1 --vn ${shader}_spv
+              -o ${gen}/${shader}_spv.h ${CMAKE_CURRENT_SOURCE_DIR}/${shader}.comp
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${shader}.comp
+      COMMENT "glslangValidator ${shader}.comp" VERBATIM)
+    list(APPEND tadamw_sources ${gen}/${shader}_spv.h)
+  endforeach()
 endif()
 
 add_library(tadamw_obj OBJECT ${tadamw_sources})
@@ -29,6 +50,11 @@ target_include_directories(tadamw_obj
   PUBLIC  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
           $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(tadamw_obj PRIVATE TAW_GPU=${TAW_HAVE_GPU})
+if(TAW_HAVE_GPU)
+  target_include_directories(tadamw_obj PRIVATE ${PROJECT_BINARY_DIR}/gen
+                             ${TADAMW_VULKAN_INCLUDE_DIR})
+endif()
 
 # x86 SIMD kernels are compiled with their own ISA flags and picked at run
 # time by CPUID; everything else stays baseline.
@@ -53,13 +79,13 @@ target_include_directories(tadamw PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
   $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_link_libraries(tadamw PRIVATE Threads::Threads)
+target_link_libraries(tadamw PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 
 add_library(tadamw_internal STATIC $<TARGET_OBJECTS:tadamw_obj>)
 target_include_directories(tadamw_internal PUBLIC
   ${PROJECT_SOURCE_DIR}/include ${PROJECT_BINARY_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(tadamw_internal PUBLIC Threads::Threads)
+target_link_libraries(tadamw_internal PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 
 if(TADAMW_INSTALL)
   include(CMakePackageConfigHelpers)

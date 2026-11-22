@@ -29,7 +29,7 @@ drive a binary range coder (format.md §4).
 | model shape | table/MLP split chosen heuristically per input, not fixed |
 | weight formats (profile 1) | F16 and INT8 (Q8) from the start; then Q4, Q2, FP8 (E4M3), NVFP4, IQ8, IQ4, IQ2 (format.md §3, §5.1) |
 | SIMD | scalar reference + AVX2/F16C and AVX-512 paths (ideas: ~/ucas, ~/q2_kernel kernels) |
-| GPU | the encoder may use a GPU for fitting, as a hybrid. Decoders are CPU by default and may opt in to a GPU (hybrid or fully). A CPU decoder is always available and is never dropped |
+| GPU | the encoder may fit on a GPU: opt-in (`taw_params.gpu` off/auto/on, `taw c -g`), Vulkan loaded at run time with `dlopen` (no link-time dependency; builds without Vulkan get a stub), GLSL compute shaders compiled to SPIR-V at build time and embedded. The CPU keeps feature collection, candidates, quantization and the final scoring. Decoders are CPU by default and may opt in to a GPU (hybrid or fully). A CPU decoder is always available and is never dropped |
 | profile 1 inputs | 12 adaptive integer context models (o0-o4, o6, word, 5 sparse), each giving a direct and an indirect (bit history) estimate, plus a match model: 25 inputs + bias |
 | profile 1 mixer | frozen MLP: one optional hidden layer (clamp ±8), weight sets picked by a selector context (the "table" part), fixed `dot4` summation order |
 | profile 1 output | integer squash, then two adaptive integer APM stages (c0, c1:c0) |
@@ -210,8 +210,9 @@ parallel (`taw d -j N`, `taw_seek_set_threads`): 5 blocks went from
    linearly, β = 0.9/0.999, weight decay 1e-5, lazy updates of only the
    weight sets a batch touches). The first `max(1, epochs/5)` epochs train
    one shared set, which then seeds every set: without this warm-up the
-   result depended on the seed by up to 2%. Fitting is plain scalar C and
-   need not be reproducible.
+   result depended on the seed by up to 2%. Fitting need not be
+   reproducible. On the CPU it is plain scalar C; with `gpu` set, a GPU
+   trains the candidates instead (see "GPU fitting").
 6. Quantize (F16 round to nearest even; Q8 per-row absmax/127 scale),
    load the bytes through the decoder's own loader, and estimate
    `bits/bit × 8n + 8 × model bytes` on the samples with the real
@@ -238,8 +239,87 @@ Level sets the effort only:
 | 9 | 4 Mi | 8 | 12 |
 
 `TAW_FIT_DEBUG=1` in the environment prints every fitted candidate to
-stderr; `TAW_FIT_DEBUG=a` fits all candidates (slow; that is how the
-prior was calibrated).
+stderr, whether the GPU was used (or why not) and the fitting time;
+`TAW_FIT_DEBUG=a` fits all candidates (slow; that is how the prior was
+calibrated).
+
+## GPU fitting
+
+`src/fit_gpu.c` drives two compute shaders through Vulkan 1.1, which it
+opens at run time (`libvulkan.so.1`). Any failure (no loader, no device,
+too little memory, a Vulkan error) makes `TAW_GPU_AUTO` fit on the CPU and
+`TAW_GPU_ON` fail with `TAW_E_GPU`; `TAW_FIT_DEBUG=1` says which happened.
+`TAW_GPU_DEVICE=n` picks Vulkan device n (even a CPU implementation);
+otherwise the first discrete, then integrated GPU that has the limits the
+shaders need (45 KiB shared memory, 512-thread workgroups, subgroup
+shuffles).
+
+- **Same schedule.** The GPU trainer runs the CPU trainer's algorithm:
+  batch 256, the same stride shuffle and start positions, tied warm-up,
+  lazy AdamW on the touched sets, the same learning-rate ramp and
+  initial weights. Only the float summation order differs (and the forward
+  pass reads f16 copies of the weights, see below), so results are close
+  to, not equal to, the CPU's. They are reproducible on the same device:
+  no float atomics anywhere.
+- **What runs where.** The CPU collects the samples (uploaded once,
+  14 words each: 4 Mi samples are 224 MiB), enumerates and initializes the
+  candidates, then quantizes each trained net and scores it with the real
+  decoder inference. The GPU trains every candidate with up to 16 hidden
+  units; the others (none at present) stay on CPU workers, which run
+  meanwhile. Which candidate goes where is a rule of the shapes, so the
+  archive does not depend on the thread count.
+- **Batch preparation.** A batch's samples, and so its weight sets, follow
+  from the schedule alone. `fit_gpu_prep.comp` therefore lays out the next
+  256 steps of every candidate at once, one workgroup per (step,
+  candidate): it sorts the batch by set per layer (bitonic) and lists the
+  runs of equal sets, splitting runs over 48 samples into pieces.
+- **Training.** `fit_gpu.comp` trains one candidate per workgroup, 256
+  steps per dispatch. Two threads per sample do the forward pass in sorted
+  order (neighbouring threads share a weight set), adding their halves with
+  a subgroup shuffle. Then one thread per (run, 4 parameters) sums the
+  gradient over the run and applies AdamW at once; pieces of long runs
+  leave partial sums that are added after a barrier. The weights of all
+  sets a candidate can touch are mirrored in shared memory as f16 when
+  they fit (8 sets of 16 hidden units do), because the GT 1030 does not
+  cache global loads in L1. The whole fit is one command buffer.
+- **Costs on a GT 1030** (3 SMs): one step of one candidate takes 10-30 us
+  depending on the shape (the sets a C0 selector touches each step have to
+  go through DRAM for AdamW); only three training workgroups are resident
+  at a time (one per SM), so eight candidates run in three waves. Opening
+  the device and uploading the samples takes 0.2-0.4 s, so `auto` leaves
+  fits smaller than 4 Mi sample-epochs (levels 1-2) to the CPU.
+- **Hybrid, measured.** Splitting candidates between the GPU and CPU
+  workers does not pay on the bench machine: at level 9 a CPU thread needs
+  about 22 s for one candidate (17 s alone), the GPU 9 s for all eight.
+  Handing the last one, two or three candidates to six CPU workers made
+  the level 9 fit of text1m take 22.4 s instead of 8.9 s. So the GPU takes
+  every candidate it can; the CPU's share is collection, quantization and
+  scoring.
+- **Quality.** The float models match the CPU's (on a 16 MiB input, an
+  H=8 C0/bit-position net scored 0.416 bits/bit at F16 against the CPU's
+  0.418). The 4-bit formats (Q4, NVFP4, IQ4) are sensitive to small
+  differences in training either way (Q4: CPU 0.586, GPU 0.476; NVFP4:
+  CPU 0.436, GPU 0.459), so per-candidate results there can move by
+  several percent; the chosen model's size stays within 0.5%.
+
+Measured on the bench corpus (five 1 MiB files, sums; i5-9400, GT 1030;
+`fit` is the fitting stage alone, per file):
+
+| level | fitter | archive bytes | encode | fit per file |
+|-------|--------|---------------|--------|--------------|
+| 1 | CPU, 1 thread | 888 591 | 10.5 s | 0.20 s |
+| 1 | GPU | 888 641 | 12.3 s | 0.47 s |
+| 5 | CPU, 1 thread | 862 716 | 33.3 s | 4.7 s |
+| 5 | CPU, 6 threads | 862 716 | 19.2 s | 1.9 s |
+| 5 | GPU | 862 459 | 14.2 s | 0.9 s |
+| 9 | CPU, 6 threads | 853 036 | 228.6 s | 44 s |
+| 9 | GPU | 854 052 | 56.3 s | 9.3 s |
+
+On a 16 MiB concatenation at level 9 (`-j 6`): `.aw` 1 013 299 bytes in
+62.4 s on the CPU (fit 35.0 s), 1 017 315 bytes in 45.7 s with the GPU
+(fit 18.4 s: bigger inputs choose 256-set selectors, whose AdamW traffic
+goes to DRAM); `.awseek` 2 826 060 bytes in 39.7 s against 2 822 114 bytes
+in 26.5 s.
 
 ## Weight formats
 
@@ -328,7 +408,10 @@ the partial ones at the edges through a per-thread buffer. The source's
 | `src/p1_simd_out.h` | mixer pieces shared by the AVX2 and AVX-512 files |
 | `src/half.h` | binary16 conversions |
 | `src/quant.c` | weight row formats: sizes, validated decoding, the encoder's quantizer |
-| `src/fit.c` | encoder: feature pass, candidates, AdamW, quantization, choice |
+| `src/fit.c` | encoder: feature pass, candidates, AdamW, quantization, choice, CPU/GPU split |
+| `src/fit_internal.h` | samples, the trainable net and the training schedule, shared by the two trainers |
+| `src/fit_gpu.c` | GPU trainer: Vulkan via `dlopen`, buffers, the command buffer (a stub without `TADAMW_GPU`) |
+| `src/fit_gpu_prep.comp`, `src/fit_gpu.comp` | its compute shaders: batch preparation, training |
 | `src/header.c` | header (de)serialization and validation |
 | `src/aw.c` | `.aw` stream encode/decode |
 | `src/awseek.c` | `.awseek` encode/decode/random access |
@@ -346,10 +429,21 @@ the partial ones at the edges through a per-thread buffer. The source's
   chain. Evaluating several outcomes of the next bit was tried and is
   slower.
 - Encoder speed: about 2.8 s/MB at level 1, 7.5 s/MB at level 5, and
-  around 2 minutes/MB at level 9. That is two context passes
-  (features, then coding) plus fitting. Fitting could run on a GPU
-  (hybrid, see the decisions table); its results don't need to be
-  reproducible.
+  around 2 minutes/MB at level 9 on one thread. That is two context
+  passes (features, then coding) plus fitting. GPU fitting (`-g on`)
+  cuts level 9 by about 4x against six CPU threads (see "GPU fitting");
+  the context passes are then most of what is left.
+- GPU fitting on small GPUs: the trainer's 512-thread workgroups need
+  45 KiB of shared memory and many registers, so a GT 1030 holds one per SM
+  (256 threads per workgroup fit two, which helped four to six candidates
+  but not eight). A leaner layout would let all eight level 9 candidates
+  run in one wave. Sets touched by many-set selectors (C0, C1, C0C1HI)
+  are not cached in shared memory, and their AdamW state goes through DRAM
+  every step. Candidates with more than 16 hidden units would need the
+  shaders extended; the encoder never proposes them yet.
+- Low-bit weight formats and GPU fitting: see "GPU fitting", quality.
+  Quantization-aware training (on either trainer) would help those formats
+  more than the trainer choice does.
 - Small awseek blocks are expensive under profile 1: every block resets
   about 5 MB of tables (the APM alone is 4.3 MB). The encoder could size
   tables down for small blocks, but the APM is fixed by the spec.

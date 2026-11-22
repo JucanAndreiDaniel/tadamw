@@ -50,6 +50,7 @@ typedef enum {
 	TAW_E_CHECKSUM,    /* CRC mismatch */
 	TAW_E_RANGE,       /* requested range outside the archive's data */
 	TAW_E_IO,          /* read/write callback failed */
+	TAW_E_GPU,         /* TAW_GPU_ON, but no usable GPU */
 } taw_status;
 
 /* Library version string, e.g. "0.1.0". */
@@ -64,6 +65,16 @@ TAW_API const char *taw_strerror(taw_status s);
 #define TAW_LEVEL_MAX 9
 #define TAW_LEVEL_DEFAULT 5
 #define TAW_BLOCK_DEFAULT (UINT32_C(1) << 20)
+
+/* Model fitting on a GPU (Vulkan, loaded at run time; TAW_HAVE_GPU says
+ * whether this build has it). OFF fits on the CPU. AUTO uses a GPU when one
+ * works and the CPU otherwise. ON fails with TAW_E_GPU without one. A GPU
+ * fit may give a different (equally valid) archive than a CPU fit. */
+typedef enum {
+	TAW_GPU_OFF = 0,
+	TAW_GPU_AUTO,
+	TAW_GPU_ON,
+} taw_gpu_mode;
 
 /* Predictor choice. AUTO fits the mixer and keeps it only if the archive
  * comes out smaller than with the order-0 placeholder. */
@@ -98,6 +109,7 @@ typedef struct {
 	taw_weights weights;
 	unsigned threads;    /* worker threads for .awseek (fitting and blocks);
 	                        0 = 1. The archive does not depend on it. */
+	taw_gpu_mode gpu;    /* fit on a GPU; default TAW_GPU_OFF */
 } taw_params;
 
 /* ---- shared types --------------------------------------------------------- */

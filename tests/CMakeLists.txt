@@ -15,6 +15,8 @@ taw_test(aw)
 taw_test(awseek)
 taw_test(p1)
 taw_test(quant)
+taw_test(gpu)
+set_tests_properties(gpu PROPERTIES SKIP_RETURN_CODE 77)
 
 add_test(NAME cli_version COMMAND taw_cli --version)
 set_tests_properties(cli_version PROPERTIES PASS_REGULAR_EXPRESSION "^taw [0-9]+\\.[0-9]+\\.[0-9]+")

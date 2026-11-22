@@ -22,6 +22,17 @@ option(TADAMW_INSTALL "Generate install rules (library, headers, CMake package, 
 option(BUILD_SHARED_LIBS "Build libtadamw as a shared library" OFF)
 option(TADAMW_WERROR "Treat warnings as errors" OFF)
 option(TADAMW_SANITIZE "Build with ASan+UBSan" OFF)
+# GPU fitting needs the Vulkan headers and glslangValidator at build time
+# only: the loader is opened at run time (dlopen), if it is there at all.
+find_path(TADAMW_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
+find_program(TADAMW_GLSLANG glslangValidator)
+if(TADAMW_VULKAN_INCLUDE_DIR AND TADAMW_GLSLANG)
+  set(tadamw_gpu_default ON)
+else()
+  set(tadamw_gpu_default OFF)
+endif()
+option(TADAMW_GPU "Encoder: fit models on a GPU (Vulkan, loaded at run time)"
+       ${tadamw_gpu_default})
 if(NOT TADAMW_ENCODER AND NOT TADAMW_DECODER)
   message(FATAL_ERROR "TADAMW_ENCODER and TADAMW_DECODER are both OFF: nothing to build")
 endif()

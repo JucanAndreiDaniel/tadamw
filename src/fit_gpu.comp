@@ -1,0 +1,348 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// AdamW training of profile 1 mixers on a GPU (fit_gpu.c drives it).
+//
+// One workgroup trains one candidate; a dispatch runs `nbatch` steps of
+// every candidate. A step is the CPU trainer's step (fit.c, tnet_train):
+// 256 samples, forward and backward, then lazy AdamW on the weight sets the
+// batch touched. fit_gpu_prep.comp has already sorted each batch by weight
+// set, so the samples of every touched set lie side by side ("rank" below
+// is the position in that order; each layer has its own).
+//
+// The forward pass takes PARTS threads per sample (adjacent lanes, which
+// add their partial outputs with subgroup shuffles). Each gradient is then
+// summed over its set's samples by one thread, four parameters at a time,
+// and updated right there; long runs come in pieces whose partial sums are
+// added afterwards (see fit_gpu_prep.comp). No float atomics: the result is
+// reproducible on the same device.
+//
+// Parameters are vec4s; rows are padded with zeros to whole vec4s (layer 1:
+// 7 per hidden unit, output layer: Q2 per set). Per candidate: w[np4],
+// m[np4], v[np4], (b1^t, b2^t, 0, 0), then 16 slots of partial sums per
+// layer (16 * (Q1 + Q2) vec4s). Samples are 14 words (st[0..24] as int16
+// pairs, the bias as 256 in the top half of word 12, then c0 | c1 << 8 |
+// msel << 16 | bit << 24); meta = squash table (4096), candidate descriptors
+// (8 words each), start positions.
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef PARTS
+#define PARTS 2u
+#endif
+layout(local_size_x = 256 * PARTS) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Samples { uint smp[]; };
+layout(std430, set = 0, binding = 1) coherent buffer Params { vec4 prv[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Meta { uint meta[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Blocks { uint blk[]; };
+
+layout(push_constant) uniform Push {
+	uint mode;        // 0 = train, 1 = untie (copy set 0 to every set)
+	uint nbatch;      // steps in this dispatch
+	uint last_nb;     // samples in the last of them
+	uint step0;       // steps done before this dispatch
+	uint steps_total;
+	uint ns, stride, step_nb, tied, pos_off, ncand; // (fit_gpu_prep.comp)
+} pc;
+
+const uint NB = 256u;  // batch
+const uint NT = NB * PARTS;
+const uint HM = 16u;   // max hidden units on the GPU
+const uint SW = 14u;   // words per sample
+const uint DESC = 4096u;
+const uint BLK = 1088u;
+const uint NSEG = NB + 8u;
+
+// by primary rank (layer 1's; layer 2's when H = 0)
+shared uint xs[NB * 13u];   // inputs as int16 pairs, each half + 0x8000
+shared uint ga[NB * 8u];    // layer-1 output gradients, f16 pairs
+shared uint info[NB];       // layer-2 rank | bit << 16
+// by layer-2 rank
+shared uint hs[NB * 8u];    // hidden activations, f16 pairs
+shared float gz[NB];        // output gradients
+// from the batch block
+shared uint sk[NB];         // set at layer-1 rank | at layer-2 rank << 16
+shared uint seg[2u * NSEG]; // [layer] segments
+shared uint spl[16];        // [layer] split runs
+shared uint nseg[2], nspl[2];
+// Weights of the sets a dispatch can touch, as f16 for the forward pass,
+// when they fit (the master copies stay in prv): layer 1 at 0, the output
+// layer after it. Global loads are not cached in L1 on every GPU.
+const uint WC = 2560u;
+shared uint wc[WC];
+
+// Two inputs (stretch units, not yet / 256) from a biased int16 pair:
+// 2^23 + u is exact in binary32, so no int-to-float conversion is needed.
+vec2 cv(uint w)
+{
+	return vec2(uintBitsToFloat(0x4B000000u | (w & 0xFFFFu)),
+	    uintBitsToFloat(0x4B000000u | (w >> 16))) - 8421376.0;
+}
+
+vec4 xq(uint r, uint q)
+{
+	const uint o = r * 13u + 2u * q;
+	return vec4(cv(xs[o]), q < 6u ? cv(xs[o + 1u]) : vec2(0.0));
+}
+
+// AdamW on the vec4 at o, whose w, m, v the caller loaded early
+vec4 adam(uint o, uint np4, vec4 w0, vec4 m0, vec4 v0, vec4 g, float lr,
+    float c1, float c2)
+{
+	const vec4 m = 0.9 * m0 + (1.0 - 0.9) * g;
+	const vec4 v = 0.999 * v0 + (1.0 - 0.999) * g * g;
+	const vec4 w = w0 - lr * ((m * c1) / (sqrt(v * c2) + 1e-6) + 1e-5 * w0);
+	prv[o + np4] = m;
+	prv[o + 2u * np4] = v;
+	prv[o] = w;
+	return w;
+}
+
+vec4 wcget(uint i)
+{
+	return vec4(unpackHalf2x16(wc[2u * i]), unpackHalf2x16(wc[2u * i + 1u]));
+}
+
+void wcput(uint i, vec4 w)
+{
+	wc[2u * i] = packHalf2x16(w.xy);
+	wc[2u * i + 1u] = packHalf2x16(w.zw);
+}
+
+// Gradient sums for vec4 qi of a set's row in layer L over ranks [r0, re).
+vec4 qsum(uint L, uint H, uint qi, uint r0, uint re)
+{
+	vec4 g = vec4(0.0);
+	if (L == 0u) {
+		const uint j = qi / 7u, q = qi - j * 7u;
+		vec4 g1 = vec4(0.0);
+		uint r = r0;
+		for (; r + 1u < re; r += 2u) {
+			const vec2 a = unpackHalf2x16(ga[r * 8u + (j >> 1)]);
+			const vec2 b = unpackHalf2x16(ga[(r + 1u) * 8u + (j >> 1)]);
+			g += ((j & 1u) != 0u ? a.y : a.x) * xq(r, q);
+			g1 += ((j & 1u) != 0u ? b.y : b.x) * xq(r + 1u, q);
+		}
+		if (r < re) {
+			const vec2 a = unpackHalf2x16(ga[r * 8u + (j >> 1)]);
+			g += ((j & 1u) != 0u ? a.y : a.x) * xq(r, q);
+		}
+		return (g + g1) * (1.0 / 256.0);
+	}
+	if (H == 0u) {
+		for (uint r = r0; r < re; r++)
+			g += gz[r] * xq(r, qi);
+		return g * (1.0 / 256.0);
+	}
+	// h[4 qi .. 4 qi + 3], and the bias input (1) at H
+	const uint p0 = 4u * qi;
+	float sb = 0.0;
+	if (p0 < H) {
+		for (uint r = r0; r < re; r++) {
+			const uint o = r * 8u + 2u * qi;
+			g += gz[r] * vec4(unpackHalf2x16(hs[o]), unpackHalf2x16(hs[o + 1u]));
+		}
+	}
+	if (p0 + 4u > H)
+		for (uint r = r0; r < re; r++)
+			sb += gz[r];
+	const uvec4 p = uvec4(p0) + uvec4(0u, 1u, 2u, 3u);
+	g = mix(vec4(0.0), g, lessThan(p, uvec4(H)));
+	return mix(g, vec4(sb), equal(p, uvec4(H)));
+}
+
+void main()
+{
+	const uint c = gl_WorkGroupID.x, T = gl_LocalInvocationID.x;
+	const uint r = T / PARTS, part = T % PARTS; // rank, part of it
+	const uint d = DESC + c * 8u;
+	const uint H = meta[d];
+	const uint base = meta[d + 3u], np4 = meta[d + 4u], n14 = meta[d + 5u];
+	const uint s1n = meta[d + 6u], s2n = meta[d + 7u];
+	const uint Q1 = H * 7u, Q2 = H > 0u ? (H + 4u) / 4u : 7u;
+	const uint scr = base + 3u * np4 + 1u;
+
+	if (pc.mode == 1u) {
+		for (uint a = 0u; a < 3u; a++) {
+			const uint A = base + a * np4;
+			for (uint i = Q1 + T; i < n14; i += NT)
+				prv[A + i] = prv[A + i % Q1];
+			for (uint i = Q2 + T; i < s2n * Q2; i += NT)
+				prv[A + n14 + i] = prv[A + n14 + i % Q2];
+		}
+		return;
+	}
+
+	// the weight cache: the sets this dispatch can touch, if they fit
+	const bool tied = pc.tied != 0u;
+	const uint n1c = H > 0u ? (tied ? 1u : s1n) * Q1 : 0u;
+	const uint n2c = (tied ? 1u : s2n) * Q2;
+	const bool c1on = 2u * n1c <= WC;
+	const uint c2at = c1on ? n1c : 0u; // in vec4s
+	const bool c2on = 2u * (c2at + n2c) <= WC;
+	for (uint i = T; c1on && i < n1c; i += NT)
+		wcput(i, prv[base + i]);
+	for (uint i = T; c2on && i < n2c; i += NT)
+		wcput(c2at + i, prv[base + n14 + i]);
+	// (the first step's barriers order these before any use)
+
+	vec4 bt = prv[base + 3u * np4]; // b1^t, b2^t
+	// the first sample at rank r (part 0 holds a sample a step ahead)
+	uint sw[14];
+	if (part == 0u) {
+		const uint p = blk[c * pc.nbatch * BLK + r] & 0xFFFFFFu;
+		for (uint q = 0u; q < SW; q++)
+			sw[q] = smp[p * SW + q];
+	}
+
+	for (uint b = 0u; b < pc.nbatch; b++) {
+		const uint nb = b + 1u == pc.nbatch ? pc.last_nb : NB;
+		const bool act = r < nb;
+		const uint step = pc.step0 + b + 1u;
+		const float lr = 0.02 + (0.001 - 0.02) * (float(step) / float(pc.steps_total));
+		bt.xy *= vec2(0.9, 0.999);
+		const float c1 = 1.0 / (1.0 - bt.x), c2 = 1.0 / (1.0 - bt.y);
+		const uint o = (c * pc.nbatch + b) * BLK;
+
+		// ---- the batch block into shared memory, the sample to its rank
+		for (uint i = T; i < 1060u - NB; i += NT) {
+			const uint v = blk[o + NB + i];
+			if (i < NB)
+				sk[i] = v;
+			else if (i < NB + 2u)
+				nseg[i - NB] = v;
+			else if (i < NB + 4u)
+				nspl[i - NB - 2u] = v;
+			else if (i < NB + 4u + 2u * NSEG)
+				seg[i - NB - 4u] = v;
+			else
+				spl[i - NB - 4u - 2u * NSEG] = v;
+		}
+		if (part == 0u && act) {
+			[[unroll]] for (uint q = 0u; q < 13u; q++)
+				xs[r * 13u + q] = sw[q] ^ 0x80008000u;
+			info[r] = blk[o + r] >> 24 | (sw[13] >> 24) << 16;
+		}
+		if (part == 0u && b + 1u < pc.nbatch) { // prefetch
+			const uint p = blk[o + BLK + r] & 0xFFFFFFu;
+			for (uint q = 0u; q < SW; q++)
+				sw[q] = smp[p * SW + q];
+		}
+		barrier();
+
+		// ---- forward: part p takes hidden pairs p, p + PARTS, ... (input
+		// vec4s p, p + PARTS, ... when H = 0)
+		float zp = 0.0, g = 0.0;
+		uint r2 = 0u;
+		if (act) {
+			const uint inf = info[r];
+			r2 = inf & 0xFFFFu;
+			const uint k1 = sk[r] & 0xFFFFu, k2 = sk[r2] >> 16;
+			const uint w2 = base + n14 + k2 * Q2, w2c = c2at + k2 * Q2;
+			vec4 x[7];
+			[[unroll]] for (uint q = 0u; q < 7u; q++)
+				x[q] = xq(r, q);
+			if (H > 0u) {
+				const uint w1 = base + k1 * Q1, w1c = k1 * Q1;
+				for (uint pr = part; 2u * pr < H; pr += PARTS) {
+					const uint j = 2u * pr;
+					float a0 = 0.0, a1 = 0.0;
+					if (c1on) {
+						[[unroll]] for (uint q = 0u; q < 7u; q++) {
+							a0 += dot(wcget(w1c + j * 7u + q), x[q]);
+							if (j + 1u < H)
+								a1 += dot(wcget(w1c + (j + 1u) * 7u + q), x[q]);
+						}
+					} else {
+						[[unroll]] for (uint q = 0u; q < 7u; q++) {
+							a0 += dot(prv[w1 + j * 7u + q], x[q]);
+							if (j + 1u < H)
+								a1 += dot(prv[w1 + (j + 1u) * 7u + q], x[q]);
+						}
+					}
+					a0 = clamp(a0 * (1.0 / 256.0), -8.0, 8.0);
+					a1 = clamp(a1 * (1.0 / 256.0), -8.0, 8.0);
+					hs[r2 * 8u + pr] = packHalf2x16(vec2(a0, a1));
+					const vec4 v4 = c2on ? wcget(w2c + (j >> 2)) : prv[w2 + (j >> 2)];
+					const vec2 v = (j & 2u) != 0u ? v4.zw : v4.xy;
+					zp += v.x * a0 + v.y * a1;
+					// masked output weights, times the output gradient below
+					ga[r * 8u + pr] = packHalf2x16(vec2(abs(a0) < 8.0 ? v.x : 0.0,
+					    j + 1u < H && abs(a1) < 8.0 ? v.y : 0.0));
+				}
+				if (part == 0u) // the output bias
+					zp += dot(c2on ? wcget(w2c + (H >> 2)) : prv[w2 + (H >> 2)],
+					    vec4(equal(uvec4(0u, 1u, 2u, 3u), uvec4(H & 3u))));
+			} else {
+				float s = 0.0;
+				[[unroll]] for (uint q = 0u; q < 7u; q++)
+					if (q % PARTS == part)
+						s += dot(c2on ? wcget(w2c + q) : prv[w2 + q], x[q]);
+				zp = s * (1.0 / 256.0);
+			}
+		}
+		float z = zp;
+		for (uint m = 1u; m < PARTS; m <<= 1)
+			z += subgroupShuffleXor(z, m);
+		if (act) {
+			const float lim = 2047.0 / 256.0;
+			const float zc = clamp(z, -lim, lim);
+			const float p = float(meta[uint(int(zc * 256.0) + 2047)]) * (1.0 / 65536.0);
+			g = p - float(info[r] >> 16);
+			if (part == 0u)
+				gz[r2] = g;
+			for (uint pr = part; 2u * pr < H; pr += PARTS)
+				ga[r * 8u + pr] = packHalf2x16(unpackHalf2x16(ga[r * 8u + pr]) * g);
+		}
+		barrier();
+
+		// ---- gradients per (segment, vec4): whole runs are updated at
+		// once, pieces of long runs leave partial sums in scratch
+		const uint I1 = nseg[0] * Q1, I = I1 + nseg[1] * Q2;
+		const float scale = 1.0 / float(nb);
+		for (uint it = T; it < I; it += NT) {
+			const uint L = it < I1 ? 0u : 1u, Q = L == 0u ? Q1 : Q2;
+			const uint ii = it - L * I1, sg = ii / Q, qi = ii - sg * Q;
+			const uint e = seg[L * NSEG + sg];
+			const uint r0 = e & 511u, re = (e >> 9) & 511u, slot = e >> 18;
+			if (slot != 31u) {
+				prv[scr + (L == 0u ? 0u : 16u * Q1) + slot * Q + qi] =
+				    qsum(L, H, qi, r0, re);
+				continue;
+			}
+			const uint set = L == 0u ? sk[r0] & 0xFFFFu : sk[r0] >> 16;
+			const uint po = base + (L == 0u ? set * Q1 : n14 + set * Q2) + qi;
+			const vec4 w0 = prv[po], m0 = prv[po + np4], v0 = prv[po + 2u * np4];
+			const vec4 w = adam(po, np4, w0, m0, v0,
+			    qsum(L, H, qi, r0, re) * scale, lr, c1, c2);
+			if (L == 0u ? c1on : c2on)
+				wcput((L == 0u ? 0u : c2at) + set * Q + qi, w);
+		}
+		// split runs add up their pieces
+		if (nspl[0] + nspl[1] > 0u) {
+			memoryBarrierBuffer();
+			barrier();
+			const uint J1 = nspl[0] * Q1, J = J1 + nspl[1] * Q2;
+			for (uint it = T; it < J; it += NT) {
+				const uint L = it < J1 ? 0u : 1u, Q = L == 0u ? Q1 : Q2;
+				const uint ii = it - L * J1, sp = ii / Q, qi = ii - sp * Q;
+				const uint e = spl[L * 8u + sp];
+				const uint rs = e & 511u, pieces = (e >> 9) & 31u, slot0 = e >> 14;
+				const uint set = L == 0u ? sk[rs] & 0xFFFFu : sk[rs] >> 16;
+				const uint po = base + (L == 0u ? set * Q1 : n14 + set * Q2) + qi;
+				const vec4 w0 = prv[po], m0 = prv[po + np4], v0 = prv[po + 2u * np4];
+				const uint sb = scr + (L == 0u ? 0u : 16u * Q1) + slot0 * Q + qi;
+				vec4 gs = prv[sb];
+				for (uint p = 1u; p < pieces; p++)
+					gs += prv[sb + p * Q];
+				const vec4 w = adam(po, np4, w0, m0, v0, gs * scale, lr, c1, c2);
+				if (L == 0u ? c1on : c2on)
+					wcput((L == 0u ? 0u : c2at) + set * Q + qi, w);
+			}
+		}
+		memoryBarrierBuffer();
+		barrier();
+	}
+	if (T == 0u)
+		prv[base + 3u * np4] = bt;
+}

@@ -20,7 +20,7 @@ static void usage(FILE *f)
 	fprintf(f,
 #if TAW_HAVE_ENCODER
 	    "usage: taw c [-l level] [-s] [-B block_size] [-p predictor] [-w weights]\n"
-	    "             [-j threads] <in> <out>\n"
+	    "             [-j threads] [-g gpu] <in> <out>\n"
 #endif
 #if TAW_HAVE_DECODER
 	    "       taw d [-j threads] <in> <out>\n"
@@ -36,7 +36,9 @@ static void usage(FILE *f)
 	    "                       if it beats order0)\n"
 	    "      -w auto|f16|q8|q4|q2|fp8|nvfp4|iq8|iq4|iq2\n"
 	    "                       mixer weight format (default auto)\n"
-	    "      -j N             worker threads for .awseek (default 1)\n"
+	    "      -j N             worker threads (default 1)\n"
+	    "      -g off|auto|on   fit on a GPU (default off; auto falls back to\n"
+	    "                       the CPU, on fails without a usable GPU)\n"
 	    "  d   decompress a .aw or .awseek archive\n"
 	    "      -j N             decode .awseek blocks on N threads (default 1;\n"
 	    "                       each holds its own decoder tables)\n"
@@ -122,6 +124,7 @@ static bool parse_u64(const char *s, uint64_t *v)
 static const char *const predictors[] = {"auto", "order0", "mix", nullptr};
 static const char *const weights[] = {"auto", "f16", "q8", "q4", "q2", "fp8",
 	"nvfp4", "iq8", "iq4", "iq2", nullptr};
+static const char *const gpus[] = {"off", "auto", "on", nullptr};
 
 static bool parse_choice(const char *s, const char *const *names,
     uint64_t *v)
@@ -172,6 +175,10 @@ static int cmd_compress(int argc, char **argv)
 		} else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc &&
 		    parse_choice(argv[i + 1], weights, &v)) {
 			p.weights = (taw_weights)v;
+			i++;
+		} else if (strcmp(argv[i], "-g") == 0 && i + 1 < argc &&
+		    parse_choice(argv[i + 1], gpus, &v)) {
+			p.gpu = (taw_gpu_mode)v;
 			i++;
 		} else if (strcmp(argv[i], "-j") == 0 && i + 1 < argc &&
 		    parse_u64(argv[i + 1], &v) && v >= 1 && v <= 256) {

@@ -76,6 +76,8 @@ taw_status taw_params_resolve(const taw_params *in, taw_params *out)
 	if ((unsigned)out->predictor > TAW_PREDICTOR_MIX ||
 	    (unsigned)out->weights > TAW_WEIGHTS_IQ2)
 		return TAW_E_ARG;
+	if ((unsigned)out->gpu > TAW_GPU_ON)
+		return TAW_E_ARG;
 	if (out->block_size == 0)
 		out->block_size = TAW_BLOCK_DEFAULT;
 	if (out->seekable &&
