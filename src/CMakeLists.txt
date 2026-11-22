@@ -1,6 +1,9 @@
 add_library(taw STATIC
+  api.c
+  aw.c
   buf.c
   crc32c.c
+  header.c
   predictor.c
   rc.c
   version.c

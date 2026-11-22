@@ -17,6 +17,8 @@ typedef struct {
 
 void taw_buf_put(taw_buf *b, const void *src, size_t n);
 void taw_buf_put_u8(taw_buf *b, uint8_t v);
+/* Append n uninitialized bytes; returns them, or nullptr on OOM. */
+uint8_t *taw_buf_extend(taw_buf *b, size_t n);
 void taw_buf_put_u32(taw_buf *b, uint32_t v);
 void taw_buf_put_u64(taw_buf *b, uint64_t v);
 void taw_buf_free(taw_buf *b);

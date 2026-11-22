@@ -35,6 +35,15 @@ void taw_buf_put(taw_buf *b, const void *src, size_t n)
 	}
 }
 
+uint8_t *taw_buf_extend(taw_buf *b, size_t n)
+{
+	if (!buf_reserve(b, n))
+		return nullptr;
+	uint8_t *p = b->p + b->n;
+	b->n += n;
+	return p;
+}
+
 void taw_buf_put_u8(taw_buf *b, uint8_t v)
 {
 	if (b->n < b->cap) {

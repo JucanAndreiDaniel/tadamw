@@ -10,6 +10,7 @@ endfunction()
 taw_test(version)
 taw_test(crc32c)
 taw_test(rc)
+taw_test(aw)
 
 add_test(NAME cli_version COMMAND taw_cli --version)
 set_tests_properties(cli_version PROPERTIES PASS_REGULAR_EXPRESSION "^taw [0-9]+\\.[0-9]+\\.[0-9]+")
