@@ -29,6 +29,32 @@ enum {
 	P1_MAXVERIFY = 32,
 };
 
+/* Arithmetic profile 6 (CALIBRATED_MIX): the profile-1 mixer followed by a
+ * handful of fitted integer calibration parameters. The 8-byte calibration
+ * extension sits between the profile-1 head and the weight payload.
+ *
+ *   off 8..9:   temp (u16 LE, Q8 multiplier, 64..512)
+ *   off 10..11: bias (i16 LE, stretch units, -1024..1024)
+ *   off 12..14: w0, w1, w2 (u8, 0..15, sum != 0) APM mix weights
+ *   off 15:     reserved, must be 0
+ */
+enum {
+	P6_CAL_EXT = 8,
+	P6_MODEL_HEAD = P1_MODEL_HEAD + P6_CAL_EXT,
+	P6_TEMP_MIN = 64, P6_TEMP_MAX = 512,
+	P6_BIAS_MAX = 1024,
+	P6_W_MAX = 15,
+};
+
+typedef struct {
+	uint16_t temp;  /* Q8 multiplier of the stretch-domain logit */
+	int16_t bias;   /* stretch units added after scaling */
+	uint8_t w0, w1, w2; /* weights of p_mix, APM1, APM2 */
+} p6_cal;
+
+/* The identity calibration: profile 1's arithmetic exactly. */
+#define P6_CAL_IDENTITY ((p6_cal){ .temp = 256, .bias = 0, .w0 = 2, .w1 = 1, .w2 = 1 })
+
 /* Context models; model k gives inputs k (direct) and P1_NCM + k (history).
  * The S models are sparse: S23 = bytes 2 and 3 back, and so on. */
 enum {
@@ -173,6 +199,8 @@ struct p1_net {
 	float *w1;     /* [S1][P1_F][hpad], transposed, zero padded */
 	float *w2;     /* [S2][w2s] zero padded; no bias when H > 0 */
 	float *b2;     /* [S2] output bias when H > 0 */
+	/* Calibration (profile 6). Profile 1 nets get the identity values. */
+	p6_cal cal;
 	/* z before the bias: dot4 over the output layer (format.md §2.2.8) */
 	float (*mix)(const p1_net *n, const float *x, const float *w1,
 	    const float *w2);
@@ -189,6 +217,24 @@ void p1_net_free(p1_net *n);
 /* Stretch-domain output, [-2047, 2047]. x has P1_XPAD entries,
  * x[P1_IN_BIAS] = 1 and x[P1_F..] = 0. */
 int32_t p1_net_eval(const p1_net *n, const float *x, const p1_sel_ctx *sc);
+
+/* ---- profile 6: learned probability calibration --------------------------- */
+
+/* Apply the fitted temperature and bias to stretch-domain t (integer only).
+ * The result is clamped to [-2047, 2047] and can be passed to p1_squash. */
+int32_t p6_cal_t(const p6_cal *cal, int32_t t);
+/* Size of a profile 6 model section (head + extension + weights). */
+uint64_t p6_model_size(const p1_shape *s, uint8_t quant);
+/* Write / parse the 16-byte profile 6 head (the first 8 bytes are the
+ * profile 1 head, so p1_head_parse works on them unchanged). */
+void p6_head_write(uint8_t out[P6_MODEL_HEAD], const p1_shape *s,
+    const p6_cal *cal);
+taw_status p6_head_parse(const uint8_t *p, size_t n, p1_shape *s,
+    p6_cal *cal);
+/* Load a profile 6 model section. The weight payload uses the profile 1
+ * encoding; the calibration extension is parsed before the weights. */
+taw_status p6_net_load(p1_net *n, uint8_t quant, const uint8_t *model,
+    size_t size);
 
 /* The mixer kernels; all produce identical bits. */
 float p1_mix_scalar(const p1_net *n, const float *x, const float *w1,
@@ -220,6 +266,7 @@ struct taw_p1 {
 	uint16_t apm1[256 * 33];
 	uint16_t *apm2;    /* [65536 * 33] */
 	uint32_t a1, a2;   /* entries to update after the bit */
+	bool calibrated;  /* profile 6: apply cal and learned APM weights */
 };
 
 /* After the context-model counters of a bit are updated: the match

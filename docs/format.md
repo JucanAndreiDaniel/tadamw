@@ -1,6 +1,6 @@
 # tar_aw container format, version 1
 
-Status: draft. Normative for everything implemented (profiles 0 and 1);
+Status: draft. Normative for everything implemented (profiles 0, 1 and 6);
 reserved values are listed so that decoders can refuse them.
 `tests/test_p1.c` pins profile 1 with golden vectors: a change that breaks
 them changes the format.
@@ -52,7 +52,12 @@ identical probabilities for every bit.
 |----|-----------------|---------------|--------|
 | 0  | `INT_ORDER0`    | empty (`model_size = 0`, `quant = 0`) | implemented, placeholder |
 | 1  | `F32_STRICT_MIX`| mixer shape and weights, §5.1; quant `F16`, `Q8`, `Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4` or `IQ2` | implemented |
-| 2..255 | — | — | reserved, refuse |
+| 6  | `CALIBRATED_MIX`| profile 1 model + 8 calibration bytes, §5.2; same quant formats | implemented |
+| 2..5, 7..255 | — | — | reserved, refuse |
+
+Profile 6 is an **experimental** profile. It is profile 1's arithmetic with
+five fitted scalar parameters; decoders must implement it exactly as written
+below (or refuse it). Profile 1 files are unaffected.
 
 ### 2.1 Profile 0: `INT_ORDER0`
 
@@ -306,6 +311,45 @@ and the same `A2` entry are updated: `e += (65535 - e) >> 6` if `b`, else
    `nib = 1` and select lines with `q = c0`. At `bitpos` 8: byte end
    (§2.2.5).
 
+### 2.3 Profile 6: `CALIBRATED_MIX`
+
+Exactly the profile 1 per-bit sequence (§2.2), with two integer-only changes.
+
+1. **Logit calibration.** Let `t` be profile 1's stretch-domain mixer output
+   (§2.2.8, `[-2047, 2047]`). With the fitted `temp` (Q8 multiplier) and
+   `bias` (stretch units):
+
+   ```
+   q = temp * t                            (signed, |q| < 2^21)
+   s = q >= 0 ? (q + 128) / 256 : (q - 128) / 256   (integer division,
+                                                     truncated toward zero)
+   t' = clamp(s + bias, -2047, 2047)
+   p_mix = squash(t')
+   ```
+
+   The identity calibration is `temp = 256`, `bias = 0`; it reproduces
+   profile 1's `t` exactly. All later uses of `p_mix` (APM bin lookup, APM
+   update) use the calibrated value.
+
+2. **Learned APM mixture.** Let `q1`, `q2` be the two interpolated APM outputs
+   (§2.2.9), and `w0`, `w1`, `w2` the fitted 4-bit weights. Then the coded
+   probability is
+
+   ```
+   p = (w0 * p_mix + w1 * q1 + w2 * q2) / (w0 + w1 + w2)   (integer division)
+   ```
+
+   The sum is always at least 1, and the numerator is below 2^22. The
+   identity weights are `(2, 1, 1)`; they differ from profile 1 only by
+   truncation instead of `(2*p_mix + q1 + q2) >> 2`. An identity-calibration
+   profile 6 file therefore codes with the same bits as profile 1 (the model
+   section is 8 bytes longer).
+
+Everything else — contexts, hashing, MLP, `squash`, APM tables and their
+updates — is byte-for-byte profile 1. A change to those changes both profiles
+and requires new profile ids; the calibration parameters are the only
+profile-6 degrees of freedom.
+
 ## 3. Quantization formats
 
 The format in which model weights are stored. Encoders may pick any format
@@ -442,6 +486,34 @@ code bits. Profile 1 accepts the row formats (`quant` 1 and 4..11);
 A decoder needs about `10 * 2^L * 64 + 2^HB + 4 * 2^MB` bytes of tables
 plus about 4.6 MB fixed (o1 table and APM), and resets them per coding
 unit.
+
+### 5.2 Profile 6 model
+
+Profile 6 shares the profile 1 weight payload and all of its `quant` formats
+(§3), but its head is 16 bytes: the profile 1 head (§5.1) followed by an
+8-byte calibration block.
+
+| off | size | field | valid range |
+|-----|------|-------|-------------|
+| 0   | 8    | profile 1 head | §5.1 (bytes 6 and 7 must still be `0`) |
+| 8   | 2    | `temp` (u16 LE) | `64..512` |
+| 10  | 2    | `bias` (i16 LE) | `-1024..1024` |
+| 12  | 1    | `w0` | `0..15` |
+| 13  | 1    | `w1` | `0..15` |
+| 14  | 1    | `w2` | `0..15`, not all three zero |
+| 15  | 1    | reserved | `0` |
+| 16  | …    | weight payload | §5.1, unchanged |
+
+`model_size` MUST equal `16` plus the profile 1 payload size for the chosen
+shape and `quant`. A decoder MUST refuse any field out of range, a non-zero
+reserved byte, or a size mismatch, using the same checks as §5.1. The row
+encodings and weight validation of §5.1 are unchanged.
+
+Encoder-side fitting (not part of the format): the network is trained on
+7/8 of the sampled bits; `temp`/`bias` are fitted by cross-entropy over the
+held-out 1/8 (a 4096-bin histogram of the mixer's integer `t`), and the APM
+weights are chosen from a small fixed set by coding-cost on a 16 KiB probe
+with the real predictor. The result does not depend on the thread count.
 
 ## 6. aw body (kind 0)
 

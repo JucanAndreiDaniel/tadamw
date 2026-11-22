@@ -144,6 +144,10 @@ void taw_pred_free(taw_pred *pr);
 
 /* Return to the start-of-coding-unit state; the model is kept. */
 void taw_pred_reset(taw_pred *pr);
+/* Encoder fitting helpers for the mixer profiles: P(bit=1)*65536 for the
+ * current state (without changing it), then advance over a known bit. */
+uint32_t taw_pred_prob(taw_pred *pr);
+void taw_pred_advance(taw_pred *pr, int bit);
 
 void taw_pred_encode(taw_pred *pr, taw_rc_enc *e, const uint8_t *src,
     size_t n);

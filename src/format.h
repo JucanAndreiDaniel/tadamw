@@ -11,7 +11,8 @@ constexpr uint8_t TAW_KIND_AW = 0;
 constexpr uint8_t TAW_KIND_AWSEEK = 1;
 
 constexpr uint8_t TAW_PROFILE_INT_ORDER0 = 0;
-constexpr uint8_t TAW_PROFILE_F32_STRICT_MIX = 1; /* reserved */
+constexpr uint8_t TAW_PROFILE_F32_STRICT_MIX = 1;
+constexpr uint8_t TAW_PROFILE_CALIBRATED_MIX = 6; /* experiment: profile 1 + calibration */
 
 constexpr uint8_t TAW_QUANT_NONE = 0;
 constexpr uint8_t TAW_QUANT_F16 = 1;

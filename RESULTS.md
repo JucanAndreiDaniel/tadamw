@@ -172,3 +172,129 @@ the leader's small W2 LR.
   implemented there. Memory overhead is `O(m+n)` extra floats per matrix,
   plus one scalar for MALTER; compute is one NS pass plus row/column sums,
   i.e. essentially Muon's cost.
+
+---
+
+# Experiment: learned probability calibration (arithmetic profile 6)
+
+Branch `exp/calibration`, base `origin/main` `a427e7f`.
+
+## Design
+
+Profile 6 (`CALIBRATED_MIX`) is profile 1 with five fitted integer scalars;
+the context models, hashing, MLP, `squash`, squash/stretch tables, APM tables
+and all state updates are byte-for-byte unchanged. Only two points in the
+per-bit path are touched:
+
+1. **Logit temperature + bias** applied to the mixer's integer stretch output
+   `t ∈ [-2047, 2047]` (after the existing clamp/truncate, before `squash`):
+   `t' = clamp(trunc_Q8(temp·t) + bias, -2047, 2047)`, where
+   `trunc_Q8` rounds `(temp·t)/256` half away from zero using integer
+   division only. No libm, no float arithmetic is added.
+2. **Learned APM mix**, replacing profile 1's `(2·p + q1 + q2) >> 2` with
+   `(w0·p + w1·q1 + w2·q2) / (w0 + w1 + w2)`, `w*` in `0..15`, with integer
+   division. `p` is the calibrated `p_mix`; the APM bin lookup and APM
+   updates still use `p_mix`.
+
+With `temp = 256`, `bias = 0`, `(w0,w1,w2) = (2,1,1)`, profile 6 produces
+exactly the same coded bytes as profile 1. A test asserts this.
+
+### Fitting (`src/fit.c`)
+
+* The network is trained on 7/8 of the sampled bits. Every 8th (position-
+  evenly-spread) sample is held out. Fitting temperature/bias on the training
+  samples was tried first and was badly overconfident: it applied heavy
+  tempering (`temp=112`, `bias=-272`) and made archives ~12 KB **larger**.
+  Holding out samples fixed it (fitted values became mild, e.g.
+  `temp=248, bias=2` on text L1).
+* `temp`/`bias` are found by a two-stage grid search minimising cross-entropy
+  on a 4096-bin histogram of the held-out samples' integer `t`. Cost per
+  grid point is one pass over the bins; no libm is used.
+* The APM weights are chosen from a fixed 14-triple set by measuring actual
+  coding cost on a 16 KiB probe with the real predictor (`taw_pred_prob` /
+  `taw_pred_advance`, including live APM adaptation) and unit resets.
+* AUTO fitting evaluates profile 1 and profile 6 candidates together and
+  picks the smaller estimated archive; `-p mix` and `-p cal` force one.
+  Fitted archives are deterministic and thread-count independent.
+
+A larger 26-triple APM grid was also tried: it overfit the 16 KiB probe
+(e.g. chose `w=(0,3,1)`) and made three of the four benchmarks worse, so the
+smaller grid was kept.
+
+## Format additions
+
+`docs/format.md` gained profile 6 in the profile table, §2.3 (arithmetic) and
+§5.2 (model layout). The model section is the profile 1 head (8 bytes) plus:
+
+| off | size | field | range |
+|-----|------|-------|-------|
+| 8   | 2 | `temp` u16 LE | 64..512 |
+| 10  | 2 | `bias` i16 LE | -1024..1024 |
+| 12  | 1 | `w0` | 0..15 |
+| 13  | 1 | `w1` | 0..15 |
+| 14  | 1 | `w2` | 0..15, not all zero |
+| 15  | 1 | reserved | 0 |
+
+followed by the unchanged profile 1 weight payload. Overhead versus profile 1
+is **8 bytes**. Loaders validate all ranges and the exact size; profile 1
+loaders reject profile 6 models (and vice versa). Public API:
+`TAW_PREDICTOR_CALIBRATED`, CLI `-p cal`.
+
+## Results
+
+Archives made with `-p mix` (baseline, profile 1) and `-p cal` (profile 6),
+clang Release build, read-only corpora in `/tmp/opencode/tadamw-bench`. Size
+is the whole `.aw` file in bytes. All profile-6 archives decompress back to
+the exact input.
+
+| corpus | level | baseline | profile 6 | delta | model base → cal |
+|--------|-------|----------|-----------|-------|------------------|
+| text1m | 1 | 190610 | 186508 | **-4102** (-2.15%) | 1888 → 1896 |
+| text1m | 5 | 187956 | 186098 | **-1858** (-0.99%) | 2696 → 2704 |
+| libc1m | 1 | 388792 | 384244 | **-4548** (-1.17%) | 1888 → 1896 |
+| libc1m | 5 | 385741 | 382830 | **-2911** (-0.76%) | 2696 → 2704 |
+
+Breakdown at text L1 (archive bytes, same fitted weights; intermediate
+variants were measured during development with temporary encoder-only
+parameter overrides, since removed from the final code):
+
+| variant | size |
+|---------|------|
+| profile 1 baseline | 190610 |
+| profile 6, identity cal, identity APM weights | 190019 |
+| + fitted temp/bias only | 189892 |
+| + fitted APM weights only | 186631 |
+| full profile 6 | 186508 |
+
+The APM mixture is the dominant gain; temperature/bias contributes ~0.1–0.3%.
+Fitted APM weights were `w=(0,1,1)` on all four runs, i.e. the two adaptive
+APM stages alone beat the frozen MLP blend on these corpora.
+
+## Verification
+
+* `ctest --test-dir build --output-on-failure`: **10/10 pass**.
+* Profile 1 golden vectors (`tests/test_p1.c`) are unchanged; new profile 6
+  goldens (F16 `len=43914 crc=0xD593C4D1`, Q8 `len=39189 crc=0xEBF4AF55`)
+  are pinned across every available ISA and decode round-trip.
+* Added validation tests for out-of-range temp/bias/weights and reserved
+  bytes, cross-profile model rejection, and identity-equivalence with
+  profile 1.
+
+## Caveats
+
+* The APM weight probe is a single 16 KiB prefix of the input. A broader grid
+  overfit it; results on data with very different local statistics may vary.
+  A larger or spread-out probe would be more robust but costs fit time.
+* The APM mixture fitting depends on the source bytes through `read_at`;
+  for seekable archives only the first block is probed. It remains
+  deterministic for a given input and independent of `threads`.
+* The chosen `w0 = 0` discards the frozen mixer from the final probability
+  on all tested inputs, so the profile-6 gain is mostly a statement about
+  the APM stages being under-weighted in profile 1, not about calibration
+  alone. On very small inputs, where APM adaptation has no time to converge,
+  a non-zero `w0` may be preferable; the probe chooses per file.
+* Fit time grows by roughly one predictor pass over 16 KiB per APM triple
+  (14 triples) plus a 4096-bin grid search per candidate; measured wall time
+  at L1/L5 was comparable to the baseline within noise on this shared box.
+* The format now reserves profile id 6 for an experimental profile. Shipping
+  it requires agreeing to keep the extension permanently.

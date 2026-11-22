@@ -86,6 +86,12 @@ static float rng_unif(uint64_t *s) /* [-1, 1) */
 	return (float)(int32_t)(uint32_t)(rng_next(s) >> 32) * (1.0f / 2147483648.0f);
 }
 
+/* Every 8th (evenly spread) sample is reserved for fitting profile 6's
+ * calibration; the network is trained on the other 7/8. Profile 1 trains on
+ * all samples and is unchanged. */
+#define CAL_HOLDOUT 8
+#define CAL_HELD(k) ((k) % CAL_HOLDOUT == 0)
+
 /* ---- samples (the type: fit_internal.h) ---------------------------------------- */
 
 static inline p1_sel_ctx sample_sc(const sample *s)
@@ -702,7 +708,7 @@ static const char *fit_env_str(const char *name, const char *def)
  * only those rows are updated ("lazy" optimizer state). With no environment
  * overrides this is the shipped AdamW fitter, bit for bit. */
 static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
-    uint64_t seed)
+    uint64_t seed, bool holdout)
 {
 	enum { BATCH = FIT_BATCH };
 	const char *hs = fit_env_str("TAW_HYBRID", "adam");
@@ -819,10 +825,13 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 			size_t nb = ns - done < BATCH ? ns - done : BATCH;
 			size_t n1 = 0, n2 = 0;
 			for (size_t k = 0; k < nb; k++) {
-				const sample *s = &sm[pos];
+				const size_t here = pos;
+				const sample *s = &sm[here];
 				pos += stride;
 				if (pos >= ns)
 					pos %= ns;
+				if (holdout && CAL_HELD(here))
+					continue;
 				const p1_sel_ctx sc = sample_sc(s);
 				uint32_t a2 = t->tied ? 0 : p1_sel_value(t->s.sel2, &sc);
 				if (!t->touched2[a2]) {
@@ -951,13 +960,15 @@ static taw_status serialize(const tnet *t, uint8_t quant, taw_buf *b)
 
 /* Mean cost in bits per coded bit, with the decoder's exact inference. */
 static taw_status evaluate(const uint8_t *model, size_t size, uint8_t quant,
-    const sample *sm, size_t ns, double *bits)
+    uint8_t profile, const sample *sm, size_t ns, double *bits)
 {
 	const float *ct = cost_tab();
 	if (!ct)
 		return TAW_E_NOMEM;
 	p1_net net;
-	taw_status st = p1_net_load(&net, quant, model, size);
+	taw_status st = profile == TAW_PROFILE_CALIBRATED_MIX
+	    ? p6_net_load(&net, quant, model, size)
+	    : p1_net_load(&net, quant, model, size);
 	if (st != TAW_OK)
 		return st;
 	double sum = 0.0;
@@ -965,7 +976,10 @@ static taw_status evaluate(const uint8_t *model, size_t size, uint8_t quant,
 		alignas(32) float x[P1_XPAD];
 		sample_x(&sm[k], x);
 		const p1_sel_ctx sc = sample_sc(&sm[k]);
-		uint32_t p = p1_squash(p1_net_eval(&net, x, &sc));
+		int32_t t = p1_net_eval(&net, x, &sc);
+		if (profile == TAW_PROFILE_CALIBRATED_MIX)
+			t = p6_cal_t(&net.cal, t);
+		uint32_t p = p1_squash(t);
 		sum += ct[sm[k].bit ? p : 65536 - p];
 	}
 	p1_net_free(&net);
@@ -973,11 +987,87 @@ static taw_status evaluate(const uint8_t *model, size_t size, uint8_t quant,
 	return TAW_OK;
 }
 
+/* ---- profile 6 calibration fitting ---------------------------------------------- */
+
+/* The sampled bits are summarized as a histogram over the mixer's integer
+ * stretch output t. Cross-entropy for a (temp, bias) pair then costs one
+ * pass over 4096 bins, which makes a small grid search cheap. */
+typedef uint32_t cal_hist[4096][2];
+
+/* Histogram over held-out samples only: the calibration must be fitted on
+ * bits the network did not train on. */
+static void cal_histogram(const p1_net *net, const sample *sm, size_t ns,
+    cal_hist h)
+{
+	memset(h, 0, sizeof(cal_hist));
+	for (size_t k = 0; k < ns; k++) {
+		if (!CAL_HELD(k))
+			continue;
+		alignas(32) float x[P1_XPAD];
+		sample_x(&sm[k], x);
+		const p1_sel_ctx sc = sample_sc(&sm[k]);
+		int32_t t = p1_net_eval(net, x, &sc) + 2047;
+		if (t < 0)
+			t = 0;
+		else if (t > 4095)
+			t = 4095;
+		h[t][sm[k].bit]++;
+	}
+}
+
+/* Cross-entropy in bits over the histogram, with the given (temp, bias). */
+static double cal_cost(const cal_hist h, const float *ct, uint16_t temp,
+    int16_t bias)
+{
+	p6_cal c = {.temp = temp, .bias = bias, .w0 = 2, .w1 = 1, .w2 = 1};
+	double sum = 0.0;
+	for (int i = 0; i < 4096; i++) {
+		uint32_t n0 = h[i][0], n1 = h[i][1];
+		if (!(n0 | n1))
+			continue;
+		uint32_t p = p1_squash(p6_cal_t(&c, i - 2047));
+		sum += (double)n0 * ct[65536u - p] + (double)n1 * ct[p];
+	}
+	return sum;
+}
+
+/* Coordinate-free two-stage grid search; no libm, no dependence on threads. */
+static void fit_cal(const cal_hist h, const float *ct, p6_cal *out)
+{
+	uint16_t best_t = 256;
+	int16_t best_b = 0;
+	double best = cal_cost(h, ct, best_t, best_b);
+	for (int stage = 0; stage < 2; stage++) {
+		const int ts = stage ? 2 : 16, bs = stage ? 2 : 16;
+		const int tlo = stage ? (int)best_t - 16 : 128;
+		const int thi = stage ? (int)best_t + 16 : 384;
+		const int blo = stage ? (int)best_b - 16 : -256;
+		const int bhi = stage ? (int)best_b + 16 : 256;
+		for (int t = tlo; t <= thi; t += ts) {
+			if (t < P6_TEMP_MIN || t > P6_TEMP_MAX)
+				continue;
+			for (int b = blo; b <= bhi; b += bs) {
+				if (b < -P6_BIAS_MAX || b > P6_BIAS_MAX)
+					continue;
+				double c = cal_cost(h, ct, (uint16_t)t, (int16_t)b);
+				if (c < best) {
+					best = c;
+					best_t = (uint16_t)t;
+					best_b = (int16_t)b;
+				}
+			}
+		}
+	}
+	out->temp = best_t;
+	out->bias = best_b;
+}
+
 /* ---- candidates and the size heuristic ----------------------------------------- */
 
 typedef struct {
 	p1_shape s;
 	uint8_t quant;
+	uint8_t profile;
 	uint64_t size; /* model section bytes */
 } cand;
 
@@ -1026,31 +1116,41 @@ static int cmp_prior(const void *a, const void *b)
 }
 
 static size_t enumerate(const p1_shape *geo, uint64_t budget, int quant_pref,
-    size_t n, cand *out, size_t cap)
+    size_t n, unsigned profiles, cand *out, size_t cap)
 {
 	size_t k = 0;
 	static const uint8_t quants[] = {TAW_QUANT_F16, TAW_QUANT_Q8,
 		TAW_QUANT_Q4, TAW_QUANT_Q2, TAW_QUANT_FP8, TAW_QUANT_NVFP4,
 		TAW_QUANT_IQ8, TAW_QUANT_IQ4, TAW_QUANT_IQ2};
 	const uint8_t want = taw_quant_from_weights((taw_weights)quant_pref);
-	for (size_t qi = 0; qi < sizeof quants; qi++) {
-		uint8_t q = quants[qi];
-		if (want != TAW_QUANT_NONE && q != want)
+	for (unsigned pr = 0; pr < 2; pr++) {
+		if (!(profiles & (1u << pr)))
 			continue;
-		for (size_t hi = 0; hi < sizeof hidden_opts; hi++) {
-			uint8_t H = hidden_opts[hi];
-			size_t n1 = H ? sizeof sel1_opts : 1;
-			size_t n2 = H ? sizeof sel2_opts_h : sizeof sel2_opts_0;
-			for (size_t a = 0; a < n1; a++)
-				for (size_t b = 0; b < n2; b++) {
-					cand c = {.s = *geo, .quant = q};
-					c.s.hidden = H;
-					c.s.sel1 = H ? sel1_opts[a] : P1_SEL_NONE;
-					c.s.sel2 = H ? sel2_opts_h[b] : sel2_opts_0[b];
-					c.size = P1_MODEL_HEAD + p1_weights_size(&c.s, q);
-					if (c.size <= budget && k < cap)
-						out[k++] = c;
-				}
+		const uint8_t profile = pr ? TAW_PROFILE_CALIBRATED_MIX
+					   : TAW_PROFILE_F32_STRICT_MIX;
+		for (size_t qi = 0; qi < sizeof quants; qi++) {
+			uint8_t q = quants[qi];
+			if (want != TAW_QUANT_NONE && q != want)
+				continue;
+			for (size_t hi = 0; hi < sizeof hidden_opts; hi++) {
+				uint8_t H = hidden_opts[hi];
+				size_t n1 = H ? sizeof sel1_opts : 1;
+				size_t n2 = H ? sizeof sel2_opts_h : sizeof sel2_opts_0;
+				for (size_t a = 0; a < n1; a++)
+					for (size_t b = 0; b < n2; b++) {
+						cand c = {.s = *geo, .quant = q,
+							.profile = profile};
+						c.s.hidden = H;
+						c.s.sel1 = H ? sel1_opts[a] : P1_SEL_NONE;
+						c.s.sel2 = H ? sel2_opts_h[b] : sel2_opts_0[b];
+						c.size = profile == TAW_PROFILE_CALIBRATED_MIX
+						    ? p6_model_size(&c.s, q)
+						    : P1_MODEL_HEAD +
+						      p1_weights_size(&c.s, q);
+						if (c.size <= budget && k < cap)
+							out[k++] = c;
+					}
+			}
 		}
 	}
 	/* Sort by prior, best first. */
@@ -1090,6 +1190,82 @@ static const struct {
 	{1u << 22, 8, 12},
 };
 
+/* Build a profile 6 model from a profile 1 model plus calibration bytes. */
+static taw_status make_cal_model(taw_buf *out, const taw_buf *m1,
+    const p1_shape *s, const p6_cal *cal)
+{
+	taw_buf b = {0};
+	uint8_t head[P6_MODEL_HEAD];
+	p6_head_write(head, s, cal);
+	taw_buf_put(&b, head, sizeof head);
+	taw_buf_put(&b, m1->p + P1_MODEL_HEAD, m1->n - P1_MODEL_HEAD);
+	if (b.oom) {
+		taw_buf_free(&b);
+		return TAW_E_NOMEM;
+	}
+	*out = b;
+	return TAW_OK;
+}
+
+/* Fit the APM mixture weights by minimizing actual coding cost on a fixed
+ * probe of the source, using the real predictor (including APM adaptation).
+ * Only 14 triples and 16 KiB of input are tried, so this stays cheap. */
+static void fit_apm(const taw_source *in, uint64_t unit, uint8_t quant,
+    taw_buf *m6, const float *ct, p6_cal *cal)
+{
+	enum { PROBE = 1u << 14 };
+	const uint64_t take = in->size < PROBE ? in->size : PROBE;
+	if (!take)
+		return;
+	uint8_t *buf = malloc((size_t)take);
+	if (!buf || in->read_at(in->ctx, 0, buf, (size_t)take) != TAW_OK) {
+		free(buf);
+		return;
+	}
+	static const uint8_t triples[][3] = {
+		{2,1,1}, {4,1,1}, {4,1,2}, {4,2,1}, {1,1,1},
+		{2,2,1}, {2,1,2}, {8,1,1}, {1,2,2}, {2,3,3},
+		{1,0,0}, {0,1,1}, {2,1,0}, {2,0,1},
+	};
+	uint8_t bw0 = cal->w0, bw1 = cal->w1, bw2 = cal->w2;
+	double best = 1e300;
+	for (size_t k = 0; k < sizeof triples / sizeof *triples; k++) {
+		const uint8_t *t = triples[k];
+		m6->p[12] = t[0];
+		m6->p[13] = t[1];
+		m6->p[14] = t[2];
+		taw_pred pr;
+		if (taw_pred_init(&pr, TAW_PROFILE_CALIBRATED_MIX, quant,
+		    m6->p, m6->n) != TAW_OK)
+			continue;
+		double sum = 0.0;
+		for (uint64_t i = 0; i < take; i++) {
+			if (unit && i % unit == 0)
+				taw_pred_reset(&pr);
+			for (int b = 7; b >= 0; b--) {
+				const int bit = (buf[i] >> b) & 1;
+				const uint32_t p = taw_pred_prob(&pr);
+				sum += ct[bit ? p : 65536u - p];
+				taw_pred_advance(&pr, bit);
+			}
+		}
+		taw_pred_free(&pr);
+		if (sum < best) {
+			best = sum;
+			bw0 = t[0];
+			bw1 = t[1];
+			bw2 = t[2];
+		}
+	}
+	cal->w0 = bw0;
+	cal->w1 = bw1;
+	cal->w2 = bw2;
+	m6->p[12] = bw0;
+	m6->p[13] = bw1;
+	m6->p[14] = bw2;
+	free(buf);
+}
+
 /* Fitting one candidate: train, quantize, score with the real inference. */
 typedef struct {
 	const cand *cs;
@@ -1097,6 +1273,8 @@ typedef struct {
 	size_t ns;
 	int epochs;
 	uint64_t n;
+	const taw_source *in;
+	uint64_t unit;
 	taw_buf *model; /* [tries] */
 	double *est, *bpb;
 	taw_status *st;
@@ -1107,21 +1285,61 @@ static void fit_one(void *arg, size_t ci, unsigned w)
 {
 	(void)w;
 	fit_job *F = arg;
+	const cand *c = &F->cs[ci];
 	tnet t;
 	taw_status st = TAW_OK;
 	if (F->pre && F->pre[ci].w) {
 		t = F->pre[ci];
 		F->pre[ci] = (tnet){0};
-	} else if ((st = tnet_init(&t, &F->cs[ci].s, 0x7A57A11ull + ci)) == TAW_OK) {
-		tnet_train(&t, F->sm, F->ns, F->epochs, 0xC0FFEEull + ci);
+	} else if ((st = tnet_init(&t, &c->s, 0x7A57A11ull + ci)) == TAW_OK) {
+		tnet_train(&t, F->sm, F->ns, F->epochs, 0xC0FFEEull + ci,
+		    c->profile == TAW_PROFILE_CALIBRATED_MIX);
 	}
 	if (st == TAW_OK) {
-		st = serialize(&t, F->cs[ci].quant, &F->model[ci]);
+		st = serialize(&t, c->quant, &F->model[ci]);
 		tnet_free(&t);
 	}
+	/* Fit the extra profile-6 parameters on the quantized net, then score
+	 * with the decoder's exact arithmetic. */
+	if (st == TAW_OK && c->profile == TAW_PROFILE_CALIBRATED_MIX) {
+		p1_net net;
+		st = p1_net_load(&net, c->quant, F->model[ci].p, F->model[ci].n);
+		if (st == TAW_OK) {
+			cal_hist h;
+			cal_histogram(&net, F->sm, F->ns, h);
+			p1_net_free(&net);
+			const float *ct = cost_tab();
+			if (!ct) {
+				st = TAW_E_NOMEM;
+			} else {
+				p6_cal cal = P6_CAL_IDENTITY;
+				fit_cal(h, ct, &cal);
+				if (getenv("TAW_FIT_DEBUG"))
+					fprintf(stderr, "taw cal: temp=%u bias=%d\n",
+					    cal.temp, cal.bias);
+				taw_buf m6 = {0};
+				st = make_cal_model(&m6, &F->model[ci], &c->s, &cal);
+				if (st == TAW_OK) {
+					fit_apm(F->in, F->unit, c->quant, &m6, ct,
+					    &cal);
+					if (getenv("TAW_FIT_DEBUG"))
+						fprintf(stderr,
+						    "taw cal: w=%u,%u,%u\n",
+						    cal.w0, cal.w1, cal.w2);
+					p6_head_write(m6.p, &c->s, &cal);
+				}
+				if (st == TAW_OK) {
+					taw_buf_free(&F->model[ci]);
+					F->model[ci] = m6;
+				} else {
+					taw_buf_free(&m6);
+				}
+			}
+		}
+	}
 	if (st == TAW_OK)
-		st = evaluate(F->model[ci].p, F->model[ci].n, F->cs[ci].quant,
-		    F->sm, F->ns, &F->bpb[ci]);
+		st = evaluate(F->model[ci].p, F->model[ci].n, c->quant,
+		    c->profile, F->sm, F->ns, &F->bpb[ci]);
 	F->est[ci] = F->bpb[ci] * 8.0 * (double)F->n + 8.0 * (double)F->model[ci].n;
 	F->st[ci] = st;
 }
@@ -1184,7 +1402,10 @@ static taw_status fit_all(fit_job *F, size_t tries, unsigned threads,
 		return TAW_E_NOMEM;
 	size_t *gi = idx, *ci = idx + tries;
 	for (size_t c = 0; c < tries; c++) {
-		if (mode != TAW_GPU_OFF && taw_gpu_fits(&F->cs[c].s))
+		/* Profile 6 needs the CPU hold-out path for its calibration. */
+		if (mode != TAW_GPU_OFF &&
+		    F->cs[c].profile == TAW_PROFILE_F32_STRICT_MIX &&
+		    taw_gpu_fits(&F->cs[c].s))
 			gi[ng++] = c;
 		else
 			ci[nc++] = c;
@@ -1275,15 +1496,19 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 	if (p->predictor == TAW_PREDICTOR_ORDER0)
 		return TAW_OK;
 	const uint64_t n = in->size;
-	const bool forced = p->predictor == TAW_PREDICTOR_MIX;
+	const bool forced = p->predictor != TAW_PREDICTOR_AUTO;
+	const unsigned profiles = p->predictor == TAW_PREDICTOR_MIX ? 1u
+	    : p->predictor == TAW_PREDICTOR_CALIBRATED ? 2u : 3u;
 	const uint64_t budget = n / 32;
 	if (unit == 0 || unit > n)
 		unit = n;
 
 	p1_shape geo = {0};
 	geometry((size_t)unit, &geo);
-	cand cs[1024];
-	size_t ncand = enumerate(&geo, budget, p->weights, (size_t)n, cs, 1024);
+	/* Both arithmetic profiles over all nine quant formats. */
+	cand cs[2048];
+	size_t ncand = enumerate(&geo, budget, p->weights, (size_t)n, profiles,
+	    cs, 2048);
 	if (ncand == 0)
 		return forced ? TAW_E_ARG : TAW_OK;
 
@@ -1304,7 +1529,7 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 		tries = ncand;
 
 	fit_job F = {.cs = cs, .sm = sm, .ns = ns, .epochs = effort[lv].epochs,
-		.n = n};
+		.n = n, .in = in, .unit = unit};
 	F.model = calloc(tries, sizeof *F.model);
 	F.est = calloc(tries, sizeof *F.est);
 	F.bpb = calloc(tries, sizeof *F.bpb);
@@ -1319,16 +1544,16 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 			break;
 		if (dbg)
 			fprintf(stderr,
-			    "taw fit: H=%u sel1=%u sel2=%u q=%u model=%zu "
+			    "taw fit: p=%u H=%u sel1=%u sel2=%u q=%u model=%zu "
 			    "bpc=%.4f est=%.0f B\n",
-			    cs[ci].s.hidden, cs[ci].s.sel1, cs[ci].s.sel2,
-			    cs[ci].quant, F.model[ci].n, F.bpb[ci] * 8.0,
-			    F.est[ci] / 8.0);
+			    cs[ci].profile, cs[ci].s.hidden, cs[ci].s.sel1,
+			    cs[ci].s.sel2, cs[ci].quant, F.model[ci].n,
+			    F.bpb[ci] * 8.0, F.est[ci] / 8.0);
 		if (best == SIZE_MAX || F.est[ci] < F.est[best])
 			best = ci;
 	}
 	if (st == TAW_OK) {
-		out->profile = TAW_PROFILE_F32_STRICT_MIX;
+		out->profile = cs[best].profile;
 		out->quant = cs[best].quant;
 		out->model = F.model[best].p;
 		out->model_size = F.model[best].n;

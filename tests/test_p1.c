@@ -119,6 +119,38 @@ static const p1_shape geo = {
 	.sel1 = P1_SEL_BITPOS, .sel2 = P1_SEL_C0, .hidden = 12,
 };
 
+/* ---- profile 6 hand-built models -------------------------------------------- */
+
+typedef struct {
+	p1_shape s;
+	p6_cal cal;
+	uint8_t quant;
+	uint64_t seed;
+	float scale;
+} model6_spec;
+
+static taw_buf build_model6(const model6_spec *m)
+{
+	taw_buf b = {0};
+	uint8_t head[P6_MODEL_HEAD];
+	p6_head_write(head, &m->s, &m->cal);
+	taw_buf_put(&b, head, sizeof head);
+	uint64_t r = m->seed;
+	const unsigned H = m->s.hidden;
+	for (size_t set = 0; H && set < p1_sel_size[m->s.sel1]; set++)
+		for (unsigned j = 0; j < H; j++)
+			put_row(&b, m->quant, &r, m->scale, P1_F);
+	for (size_t set = 0; set < p1_sel_size[m->s.sel2]; set++)
+		put_row(&b, m->quant, &r, m->scale, H ? H + 1 : P1_F);
+	REQUIRE(!b.oom);
+	REQUIRE(b.n == P6_MODEL_HEAD + p1_weights_size(&m->s, m->quant));
+	return b;
+}
+
+static const p6_cal cal_fixed = {
+	.temp = 247, .bias = 19, .w0 = 1, .w1 = 2, .w2 = 3,
+};
+
 /* ---- squash / stretch ------------------------------------------------------- */
 
 static void tables(void)
@@ -373,6 +405,100 @@ static void validation(void)
 	taw_buf_free(&mb);
 }
 
+/* ---- profile 6 validation --------------------------------------------------- */
+
+static taw_status load6(const taw_buf *mb, uint8_t quant)
+{
+	taw_pred pr;
+	taw_status st = taw_pred_init(&pr, TAW_PROFILE_CALIBRATED_MIX, quant,
+	    mb->p, mb->n);
+	taw_pred_free(&pr);
+	return st;
+}
+
+static taw_status load6_patched(const taw_buf *mb, uint8_t quant, size_t off,
+    uint8_t v)
+{
+	uint8_t saved = mb->p[off];
+	mb->p[off] = v;
+	taw_status st = load6(mb, quant);
+	mb->p[off] = saved;
+	return st;
+}
+
+static void validation6(void)
+{
+	model6_spec m = {.s = geo, .cal = cal_fixed, .quant = TAW_QUANT_F16,
+		.seed = 9, .scale = 1.0f};
+	taw_buf mb = build_model6(&m);
+	CHECK(load6(&mb, TAW_QUANT_F16) == TAW_OK);
+	CHECK(load6(&mb, TAW_QUANT_Q8) == TAW_E_FORMAT);   /* size mismatch */
+	CHECK(load6(&mb, TAW_QUANT_BF16) == TAW_E_UNSUPPORTED);
+	CHECK(load(&mb, TAW_QUANT_F16) == TAW_E_FORMAT);   /* 8 extra bytes */
+	/* temp, bias and APM weights have narrow valid ranges; reserved must be 0. */
+	CHECK(load6_patched(&mb, TAW_QUANT_F16, 8, 0) == TAW_E_FORMAT);
+	CHECK(load6_patched(&mb, TAW_QUANT_F16, 9, 3) == TAW_E_FORMAT);
+	CHECK(load6_patched(&mb, TAW_QUANT_F16, 11, 4) == TAW_E_FORMAT);
+	CHECK(load6_patched(&mb, TAW_QUANT_F16, 12, P6_W_MAX + 1) ==
+	    TAW_E_FORMAT);
+	CHECK(load6_patched(&mb, TAW_QUANT_F16, 14, P6_W_MAX + 1) ==
+	    TAW_E_FORMAT);
+	CHECK(load6_patched(&mb, TAW_QUANT_F16, 15, 1) == TAW_E_FORMAT);
+	uint8_t w[3] = {mb.p[12], mb.p[13], mb.p[14]};
+	mb.p[12] = mb.p[13] = mb.p[14] = 0;
+	CHECK(load6(&mb, TAW_QUANT_F16) == TAW_E_FORMAT);
+	mb.p[12] = w[0];
+	mb.p[13] = w[1];
+	mb.p[14] = w[2];
+	/* The profile 1 head fields are still validated. */
+	CHECK(load6_patched(&mb, TAW_QUANT_F16, 5, P1_HMAX + 1) ==
+	    TAW_E_FORMAT);
+	CHECK(load6_patched(&mb, TAW_QUANT_F16, 6, 1) == TAW_E_FORMAT);
+	taw_buf_free(&mb);
+
+	model_spec m1 = {.s = geo, .quant = TAW_QUANT_F16, .seed = 9,
+		.scale = 1.0f};
+	taw_buf mb1 = build_model(&m1);
+	CHECK(load6(&mb1, TAW_QUANT_F16) == TAW_E_FORMAT);
+	taw_buf_free(&mb1);
+}
+
+/* The identity calibration must reproduce profile 1 bit for bit: only the
+ * model section is 8 bytes longer. */
+static void identity_matches_p1(void)
+{
+	enum { N = 8192 };
+	uint8_t *src = malloc(N);
+	REQUIRE(src);
+	td_fill(src, N, TD_TEXT, 77);
+	model_spec m1 = {.s = geo, .quant = TAW_QUANT_F16, .seed = 5,
+		.scale = 0.4f};
+	model6_spec m6 = {.s = geo, .cal = P6_CAL_IDENTITY,
+		.quant = TAW_QUANT_F16, .seed = 5, .scale = 0.4f};
+	taw_buf b1 = build_model(&m1), b6 = build_model6(&m6);
+	taw_pred p1, p6;
+	REQUIRE(taw_pred_init(&p1, TAW_PROFILE_F32_STRICT_MIX, m1.quant,
+	    b1.p, b1.n) == TAW_OK);
+	REQUIRE(taw_pred_init(&p6, TAW_PROFILE_CALIBRATED_MIX, m6.quant,
+	    b6.p, b6.n) == TAW_OK);
+	taw_buf o1 = {0}, o6 = {0};
+	taw_rc_enc e1, e6;
+	taw_rc_enc_init(&e1, &o1);
+	taw_rc_enc_init(&e6, &o6);
+	taw_pred_encode(&p1, &e1, src, N);
+	taw_pred_encode(&p6, &e6, src, N);
+	taw_rc_enc_flush(&e1);
+	taw_rc_enc_flush(&e6);
+	CHECK(o1.n == o6.n && memcmp(o1.p, o6.p, o1.n) == 0);
+	taw_pred_free(&p1);
+	taw_pred_free(&p6);
+	taw_buf_free(&o1);
+	taw_buf_free(&o6);
+	taw_buf_free(&b1);
+	taw_buf_free(&b6);
+	free(src);
+}
+
 /* Model damage inside an archive: the model CRC catches raw flips; a
  * consistent but invalid model (CRCs fixed) is a format error. */
 static void archive_model_damage(void)
@@ -478,6 +604,71 @@ static void golden(void)
 	p1_isa_force(-1);
 }
 
+/* ---- profile 6 golden vector -------------------------------------------------- */
+
+static uint32_t golden6_crc(uint8_t quant, uint32_t *coded_len)
+{
+	enum { N = 1 << 16 };
+	uint8_t *src = malloc(N), *dst = malloc(N);
+	REQUIRE(src && dst);
+	td_fill(src, N, TD_TEXT, 1234);
+	for (size_t i = 0; i < N; i += 4096) /* some match-model work */
+		memcpy(src + i, src, 64);
+	model6_spec m = {.s = geo, .cal = cal_fixed, .quant = quant,
+		.seed = 42, .scale = 0.4f};
+	taw_buf mb = build_model6(&m);
+	taw_pred pr;
+	REQUIRE(taw_pred_init(&pr, TAW_PROFILE_CALIBRATED_MIX, quant, mb.p,
+	    mb.n) == TAW_OK);
+	taw_buf out = {0};
+	taw_rc_enc e;
+	taw_rc_enc_init(&e, &out);
+	taw_pred_encode(&pr, &e, src, N);
+	taw_rc_enc_flush(&e);
+	REQUIRE(!out.oom);
+
+	taw_pred_reset(&pr);
+	taw_rc_dec d;
+	taw_rc_dec_init(&d, out.p, out.n);
+	taw_pred_decode(&pr, &d, dst, N);
+	CHECK(memcmp(src, dst, N) == 0);
+
+	uint32_t crc = taw_crc32c(0, out.p, out.n);
+	*coded_len = (uint32_t)out.n;
+	taw_pred_free(&pr);
+	taw_buf_free(&out);
+	taw_buf_free(&mb);
+	free(src);
+	free(dst);
+	return crc;
+}
+
+static void golden6(void)
+{
+	static const struct {
+		uint8_t quant;
+		uint32_t len, crc;
+	} want[] = {
+		{TAW_QUANT_F16, 43914, 0xD593C4D1u},
+		{TAW_QUANT_Q8, 39189, 0xEBF4AF55u},
+	};
+	for (size_t i = 0; i < sizeof want / sizeof *want; i++) {
+		for (int isa = 0; isa < P1_ISA_COUNT; isa++) {
+			if (!p1_isa_available((p1_isa)isa))
+				continue;
+			p1_isa_force(isa);
+			uint32_t len, crc = golden6_crc(want[i].quant, &len);
+			if (len != want[i].len || crc != want[i].crc) {
+				fprintf(stderr,
+				    "golden6 quant=%u isa=%d: len %u crc 0x%08X\n",
+				    want[i].quant, isa, len, crc);
+				check_failures++;
+			}
+		}
+	}
+	p1_isa_force(-1);
+}
+
 int main(void)
 {
 	tables();
@@ -485,7 +676,10 @@ int main(void)
 	parity();
 	ctx_parity();
 	validation();
+	validation6();
+	identity_matches_p1();
 	golden();
+	golden6();
 	archive_parity();
 	archive_model_damage();
 	return CHECK_DONE();

@@ -73,6 +73,55 @@ uint64_t p1_weights_size(const p1_shape *s, uint8_t quant)
 	    r2 * taw_quant_row_bytes(quant, l2);
 }
 
+/* ---- profile 6 head and calibration ---------------------------------------- */
+
+uint64_t p6_model_size(const p1_shape *s, uint8_t quant)
+{
+	return P6_MODEL_HEAD + p1_weights_size(s, quant);
+}
+
+void p6_head_write(uint8_t out[P6_MODEL_HEAD], const p1_shape *s,
+    const p6_cal *cal)
+{
+	p1_head_write(out, s);
+	out[8] = (uint8_t)cal->temp;
+	out[9] = (uint8_t)(cal->temp >> 8);
+	out[10] = (uint8_t)cal->bias;
+	out[11] = (uint8_t)((uint16_t)cal->bias >> 8);
+	out[12] = cal->w0;
+	out[13] = cal->w1;
+	out[14] = cal->w2;
+	out[15] = 0;
+}
+
+taw_status p6_head_parse(const uint8_t *p, size_t n, p1_shape *s,
+    p6_cal *cal)
+{
+	if (n < P6_MODEL_HEAD || p1_head_parse(p, n, s) != TAW_OK)
+		return TAW_E_FORMAT;
+	*cal = (p6_cal){
+		.temp = taw_rd16(p + 8),
+		.bias = (int16_t)taw_rd16(p + 10),
+		.w0 = p[12], .w1 = p[13], .w2 = p[14],
+	};
+	if (cal->temp < P6_TEMP_MIN || cal->temp > P6_TEMP_MAX ||
+	    cal->bias < -P6_BIAS_MAX || cal->bias > P6_BIAS_MAX ||
+	    cal->w0 > P6_W_MAX || cal->w1 > P6_W_MAX || cal->w2 > P6_W_MAX ||
+	    (cal->w0 == 0 && cal->w1 == 0 && cal->w2 == 0) || p[15])
+		return TAW_E_FORMAT;
+	return TAW_OK;
+}
+
+int32_t p6_cal_t(const p6_cal *cal, int32_t t)
+{
+	/* Round the Q8 product half away from zero, then add the bias. All
+	 * quantities are integers; |temp * t| < 2^21. */
+	int32_t q = (int32_t)cal->temp * t;
+	int32_t s = q >= 0 ? (q + 128) / 256 : (q - 128) / 256;
+	s += cal->bias;
+	return s < -2047 ? -2047 : s > 2047 ? 2047 : s;
+}
+
 /* ---- ISA selection ----------------------------------------------------------- */
 
 #if TAW_X86_SIMD
@@ -172,17 +221,21 @@ static taw_status read_rows(const uint8_t **pp, uint8_t quant, p1_isa isa,
 	return TAW_OK;
 }
 
-taw_status p1_net_load(p1_net *n, uint8_t quant, const uint8_t *model,
-    size_t size)
+/* net_load is shared by profiles 1 and 6; head_len is 8 or 16. */
+static taw_status net_load(p1_net *n, uint8_t quant, const uint8_t *model,
+    size_t size, size_t head_len)
 {
 	memset(n, 0, sizeof *n);
 	if (!p1_quant_supported(quant))
 		return TAW_E_UNSUPPORTED;
+	if (size < head_len)
+		return TAW_E_FORMAT;
 	taw_status st = p1_head_parse(model, size, &n->s);
 	if (st != TAW_OK)
 		return st;
-	if (size - P1_MODEL_HEAD != p1_weights_size(&n->s, quant))
+	if (size - head_len != p1_weights_size(&n->s, quant))
 		return TAW_E_FORMAT;
+	n->cal = P6_CAL_IDENTITY;
 
 	const p1_shape *s = &n->s;
 	const p1_isa isa = p1_isa_current();
@@ -212,7 +265,7 @@ taw_status p1_net_load(p1_net *n, uint8_t quant, const uint8_t *model,
 	default: n->mix = p1_mix_scalar; break;
 	}
 
-	const uint8_t *p = model + P1_MODEL_HEAD;
+	const uint8_t *p = model + head_len;
 	float tmp[P1_HMAX + P1_F];
 	/* Layer 1 row (set, j) lands transposed: w1[set][i][j]. */
 	for (size_t set = 0; set < s1; set++) {
@@ -238,6 +291,26 @@ taw_status p1_net_load(p1_net *n, uint8_t quant, const uint8_t *model,
 			n->b2[set] = row[H];
 	}
 	return TAW_OK;
+}
+
+taw_status p1_net_load(p1_net *n, uint8_t quant, const uint8_t *model,
+    size_t size)
+{
+	return net_load(n, quant, model, size, P1_MODEL_HEAD);
+}
+
+taw_status p6_net_load(p1_net *n, uint8_t quant, const uint8_t *model,
+    size_t size)
+{
+	p1_shape s;
+	p6_cal cal;
+	taw_status st = p6_head_parse(model, size, &s, &cal);
+	if (st != TAW_OK)
+		return st;
+	st = net_load(n, quant, model, size, P6_MODEL_HEAD);
+	if (st == TAW_OK)
+		n->cal = cal;
+	return st;
 }
 
 void p1_net_free(p1_net *n)

@@ -41,7 +41,8 @@ bool taw_pred_supported(uint8_t profile, uint8_t quant)
 {
 	switch (profile) {
 	case TAW_PROFILE_INT_ORDER0: return quant == TAW_QUANT_NONE;
-	case TAW_PROFILE_F32_STRICT_MIX: return p1_quant_supported(quant);
+	case TAW_PROFILE_F32_STRICT_MIX:
+	case TAW_PROFILE_CALIBRATED_MIX: return p1_quant_supported(quant);
 	default: return false;
 	}
 }
@@ -69,8 +70,11 @@ taw_status taw_pred_init(taw_pred *pr, uint8_t profile, uint8_t quant,
 		free(m);
 		return TAW_E_NOMEM;
 	}
-	taw_status st = p1_net_load(&m->net, quant, model, model_size);
+	taw_status st = profile == TAW_PROFILE_CALIBRATED_MIX
+	    ? p6_net_load(&m->net, quant, model, model_size)
+	    : p1_net_load(&m->net, quant, model, model_size);
 	if (st == TAW_OK) {
+		m->calibrated = profile == TAW_PROFILE_CALIBRATED_MIX;
 		st = p1_ctx_init(&m->ctx, &m->net.s);
 		if (st != TAW_OK)
 			p1_net_free(&m->net);
@@ -130,13 +134,37 @@ static inline uint32_t p1_p16(struct taw_p1 *m)
 	x[P1_IN_BIAS] = 1.0f;
 	for (unsigned i = P1_F; i < P1_XPAD; i++)
 		x[i] = 0.0f;
-	const uint32_t p = p1_squash(p1_net_eval(&m->net, x, &sc));
+	const p6_cal *cal = &m->net.cal;
+	uint32_t p = p1_squash(m->calibrated
+	    ? p6_cal_t(cal, p1_net_eval(&m->net, x, &sc))
+	    : p1_net_eval(&m->net, x, &sc));
 	const int32_t s12 = p1_stretch_tab[p >> 4];
 	const uint32_t q1 = apm_p(m->apm1, sc.c0, s12, &m->a1);
 	const uint32_t q2 =
 	    apm_p(m->apm2, (size_t)sc.c1 << 8 | sc.c0, s12, &m->a2);
+	if (m->calibrated) {
+		/* Learned mixture of the mixer and the two APM stages. The
+		 * weights are 4-bit, so the products fit in 32 bits. */
+		const unsigned den = (unsigned)cal->w0 + cal->w1 + cal->w2;
+		return (cal->w0 * p + cal->w1 * q1 + cal->w2 * q2) / den;
+	}
 	/* p >= 22 and q1, q2 >= 0, so the result is in [11, 65524]. */
 	return (2 * p + q1 + q2) >> 2;
+}
+
+static inline void p1_update(struct taw_p1 *m, int bit);
+
+uint32_t taw_pred_prob(taw_pred *pr)
+{
+	return pr->p1 ? p1_p16(pr->p1) : pr->p[pr->c0];
+}
+
+void taw_pred_advance(taw_pred *pr, int bit)
+{
+	if (pr->p1)
+		p1_update(pr->p1, bit);
+	else
+		o0_update(pr, bit);
 }
 
 static inline void p1_update(struct taw_p1 *m, int bit)
@@ -153,7 +181,9 @@ void taw_pred_encode(taw_pred *pr, taw_rc_enc *e, const uint8_t *src,
 	if (pr->p1) {
 		struct taw_p1 *m = pr->p1;
 #if TAW_X86_SIMD
-		if (m->ctx.avx2) {
+		/* The fused loop hardcodes profile 1's probability; profile 6
+		 * uses the generic loop so its calibration is applied. */
+		if (m->ctx.avx2 && !m->calibrated) {
 			p1_encode_avx2(m, e, src, n);
 			return;
 		}
@@ -188,7 +218,7 @@ void taw_pred_skip(taw_pred *pr, const uint8_t *src, size_t n)
 		/* the same predictions and updates as coding, without a coder */
 		struct taw_p1 *m = pr->p1;
 #if TAW_X86_SIMD
-		if (m->ctx.avx2) {
+		if (m->ctx.avx2 && !m->calibrated) {
 			p1_skip_avx2(m, src, n);
 			return;
 		}
@@ -212,7 +242,7 @@ void taw_pred_decode(taw_pred *pr, taw_rc_dec *d, uint8_t *dst, size_t n)
 	if (pr->p1) {
 		struct taw_p1 *m = pr->p1;
 #if TAW_X86_SIMD
-		if (m->ctx.avx2) {
+		if (m->ctx.avx2 && !m->calibrated) {
 			p1_decode_avx2(m, d, dst, n);
 			return;
 		}
