@@ -12,6 +12,8 @@ constexpr uint8_t TAW_KIND_AWSEEK = 1;
 
 constexpr uint8_t TAW_PROFILE_INT_ORDER0 = 0;
 constexpr uint8_t TAW_PROFILE_F32_STRICT_MIX = 1; /* reserved */
+/* Experimental: profile 1 plus an entropy-adaptive confidence gate. */
+constexpr uint8_t TAW_PROFILE_ENTROPY_GATE = 11;
 
 constexpr uint8_t TAW_QUANT_NONE = 0;
 constexpr uint8_t TAW_QUANT_F16 = 1;

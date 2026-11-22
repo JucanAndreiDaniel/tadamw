@@ -973,6 +973,126 @@ static taw_status evaluate(const uint8_t *model, size_t size, uint8_t quant,
 	return TAW_OK;
 }
 
+/* ---- profile 11: fitting the entropy-adaptive gate ---------------------------
+ * The network is fitted exactly as for profile 1 first; the gate is then
+ * fitted against the quantized network's own (real) inference, so the
+ * encoder optimizes the probabilities the decoder will actually produce. */
+
+typedef struct {
+	uint16_t pm, pc; /* MLP probability, raw mixture probability */
+	uint16_t mad;    /* mean absolute deviation of the 25 stretched inputs */
+	uint8_t bit;
+} gate_sample;
+
+enum { GATE_FIT_MAX = 1u << 16 };
+
+static void gate_collect(const sample *sm, size_t ns, const uint8_t *model,
+    size_t msize, uint8_t quant, gate_sample *gs, size_t *gn)
+{
+	p1_net net;
+	if (p1_net_load(&net, quant, model, msize) != TAW_OK) {
+		*gn = 0;
+		return;
+	}
+	size_t step = (ns + GATE_FIT_MAX - 1) / GATE_FIT_MAX;
+	if (!step)
+		step = 1;
+	size_t n = 0;
+	for (size_t k = 0; k < ns; k += step) {
+		alignas(32) float x[P1_XPAD];
+		sample_x(&sm[k], x);
+		const p1_sel_ctx sc = sample_sc(&sm[k]);
+		int32_t mean, mad;
+		p11_features(sm[k].st, &mean, &mad);
+		gs[n].pm = (uint16_t)p1_squash(p1_net_eval(&net, x, &sc));
+		gs[n].pc = (uint16_t)p1_squash(mean);
+		gs[n].mad = (uint16_t)mad;
+		gs[n].bit = sm[k].bit;
+		n++;
+	}
+	p1_net_free(&net);
+	*gn = n;
+}
+
+static double gate_cost(const gate_sample *gs, size_t n, const float *ct,
+    int a, int b)
+{
+	const p11_gate g = {.a = (int16_t)a, .b = (int16_t)b};
+	double sum = 0.0;
+	for (size_t k = 0; k < n; k++) {
+		uint32_t p = p11_gate_p(gs[k].pm, gs[k].pc, gs[k].mad, &g);
+		sum += ct[gs[k].bit ? p : 65536u - p];
+	}
+	return sum;
+}
+
+static int clampi(int v, int lo, int hi)
+{
+	return v < lo ? lo : v > hi ? hi : v;
+}
+
+static p11_gate fit_gate(const gate_sample *gs, size_t n)
+{
+	const float *ct = cost_tab();
+	p11_gate best = {0, 0};
+	if (!ct || !n)
+		return best;
+	double bc = 1e300;
+	/* Coarse grid, then a local refinement with the same integer cost. */
+	for (int a = P11_GATE_A_MIN; a <= P11_GATE_A_MAX; a += 16)
+		for (int b = P11_GATE_B_MIN; b <= P11_GATE_B_MAX; b += 64) {
+			double c = gate_cost(gs, n, ct, a, b);
+			if (c < bc) {
+				bc = c;
+				best = (p11_gate){(int16_t)a, (int16_t)b};
+			}
+		}
+	const int a0 = best.a, b0 = best.b;
+	for (int a = clampi(a0 - 16, P11_GATE_A_MIN, P11_GATE_A_MAX);
+	     a <= clampi(a0 + 16, P11_GATE_A_MIN, P11_GATE_A_MAX); a += 2)
+		for (int b = clampi(b0 - 64, P11_GATE_B_MIN, P11_GATE_B_MAX);
+		     b <= clampi(b0 + 64, P11_GATE_B_MIN, P11_GATE_B_MAX);
+		     b += 8) {
+			double c = gate_cost(gs, n, ct, a, b);
+			if (c < bc) {
+				bc = c;
+				best = (p11_gate){(int16_t)a, (int16_t)b};
+			}
+		}
+	return best;
+}
+
+/* Mean cost in bits per coded bit with the gate enabled (real inference). */
+static taw_status evaluate_gate(const uint8_t *model, size_t size,
+    uint8_t quant, const sample *sm, size_t ns, const p11_gate *gate,
+    double *bits)
+{
+	const float *ct = cost_tab();
+	if (!ct)
+		return TAW_E_NOMEM;
+	if (size <= P11_GATE_SIZE)
+		return TAW_E_FORMAT;
+	p1_net net;
+	taw_status st = p1_net_load(&net, quant, model, size - P11_GATE_SIZE);
+	if (st != TAW_OK)
+		return st;
+	double sum = 0.0;
+	for (size_t k = 0; k < ns; k++) {
+		alignas(32) float x[P1_XPAD];
+		sample_x(&sm[k], x);
+		const p1_sel_ctx sc = sample_sc(&sm[k]);
+		int32_t mean, mad;
+		p11_features(sm[k].st, &mean, &mad);
+		uint32_t p = p11_gate_p(
+		    p1_squash(p1_net_eval(&net, x, &sc)), p1_squash(mean),
+		    mad, gate);
+		sum += ct[sm[k].bit ? p : 65536u - p];
+	}
+	p1_net_free(&net);
+	*bits = ns ? sum / (double)ns : 8.0;
+	return TAW_OK;
+}
+
 /* ---- candidates and the size heuristic ----------------------------------------- */
 
 typedef struct {
@@ -1327,13 +1447,49 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 		if (best == SIZE_MAX || F.est[ci] < F.est[best])
 			best = ci;
 	}
-	if (st == TAW_OK) {
-		out->profile = TAW_PROFILE_F32_STRICT_MIX;
-		out->quant = cs[best].quant;
-		out->model = F.model[best].p;
-		out->model_size = F.model[best].n;
-		F.model[best] = (taw_buf){0};
+	/* Profile 11: keep the fitted network, append the fitted gate. A gate
+	 * of (0, 0) reproduces profile 1 exactly, so a failed fit costs only
+	 * the four tail bytes. `-p gate` forces this profile for benchmarking. */
+	taw_buf gated = {0};
+	if (st == TAW_OK && p->predictor == TAW_PREDICTOR_GATE &&
+	    (uint64_t)F.model[best].n + P11_GATE_SIZE <= budget) {
+		gate_sample *gsm = malloc(GATE_FIT_MAX * sizeof *gsm);
+		if (!gsm)
+			st = TAW_E_NOMEM;
+		else {
+			size_t ngs = 0;
+			gate_collect(sm, ns, F.model[best].p, F.model[best].n,
+			    cs[best].quant, gsm, &ngs);
+			const p11_gate gate = fit_gate(gsm, ngs);
+			free(gsm);
+			uint8_t tail[P11_GATE_SIZE];
+			p11_gate_write(tail, &gate);
+			taw_buf_put(&gated, F.model[best].p, F.model[best].n);
+			taw_buf_put(&gated, tail, sizeof tail);
+			double gbpb = 8.0;
+			if (!gated.oom)
+				st = evaluate_gate(gated.p, gated.n,
+				    cs[best].quant, sm, ns, &gate, &gbpb);
+			if (dbg)
+				fprintf(stderr,
+				    "taw gate: a=%d b=%d bpc=%.4f est=%.0f B\n",
+				    gate.a, gate.b, gbpb * 8.0,
+				    gbpb * 8.0 * (double)n + (double)gated.n);
+		}
 	}
+	if (st == TAW_OK) {
+		const bool use_gate = gated.n != 0 && !gated.oom;
+		out->profile = use_gate ? TAW_PROFILE_ENTROPY_GATE
+					: TAW_PROFILE_F32_STRICT_MIX;
+		out->quant = cs[best].quant;
+		out->model = use_gate ? gated.p : F.model[best].p;
+		out->model_size = use_gate ? gated.n : F.model[best].n;
+		if (use_gate)
+			gated = (taw_buf){0};
+		else
+			F.model[best] = (taw_buf){0};
+	}
+	taw_buf_free(&gated);
 	for (size_t ci = 0; F.model && ci < tries; ci++)
 		taw_buf_free(&F.model[ci]);
 	free(F.model);

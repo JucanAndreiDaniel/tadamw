@@ -114,6 +114,16 @@ static taw_buf build_model(const model_spec *m)
 	return b;
 }
 
+static taw_buf build_gate_model(const model_spec *m, p11_gate gate)
+{
+	taw_buf b = build_model(m);
+	uint8_t tail[P11_GATE_SIZE];
+	p11_gate_write(tail, &gate);
+	taw_buf_put(&b, tail, sizeof tail);
+	REQUIRE(!b.oom);
+	return b;
+}
+
 static const p1_shape geo = {
 	.lines_log2 = 12, .hist_log2 = 16, .match_log2 = 12,
 	.sel1 = P1_SEL_BITPOS, .sel2 = P1_SEL_C0, .hidden = 12,
@@ -478,6 +488,198 @@ static void golden(void)
 	p1_isa_force(-1);
 }
 
+/* ---- profile 11: entropy-adaptive gate ------------------------------------ */
+
+static void gate_arithmetic(void)
+{
+	int16_t st[P1_NCTX];
+	int32_t mean, mad;
+	for (unsigned i = 0; i < P1_NCTX; i++)
+		st[i] = 0;
+	p11_features(st, &mean, &mad);
+	CHECK(mean == 0 && mad == 0);
+	for (unsigned i = 0; i < P1_NCTX - 1; i++)
+		st[i] = i & 1 ? 100 : -100;
+	st[P1_NCTX - 1] = 0;
+	p11_features(st, &mean, &mad);
+	CHECK(mean == 0 && mad == 96);
+	for (unsigned i = 0; i < P1_NCTX; i++)
+		st[i] = 1000;
+	p11_features(st, &mean, &mad);
+	CHECK(mean == 1000 && mad == 0);
+
+	const p11_gate zero = {0, 0}, full = {256, 0}, neg = {-1, 1};
+	CHECK(p11_gate_p(12345, 54321, 7, &zero) == 12345);
+	CHECK(p11_gate_p(12345, 54321, 7, &full) == 54321);
+	CHECK(p11_gate_p(12345, 54321, 0, &neg) == 12345);
+	CHECK(p11_gate_p(12345, 54321, 1, &neg) == 12345); /* floor(1/64)=0 */
+	CHECK(p11_gate_p(0, 25600, 256, &neg) == 300);     /* w = 3 */
+}
+
+static void gate_validation(void)
+{
+	model_spec m = {.s = geo, .quant = TAW_QUANT_F16, .seed = 7,
+		.scale = 1.0f};
+	taw_buf mb = build_gate_model(&m, (p11_gate){208, -56});
+	p11_gate g;
+	CHECK(p11_gate_parse(mb.p + mb.n - P11_GATE_SIZE, P11_GATE_SIZE, &g) ==
+	    TAW_OK);
+	CHECK(g.a == 208 && g.b == -56);
+	CHECK(p11_gate_parse(mb.p + mb.n - P11_GATE_SIZE, 3, &g) ==
+	    TAW_E_FORMAT);
+
+	taw_pred pr;
+	CHECK(taw_pred_supported(TAW_PROFILE_ENTROPY_GATE, TAW_QUANT_F16));
+	CHECK(!taw_pred_supported(TAW_PROFILE_ENTROPY_GATE, TAW_QUANT_BF16));
+	CHECK(taw_pred_init(&pr, TAW_PROFILE_ENTROPY_GATE, TAW_QUANT_F16,
+	    mb.p, mb.n) == TAW_OK);
+	taw_pred_free(&pr);
+	CHECK(taw_pred_init(&pr, TAW_PROFILE_ENTROPY_GATE, TAW_QUANT_Q8,
+	    mb.p, mb.n) == TAW_E_FORMAT); /* the payload is F16 */
+
+	/* Out-of-range gate parameters and a short model are refused. */
+	mb.p[mb.n - 4] = 0;
+	mb.p[mb.n - 3] = 0x7F; /* a = 32512 */
+	CHECK(taw_pred_init(&pr, TAW_PROFILE_ENTROPY_GATE, TAW_QUANT_F16,
+	    mb.p, mb.n) == TAW_E_FORMAT);
+	mb.p[mb.n - 4] = (uint8_t)(uint16_t)208;
+	mb.p[mb.n - 3] = 0;
+	mb.p[mb.n - 2] = 0;
+	mb.p[mb.n - 1] = 0x7F; /* b = 32512 */
+	CHECK(taw_pred_init(&pr, TAW_PROFILE_ENTROPY_GATE, TAW_QUANT_F16,
+	    mb.p, mb.n) == TAW_E_FORMAT);
+	mb.p[mb.n - 2] = (uint8_t)(uint16_t)-56;
+	mb.p[mb.n - 1] = 0xFF;
+	mb.n--;
+	CHECK(taw_pred_init(&pr, TAW_PROFILE_ENTROPY_GATE, TAW_QUANT_F16,
+	    mb.p, mb.n) == TAW_E_FORMAT);
+	taw_pred_free(&pr);
+	taw_buf_free(&mb);
+}
+
+/* A zero gate must be bit-identical to profile 1: the new profile is a
+ * strict extension, not a change to the existing arithmetic. */
+static void gate_identity(void)
+{
+	enum { N = 8192 };
+	uint8_t *src = malloc(N);
+	REQUIRE(src);
+	td_fill(src, N, TD_TEXT, 77);
+	model_spec m = {.s = geo, .quant = TAW_QUANT_F16, .seed = 42,
+		.scale = 0.4f};
+	taw_buf m1 = build_model(&m);
+	taw_buf m11 = build_gate_model(&m, (p11_gate){0, 0});
+	taw_pred a, b;
+	REQUIRE(taw_pred_init(&a, TAW_PROFILE_F32_STRICT_MIX, m.quant,
+	    m1.p, m1.n) == TAW_OK);
+	REQUIRE(taw_pred_init(&b, TAW_PROFILE_ENTROPY_GATE, m.quant,
+	    m11.p, m11.n) == TAW_OK);
+	taw_buf o1 = {0}, o11 = {0};
+	taw_rc_enc e1, e11;
+	taw_rc_enc_init(&e1, &o1);
+	taw_rc_enc_init(&e11, &o11);
+	taw_pred_encode(&a, &e1, src, N);
+	taw_pred_encode(&b, &e11, src, N);
+	taw_rc_enc_flush(&e1);
+	taw_rc_enc_flush(&e11);
+	CHECK(!o1.oom && !o11.oom && o1.n == o11.n &&
+	    memcmp(o1.p, o11.p, o1.n) == 0);
+	taw_pred_free(&a);
+	taw_pred_free(&b);
+	taw_buf_free(&m1);
+	taw_buf_free(&m11);
+	taw_buf_free(&o1);
+	taw_buf_free(&o11);
+	free(src);
+}
+
+/* The encoder's gate fitting, header and decoder all agree end to end. */
+static void gate_archive(void)
+{
+	enum { N = 50000 };
+	uint8_t *src = malloc(N);
+	REQUIRE(src);
+	td_fill(src, N, TD_TEXT, 77);
+	const taw_params p = {.level = 1, .predictor = TAW_PREDICTOR_GATE};
+	void *arc;
+	size_t an;
+	REQUIRE(taw_compress(src, N, &p, &arc, &an) == TAW_OK);
+	taw_info info;
+	REQUIRE(taw_read_info(arc, an, &info) == TAW_OK);
+	CHECK(info.arith_profile == TAW_PROFILE_ENTROPY_GATE);
+	CHECK(info.model_size > P1_MODEL_HEAD + P11_GATE_SIZE);
+	void *dst;
+	size_t dn;
+	CHECK(taw_decompress(arc, an, &dst, &dn) == TAW_OK);
+	CHECK(dn == N && memcmp(dst, src, N) == 0);
+	free(dst);
+	free(arc);
+	free(src);
+}
+
+/* A fixed gated model over fixed text, pinned for every ISA. */
+static uint32_t gate_golden_crc(uint8_t quant, p11_gate gate,
+    uint32_t *coded_len)
+{
+	enum { N = 1 << 16 };
+	uint8_t *src = malloc(N), *dst = malloc(N);
+	REQUIRE(src && dst);
+	td_fill(src, N, TD_TEXT, 1234);
+	for (size_t i = 0; i < N; i += 4096)
+		memcpy(src + i, src, 64);
+	model_spec m = {.s = geo, .quant = quant, .seed = 42, .scale = 0.4f};
+	taw_buf mb = build_gate_model(&m, gate);
+	taw_pred pr;
+	REQUIRE(taw_pred_init(&pr, TAW_PROFILE_ENTROPY_GATE, quant, mb.p,
+	    mb.n) == TAW_OK);
+	taw_buf out = {0};
+	taw_rc_enc e;
+	taw_rc_enc_init(&e, &out);
+	taw_pred_encode(&pr, &e, src, N);
+	taw_rc_enc_flush(&e);
+	REQUIRE(!out.oom);
+	taw_pred_reset(&pr);
+	taw_rc_dec d;
+	taw_rc_dec_init(&d, out.p, out.n);
+	taw_pred_decode(&pr, &d, dst, N);
+	CHECK(memcmp(src, dst, N) == 0);
+	uint32_t crc = taw_crc32c(0, out.p, out.n);
+	*coded_len = (uint32_t)out.n;
+	taw_pred_free(&pr);
+	taw_buf_free(&out);
+	taw_buf_free(&mb);
+	free(src);
+	free(dst);
+	return crc;
+}
+
+static void gate_golden(void)
+{
+	static const struct {
+		uint8_t quant;
+		uint32_t len, crc;
+	} want[] = {
+		{TAW_QUANT_F16, 59403, 0xE70A25C1u},
+		{TAW_QUANT_Q8, 47616, 0x4310D2DBu},
+	};
+	const p11_gate gate = {208, -56};
+	for (size_t i = 0; i < sizeof want / sizeof *want; i++) {
+		for (int isa = 0; isa < P1_ISA_COUNT; isa++) {
+			if (!p1_isa_available((p1_isa)isa))
+				continue;
+			p1_isa_force(isa);
+			uint32_t len, crc = gate_golden_crc(want[i].quant, gate, &len);
+			if (len != want[i].len || crc != want[i].crc) {
+				fprintf(stderr,
+				    "gate golden quant=%u isa=%d: len %u crc 0x%08X\n",
+				    want[i].quant, isa, len, crc);
+				check_failures++;
+			}
+		}
+	}
+	p1_isa_force(-1);
+}
+
 int main(void)
 {
 	tables();
@@ -486,6 +688,11 @@ int main(void)
 	ctx_parity();
 	validation();
 	golden();
+	gate_arithmetic();
+	gate_validation();
+	gate_identity();
+	gate_archive();
+	gate_golden();
 	archive_parity();
 	archive_model_damage();
 	return CHECK_DONE();

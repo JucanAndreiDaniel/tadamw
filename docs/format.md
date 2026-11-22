@@ -1,7 +1,8 @@
 # tar_aw container format, version 1
 
-Status: draft. Normative for everything implemented (profiles 0 and 1);
-reserved values are listed so that decoders can refuse them.
+Status: draft. Normative for everything implemented (profiles 0, 1 and 11;
+profile 11 is an experimental extension); reserved values are listed so that
+decoders can refuse them.
 `tests/test_p1.c` pins profile 1 with golden vectors: a change that breaks
 them changes the format.
 
@@ -52,7 +53,8 @@ identical probabilities for every bit.
 |----|-----------------|---------------|--------|
 | 0  | `INT_ORDER0`    | empty (`model_size = 0`, `quant = 0`) | implemented, placeholder |
 | 1  | `F32_STRICT_MIX`| mixer shape and weights, §5.1; quant `F16`, `Q8`, `Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4` or `IQ2` | implemented |
-| 2..255 | — | — | reserved, refuse |
+| 11 | `ENTROPY_GATE`  | profile 1 model + 4-byte gate tail, §5.2 | implemented, experimental |
+| 2..10, 12..255 | — | — | reserved, refuse |
 
 ### 2.1 Profile 0: `INT_ORDER0`
 
@@ -306,6 +308,46 @@ and the same `A2` entry are updated: `e += (65535 - e) >> 6` if `b`, else
    `nib = 1` and select lines with `q = c0`. At `bitpos` 8: byte end
    (§2.2.5).
 
+### 2.3 Profile 11: `ENTROPY_GATE` (experimental)
+
+Profile 11 is profile 1 with an entropy-adaptive confidence gate inserted
+between the mixer and the APM stages. All of §2.2 applies unchanged, except
+that step 2 of §2.2.10 uses `p_gate` below in place of `p_mix`; the APM stages
+of §2.2.9 then refine `p_gate` exactly as they refined `p_mix`.
+
+The frozen MLP still produces `p_mlp = squash(t)` (§2.2.8). Let `st[0..24]` be
+the integer stretch values that produced its inputs (`x[i] = st[i]/256` is
+exact in binary32). From them compute, in int32:
+
+```
+sum  = Σ(i = 0..24) st[i]                      [-51175, 51175]
+mean = (sum >= 0 ? (sum + 12) / 25 : (sum - 12) / 25)   round, ties away from 0
+dev  = Σ(i = 0..24) |st[i] - mean|
+mad  = (dev + 12) / 25                         [0, 4094]
+p_ctx = squash(mean)                           mean is in [-2047, 2047]
+```
+
+The four-byte gate tail of the model section (§5.2) holds two signed
+little-endian int16 parameters: `a` in `[-256, 512]` and `b` in
+`[-2048, 2048]`. With the fixed shift `S = 6`:
+
+```
+prod   = b * mad                               (int32)
+q      = floor(prod / 64)                      (floor, not truncation)
+w      = clamp(a + q, 0, 256)
+p_gate = ((256 - w) * p_mlp + w * p_ctx + 128) >> 8    [22, 65514]
+```
+
+The APM stages use `s12 = stretch[p_gate >> 4]` and update their entries as in
+§2.2.9. With `a = b = 0`, `w = 0` and profile 11 is bit-identical to profile 1.
+
+`mad` measures the disagreement of the context estimates. The fitted gate
+gives the raw context mixture more weight when they agree and trusts the
+frozen MLP's learned combination when they disagree — the analogue of
+StateSMix's entropy-adaptive scaling of n-gram contributions
+(arXiv:2605.02904). Parameters are fitted once by the encoder and frozen
+while coding.
+
 ## 3. Quantization formats
 
 The format in which model weights are stored. Encoders may pick any format
@@ -373,8 +415,9 @@ Reading past the end of a segment yields `0` bytes. A probability outside
 ## 5. Model section
 
 `model_size` bytes immediately follow the header. Their layout belongs to
-the arithmetic profile (profile 0: empty). The model is fitted once over the
-whole input and is shared by every chunk or block.
+the arithmetic profile (profile 0: empty; profile 1: §5.1; profile 11: §5.2).
+The model is fitted once over the whole input and is shared by every chunk
+or block.
 
 Constraint: `model_size <= floor(raw_size / 32)`. Encoders that cannot
 beat profile 0 inside that budget use profile 0.
@@ -442,6 +485,22 @@ code bits. Profile 1 accepts the row formats (`quant` 1 and 4..11);
 A decoder needs about `10 * 2^L * 64 + 2^HB + 4 * 2^MB` bytes of tables
 plus about 4.6 MB fixed (o1 table and APM), and resets them per coding
 unit.
+
+### 5.2 Profile 11 model
+
+The profile 11 model section is the §5.1 head and weight payload, followed
+immediately by a four-byte gate tail:
+
+| offset from tail | size | field | valid range |
+|------------------|------|-------|-------------|
+| 0 | 2 | `gate_a`, signed int16 LE | `-256..512` |
+| 2 | 2 | `gate_b`, signed int16 LE | `-2048..2048` |
+
+`model_size` MUST equal `8` plus the payload size (§5.1) plus `4` exactly.
+Profile 11 accepts every `quant` that profile 1 accepts (§3). A decoder MUST
+refuse an unsupported quant, an out-of-range gate parameter, a head/payload
+format error as in §5.1, or a size mismatch. The gate is fitted by the encoder after the
+network weights (`src/fit.c`) and never changes while coding.
 
 ## 6. aw body (kind 0)
 

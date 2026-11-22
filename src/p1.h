@@ -209,10 +209,42 @@ void p1_isa_force(int isa);
 /* The ISA that kernels picked now should use (forced or best). */
 p1_isa p1_isa_current(void);
 
+/* ---- profile 11: entropy-adaptive confidence gate ------------------------
+ * Profile 11 is profile 1's context models, frozen MLP and APM stages plus a
+ * four-byte gate appended to the model section (docs/format.md §2.3, §5.2).
+ * The gate interpolates the MLP's probability with the raw mixture of the 25
+ * stretched context estimates, with a weight driven by their disagreement.
+ * All of it is integer arithmetic; fit.c and the decoder share these helpers.
+ */
+
+enum {
+	P11_GATE_SIZE = 4,
+	P11_GATE_SHIFT = 6,   /* fixed: gate_b * mad is floor-divided by 2^6 */
+	P11_GATE_A_MIN = -256, P11_GATE_A_MAX = 512,
+	P11_GATE_B_MIN = -2048, P11_GATE_B_MAX = 2048,
+};
+
+typedef struct {
+	int16_t a, b;
+} p11_gate;
+
+/* Confidence features from the 25 stretched inputs (st[i] in 1/256 units):
+ * mean = round-to-nearest(st[i] sum / 25), mad = mean |st[i] - mean|. */
+void p11_features(const int16_t st[P1_NCTX], int32_t *mean, int32_t *mad);
+/* p = ((256 - w) * p_mlp + w * p_ctx + 128) >> 8, w from the gate and mad. */
+uint32_t p11_gate_p(uint32_t p_mlp, uint32_t p_ctx, int32_t mad,
+    const p11_gate *g);
+
+/* Parse/write the four-byte little-endian gate tail (signed int16 a, b). */
+taw_status p11_gate_parse(const uint8_t *p, size_t n, p11_gate *g);
+void p11_gate_write(uint8_t out[P11_GATE_SIZE], const p11_gate *g);
+
 /* ---- the per-bit loop ------------------------------------------------------- */
 
 /* Profile 1 state. After the mixer, two adaptive APM (SSE) stages refine
- * the probability in the contexts c0 and c1:c0 (format.md §2.2.9). */
+ * the probability in the contexts c0 and c1:c0 (format.md §2.2.9).
+ * With `gated` set (profile 11) the generic loop inserts the entropy gate;
+ * the fused AVX2 loop only implements profile 1 and is bypassed then. */
 enum { P1_APM_RATE = 6 };
 struct taw_p1 {
 	p1_ctx ctx;
@@ -220,6 +252,8 @@ struct taw_p1 {
 	uint16_t apm1[256 * 33];
 	uint16_t *apm2;    /* [65536 * 33] */
 	uint32_t a1, a2;   /* entries to update after the bit */
+	p11_gate gate;    /* profile 11 only */
+	bool gated;       /* profile 11: interpolate MLP with raw mixture */
 };
 
 /* After the context-model counters of a bit are updated: the match

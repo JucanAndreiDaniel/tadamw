@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* Arithmetic profiles: 0 = INT_ORDER0 (placeholder), 1 = F32_STRICT_MIX. */
+/* Arithmetic profiles: 0 = INT_ORDER0 (placeholder), 1 = F32_STRICT_MIX,
+ * 11 = ENTROPY_GATE (profile 1 plus an entropy-adaptive confidence gate). */
 #include <stdlib.h>
 #include <string.h>
 
@@ -7,6 +8,8 @@
 #include "p1.h"
 #include "taw_internal.h"
 
+/* struct taw_p1 (shared with the fused AVX2 loop) is declared in p1.h; the
+ * gate fields there are used only by profile 11. */
 enum { APM_RATE = P1_APM_RATE };
 
 static void apm_reset(struct taw_p1 *m)
@@ -41,7 +44,8 @@ bool taw_pred_supported(uint8_t profile, uint8_t quant)
 {
 	switch (profile) {
 	case TAW_PROFILE_INT_ORDER0: return quant == TAW_QUANT_NONE;
-	case TAW_PROFILE_F32_STRICT_MIX: return p1_quant_supported(quant);
+	case TAW_PROFILE_F32_STRICT_MIX:
+	case TAW_PROFILE_ENTROPY_GATE: return p1_quant_supported(quant);
 	default: return false;
 	}
 }
@@ -68,6 +72,37 @@ taw_status taw_pred_init(taw_pred *pr, uint8_t profile, uint8_t quant,
 	if (!m->apm2) {
 		free(m);
 		return TAW_E_NOMEM;
+	}
+	if (profile == TAW_PROFILE_ENTROPY_GATE) {
+		/* Profile 11 = profile 1's head + weight payload + a four-byte
+		 * gate tail. The network sees only the first part. */
+		if (!p1_quant_supported(quant)) {
+			free(m->apm2);
+			free(m);
+			return TAW_E_UNSUPPORTED;
+		}
+		p1_shape shape;
+		taw_status gs = p1_head_parse(model, model_size, &shape);
+		if (gs != TAW_OK) {
+			free(m->apm2);
+			free(m);
+			return gs;
+		}
+		const size_t wsize = (size_t)p1_weights_size(&shape, quant);
+		if (model_size != P1_MODEL_HEAD + wsize + P11_GATE_SIZE) {
+			free(m->apm2);
+			free(m);
+			return TAW_E_FORMAT;
+		}
+		gs = p11_gate_parse(model + P1_MODEL_HEAD + wsize,
+		    P11_GATE_SIZE, &m->gate);
+		if (gs != TAW_OK) {
+			free(m->apm2);
+			free(m);
+			return gs;
+		}
+		m->gated = true;
+		model_size = P1_MODEL_HEAD + wsize;
 	}
 	taw_status st = p1_net_load(&m->net, quant, model, model_size);
 	if (st == TAW_OK) {
@@ -122,6 +157,17 @@ static inline void o0_update(taw_pred *pr, int bit)
 
 /* ---- profile 1 -------------------------------------------------------------- */
 
+static inline uint32_t p1_apm16(struct taw_p1 *m, const p1_sel_ctx *sc,
+    uint32_t p)
+{
+	const int32_t s12 = p1_stretch_tab[p >> 4];
+	const uint32_t q1 = apm_p(m->apm1, sc->c0, s12, &m->a1);
+	const uint32_t q2 =
+	    apm_p(m->apm2, (size_t)sc->c1 << 8 | sc->c0, s12, &m->a2);
+	/* p >= 22 and q1, q2 >= 0, so the result is in [11, 65524]. */
+	return (2 * p + q1 + q2) >> 2;
+}
+
 static inline uint32_t p1_p16(struct taw_p1 *m)
 {
 	p1_sel_ctx sc;
@@ -130,13 +176,18 @@ static inline uint32_t p1_p16(struct taw_p1 *m)
 	x[P1_IN_BIAS] = 1.0f;
 	for (unsigned i = P1_F; i < P1_XPAD; i++)
 		x[i] = 0.0f;
-	const uint32_t p = p1_squash(p1_net_eval(&m->net, x, &sc));
-	const int32_t s12 = p1_stretch_tab[p >> 4];
-	const uint32_t q1 = apm_p(m->apm1, sc.c0, s12, &m->a1);
-	const uint32_t q2 =
-	    apm_p(m->apm2, (size_t)sc.c1 << 8 | sc.c0, s12, &m->a2);
-	/* p >= 22 and q1, q2 >= 0, so the result is in [11, 65524]. */
-	return (2 * p + q1 + q2) >> 2;
+	uint32_t p = p1_squash(p1_net_eval(&m->net, x, &sc));
+	if (m->gated) {
+		/* x[i] = st[i] / 256 is exact in binary32, so this recovers
+		 * the integer stretch inputs without any rounding. */
+		int16_t st[P1_NCTX];
+		for (unsigned i = 0; i < P1_NCTX; i++)
+			st[i] = (int16_t)(x[i] * 256.0f);
+		int32_t mean, mad;
+		p11_features(st, &mean, &mad);
+		p = p11_gate_p(p, p1_squash(mean), mad, &m->gate);
+	}
+	return p1_apm16(m, &sc, p);
 }
 
 static inline void p1_update(struct taw_p1 *m, int bit)
@@ -153,7 +204,7 @@ void taw_pred_encode(taw_pred *pr, taw_rc_enc *e, const uint8_t *src,
 	if (pr->p1) {
 		struct taw_p1 *m = pr->p1;
 #if TAW_X86_SIMD
-		if (m->ctx.avx2) {
+		if (m->ctx.avx2 && !m->gated) {
 			p1_encode_avx2(m, e, src, n);
 			return;
 		}
@@ -188,7 +239,7 @@ void taw_pred_skip(taw_pred *pr, const uint8_t *src, size_t n)
 		/* the same predictions and updates as coding, without a coder */
 		struct taw_p1 *m = pr->p1;
 #if TAW_X86_SIMD
-		if (m->ctx.avx2) {
+		if (m->ctx.avx2 && !m->gated) {
 			p1_skip_avx2(m, src, n);
 			return;
 		}
@@ -212,7 +263,7 @@ void taw_pred_decode(taw_pred *pr, taw_rc_dec *d, uint8_t *dst, size_t n)
 	if (pr->p1) {
 		struct taw_p1 *m = pr->p1;
 #if TAW_X86_SIMD
-		if (m->ctx.avx2) {
+		if (m->ctx.avx2 && !m->gated) {
 			p1_decode_avx2(m, d, dst, n);
 			return;
 		}
