@@ -1,0 +1,25 @@
+24 jobs
+J_lr00p04_wd1em3               text1m  L1   179920  10.65s
+J_lr00p04_wd1em3               libc1m  L1   376739  11.80s
+J_lr00p04_wd1em4               text1m  L1   180041  8.92s
+J_lr00p04_wd1em3               text1m  L5   179195  29.18s
+J_lr00p04_wd1em4               libc1m  L1   376682  9.79s
+J_lr00p04_wd1em3               libc1m  L5   373235  28.91s
+J_lr00p055_wd1em3              text1m  L1   179913  8.72s
+J_lr00p04_wd1em4               text1m  L5   179076  28.45s
+J_lr00p055_wd1em3              libc1m  L1   373887  10.11s
+J_lr00p04_wd1em4               libc1m  L5   373309  28.08s
+J_lr00p06_wd5em4               text1m  L1   180121  7.54s
+J_lr00p055_wd1em3              text1m  L5   178886  26.39s
+J_lr00p06_wd5em4               libc1m  L1   376497  9.62s
+J_lr00p055_wd1em3              libc1m  L5   371894  25.77s
+J_lr00p06_wd3em4               text1m  L1   180056  12.61s
+J_lr00p06_wd5em4               text1m  L5   179247  30.33s
+J_lr00p06_wd3em4               libc1m  L1   376606  9.30s
+J_lr00p06_wd5em4               libc1m  L5   371728  32.07s
+J_lr00p06_wd3em4               text1m  L5   179365  27.10s
+J_lr00p03_wd1em3               text1m  L1   179888  9.67s
+J_lr00p03_wd1em3               libc1m  L1   375979  8.66s
+J_lr00p06_wd3em4               libc1m  L5   371711  29.13s
+J_lr00p03_wd1em3               text1m  L5   178362  27.83s
+J_lr00p03_wd1em3               libc1m  L5   373173  26.79s

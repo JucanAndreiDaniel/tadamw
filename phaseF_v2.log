@@ -1,0 +1,25 @@
+24 jobs
+F_lr0p025                      text1m  L1   181406  9.12s
+F_lr0p025                      libc1m  L1   376859  9.55s
+F_lr0p035                      text1m  L1   181516  8.87s
+F_lr0p025                      text1m  L5   179298  27.93s
+F_lr0p035                      libc1m  L1   376643  9.93s
+F_lr0p025                      libc1m  L5   373254  28.99s
+F_lr0p035                      text1m  L5   178950  27.56s
+F_lr0p04                       text1m  L1   179809  9.42s
+F_lr0p04                       libc1m  L1   376648  9.14s
+F_lr0p035                      libc1m  L5   373731  27.79s
+F_lr0p04                       text1m  L5   179144  27.19s
+F_lr0p045                      text1m  L1   180356  9.29s
+F_lr0p045                      libc1m  L1   376399  9.50s
+F_lr0p04                       libc1m  L5   372781  28.41s
+F_lr0p06                       text1m  L1   180315  9.72s
+F_lr0p045                      text1m  L5   179284  29.25s
+F_lr0p06                       libc1m  L1   375972  9.72s
+F_lr0p045                      libc1m  L5   374097  31.06s
+F_lr0p06                       text1m  L5   179844  29.93s
+F_lr0p07                       text1m  L1   180055  9.44s
+F_lr0p07                       libc1m  L1   376034  9.96s
+F_lr0p06                       libc1m  L5   373715  29.26s
+F_lr0p07                       text1m  L5   180646  26.13s
+F_lr0p07                       libc1m  L5   373916  25.00s

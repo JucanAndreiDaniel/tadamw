@@ -178,14 +178,16 @@ the leader's small W2 LR.
 
 # Appendix: AdamW LR/WD baseline sweep (PR #7)
 
-# Tuning the plain AdamW baseline — CURRENT: v2 on `origin/main` e64cc83
+# Tuning the plain AdamW baseline — v2, rebased on `origin/main` 1aa3dd7
 
 > **STALE NOTICE.** The earlier sweep (a427e7f, 51 configs, "best 0.003→6e-5")
-> is preserved at the bottom and in `sweep_table.md` / `results.tsv` /
-> `arcs/` / `phase*.log`, but is **invalid** after upstream's fit.c rewrite
-> (GPU fitting path, bit-position sampling, new quant formats, FIT_BATCH,
-> fit_stride/fit_warm_epochs). All numbers below were re-measured from scratch
-> on rebased `origin/main` e64cc83.
+> is preserved in `sweep_table.md` / `results.tsv` / `arcs/` / `phase*.log`,
+> but is **invalid** after upstream's fit.c rewrite (GPU fitting, bit-position
+> sampling, new quant formats, FIT_BATCH). Numbers below were re-measured from
+> scratch on e64cc83 and re-verified byte-for-byte after rebasing onto
+> 1aa3dd7 (upstream PRs #3 MALTER and #4 Muon). Upstream optimizer code is
+> untouched; this PR keeps only docs/sweep data and the `TAW_LR1=flat`
+> convenience.
 
 ## TL;DR — best plain AdamW configuration (v2)
 
@@ -214,20 +216,22 @@ text1m L5 where almost every high-LR variant regresses. Runner-up
 The best LR-only (β/WD shipped) config is `0.04→0.002, β1=0.9, WD=1e-5`
 with −6,829 bytes and all four cells improved.
 
-## What changed in `src/fit.c` (rebased)
+## What changed in `src/fit.c` after the 1aa3dd7 rebase
 
-- Conflict with upstream was limited to `tnet_train()`: upstream's
-  `enum { BATCH = FIT_BATCH };` and all other upstream changes were preserved;
-  only the env-override layer was re-applied. `git diff origin/main -- src/fit.c`
-  contains exactly the `fit_env_float()` helper and the five env reads.
-- Overrides: `TAW_LR0` (default 0.02), `TAW_LR1` (default LR0/20; literal
-  `flat` gives constant LR), `TAW_B1` (0.9), `TAW_B2` (0.999), `TAW_WD`
-  (1e-5). Malformed/out-of-range values fall back to the default.
-- **The shipped default was NOT changed.** With no overrides, the four
-  baseline sizes match the coordinators' new baseline exactly.
+- Upstream PRs #3/#4 already ship the `TAW_LR0`, `TAW_LR1`, `TAW_B1`,
+  `TAW_B2`, `TAW_WD` overrides and the hybrid/Muon/MALTER optimizers. All of
+  that upstream code was preserved verbatim.
+- The entire PR delta is now six lines in `tnet_train()`: `TAW_LR1=flat`
+  keeps the LR constant (otherwise upstream's default LR0/20 schedule is
+  used), plus a comment. `git diff origin/main -- src/fit.c` shows exactly
+  this hunk and nothing else.
+- **The shipped default was NOT changed.** With no overrides, all four
+  baseline archives are byte-identical (`cmp`) to the pre-rebase v2 archives
+  and match 181557 / 179166 / 379197 / 375291; the tuned config likewise
+  reproduces 179913 / 178886 / 373887 / 371894 byte-for-byte.
 - `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang`,
   `cmake --build build -j1`, `ctest --test-dir build --output-on-failure`:
-  **12/12 passed** (44.94 s) after the rebase.
+  **12/12 passed** (53.09 s) on 1aa3dd7.
 
 ## Method (v2)
 
@@ -384,6 +388,7 @@ From the pre-rebase branch: best single config was LR 0.003→6e-5 with
 The sibling `exp/muon` control numbers (188984/188087/385592/384178) were a
 per-cell mix of LR0=0.002 and LR0=0.003, not one schedule. All of this is
 invalid on e64cc83; the full stale table is in `sweep_table.md` and raw data
-in `results.tsv`. Branch rebased cleanly onto e64cc83 as commit 5c49f70.
+in `results.tsv`. Branch rebased onto e64cc83 and then onto 1aa3dd7; all
+v2 bytes re-verified after the final rebase.
 
-Commit on `exp/lr-baseline`, not pushed.
+Commits on `exp/lr-baseline`, force-pushed to `myfork` only.

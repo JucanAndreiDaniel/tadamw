@@ -3,3 +3,4 @@
 *.aw
 *.awseek
 /bench/dec/
+/__pycache__/

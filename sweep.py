@@ -18,11 +18,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 TAW = ROOT / "build/tools/taw"
 DATA = Path("/tmp/opencode/tadamw-bench")
-ARCS = ROOT / "arcs"
-RESULTS = ROOT / "results.tsv"
+ARCS = ROOT / "arcs_v2"       # v2 (e64cc83) archives; arcs/ holds stale v1
+RESULTS = ROOT / "results_v2.tsv"
 CORPORA = ("text1m", "libc1m")
-BASE = {"text1m": {1: 190610, 5: 187956, 9: 184211},
-        "libc1m": {1: 388792, 5: 385741, 9: 378206}}
+BASE = {"text1m": {1: 181557, 5: 179166},
+        "libc1m": {1: 379197, 5: 375291}}
 
 
 def nameify(s):
@@ -38,7 +38,8 @@ def configs(phase):
             out.append((f"A_lr{nameify(lr)}", {"TAW_LR0": lr}, (1, 5)))
 
     if phase == "B":  # refine LR around coarse optimum and explore the edges
-        for lr in ("0.03", "0.004", "0.0035", "0.0025", "0.0015", "0.0005"):
+        for lr in ("0.05", "0.03", "0.015", "0.008", "0.004", "0.0035",
+                   "0.0025"):
             out.append((f"B_lr{nameify(lr)}", {"TAW_LR0": lr}, (1, 5)))
 
     if phase == "C":  # LR schedule shape at the two best starting LRs
@@ -52,6 +53,65 @@ def configs(phase):
             for tag, lr1 in variants:
                 out.append((f"C_lr0{nameify(lr0)}_{tag}",
                             {"TAW_LR0": lr0, "TAW_LR1": lr1}, (1, 5)))
+
+    if phase == "F":  # v2: refine the high-LR optimum
+        for lr in ("0.025", "0.035", "0.04", "0.045", "0.06", "0.07"):
+            out.append((f"F_lr{nameify(lr)}", {"TAW_LR0": lr}, (1, 5)))
+
+    if phase == "G":  # v2: LR1 schedule at best LR0 (env BEST_LR)
+        best = os.environ.get("BEST_LR", "0.03")
+        variants = (("r10", str(round(float(best) / 10, 6))),
+                    ("r20", str(round(float(best) / 20, 6))),
+                    ("r50", str(round(float(best) / 50, 6))),
+                    ("r100", str(round(float(best) / 100, 6))),
+                    ("flat", "flat"),
+                    ("abs0p003", "0.003"),
+                    ("abs0p01", "0.01"))
+        for tag, lr1 in variants:
+            out.append((f"G_lr0{nameify(best)}_{tag}",
+                        {"TAW_LR0": best, "TAW_LR1": lr1}, (1, 5)))
+
+    if phase == "K":  # v2: local refinement of best b1=0.95 / wd=1e-3 config
+        cases = (("0.0525", "0.000525", "0.95", "1e-3"),
+                 ("0.0575", "0.000575", "0.95", "1e-3"),
+                 ("0.055", "0.000275", "0.95", "1e-3"),
+                 ("0.055", "0.00011", "0.95", "1e-3"),
+                 ("0.055", "0.00055", "0.95", "2e-3"),
+                 ("0.055", "0.00055", "0.95", "7e-4"),
+                 ("0.055", "0.00055", "0.94", "1e-3"))
+        for lr0, lr1, b1, wd in cases:
+            out.append((f"K_lr0{nameify(lr0)}_lr1{nameify(lr1)}"
+                        f"_b1{nameify(b1)}_wd{nameify(wd)}",
+                        {"TAW_LR0": lr0, "TAW_LR1": lr1, "TAW_B1": b1,
+                         "TAW_B2": "0.999", "TAW_WD": wd}, (1, 5)))
+
+    if phase == "J":  # v2: cross LR x b1=0.95 x WD
+        for lr0, lr1, wd in (("0.04", "0.0004", "1e-3"),
+                             ("0.04", "0.0004", "1e-4"),
+                             ("0.055", "0.00055", "1e-3"),
+                             ("0.06", "0.0006", "5e-4"),
+                             ("0.06", "0.0006", "3e-4"),
+                             ("0.03", "0.0003", "1e-3")):
+            out.append((f"J_lr0{nameify(lr0)}_wd{nameify(wd)}",
+                        {"TAW_LR0": lr0, "TAW_LR1": lr1,
+                         "TAW_B1": "0.95", "TAW_B2": "0.999",
+                         "TAW_WD": wd}, (1, 5)))
+
+    if phase == "I":  # v2: final refinement around lr0=0.06, ratio 1/100
+        for lr0, lr1 in (("0.055", "0.00055"), ("0.065", "0.00065"),
+                         ("0.07", "0.0007"), ("0.08", "0.0008"),
+                         ("0.06", "0.0003"), ("0.06", "0.0002"),
+                         ("0.06", "0.001"), ("0.04", "0.0006")):
+            out.append((f"I_lr0{nameify(lr0)}_lr1{nameify(lr1)}",
+                        {"TAW_LR0": lr0, "TAW_LR1": lr1}, (1, 5)))
+
+    if phase == "H":  # v2: very low final LR, and r100 at neighbouring LR0
+        for lr0, lr1 in (("0.04", "0.0002"), ("0.04", "0.0001"),
+                         ("0.04", "0.00004"), ("0.05", "0.0005"),
+                         ("0.05", "0.0004"), ("0.03", "0.0003"),
+                         ("0.06", "0.0006"), ("0.035", "0.00035")):
+            out.append((f"H_lr0{nameify(lr0)}_lr1{nameify(lr1)}",
+                        {"TAW_LR0": lr0, "TAW_LR1": lr1}, (1, 5)))
 
     if phase == "C2":  # 2-D grid: decouple initial and final LR
         for lr0, lr1 in (("0.003", "0.00003"), ("0.002", "0.00002"),
