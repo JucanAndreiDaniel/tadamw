@@ -52,7 +52,11 @@ identical probabilities for every bit.
 |----|-----------------|---------------|--------|
 | 0  | `INT_ORDER0`    | empty (`model_size = 0`, `quant = 0`) | implemented, placeholder |
 | 1  | `F32_STRICT_MIX`| mixer shape and weights, §5.1; quant `F16`, `Q8`, `Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4` or `IQ2` | implemented |
-| 2..255 | — | — | reserved, refuse |
+| 2  | — | — | reserved, refuse |
+| 3  | `SOFT_GATED`    | soft-gated expert mixture, §5.2; quant `F16` or `Q8` | implemented |
+| 4..6 | — | — | reserved, refuse |
+| 7  | `SOFT_GATED_CAL`| profile 3 + learned APM blend, §2.4 / §5.3; quant `F16` or `Q8` | implemented |
+| 8..255 | — | — | reserved, refuse |
 
 ### 2.1 Profile 0: `INT_ORDER0`
 
@@ -306,6 +310,94 @@ and the same `A2` entry are updated: `e += (65535 - e) >> 6` if `b`, else
    `nib = 1` and select lines with `q = c0`. At `bitpos` 8: byte end
    (§2.2.5).
 
+### 2.3 Profile 3: `SOFT_GATED`
+
+This profile keeps everything after the mixer from profile 1 unchanged:
+the 12 adaptive integer context models and their 25 stretched inputs
+(§2.2.2–§2.2.6), `squash` and `stretch` (§2.2.1), the two APM stages and
+the final probability (§2.2.9), the per-bit sequence (§2.2.10) and the range
+coder (§4). Only the mixer and the model section (§5.2) are new. Consequently
+the coding-unit state is exactly the profile 1 state of §2.2.2.
+
+Instead of selecting one weight set per bit, profile 3 blends `K = 2..4`
+**experts** with a deterministic integer gate. Each expert is a linear
+model over the shared hidden layer; the gate produces nonnegative integer
+weights from cheap features (the partial byte `c0`, the match class `msel`,
+and optionally a confidence feature derived from the 25 inputs).
+
+#### 2.3.1 Integer functions (new)
+
+`E[0..511]` is the fixed softmax table:
+
+```
+E[0] = 256
+E[d] = (E[d-1] * 235) >> 8      for d = 1..511
+```
+
+It is a fixed-point approximation of `256 * 2^(-d/8)`; it is
+non-increasing and reaches `0` at `d = 65`.
+
+The confidence bucket (only when gate flag bit 1 is set) is computed from
+`x[i] = st[i] / 256`, `i = 0..24`, in this exact order:
+
+```
+mean = 0
+for i = 0 .. 24: mean = mean + x[i]
+mean = mean * (1 / 25)                 (exact multiply by a constant)
+mad = 0
+for i = 0 .. 24: d = x[i] - mean; mad = mad + (d < 0 ? -d : d)
+mad = mad * (1 / 25)
+conf = trunc(mad * 32);  conf = min(conf, 15)
+```
+
+`conf` is in `0..15`; it is large when the 25 context estimates disagree.
+
+#### 2.3.2 Gate and mixer
+
+With gate tables `G0[k][256]`, `GM[k][8]` and `GF[k][16]` (int8), the gate
+logit of expert `k` is the int16 sum
+
+```
+l[k] = G0[k][c0] + (flag 0 ? GM[k][msel] : 0) + (flag 1 ? GF[k][conf] : 0)
+```
+
+(the unused `G0[k][0]` is present in the model but never read). The integer
+softmax and its exact normalization are:
+
+```
+m    = max(l[0] .. l[K-1])
+e[k] = E[min(511, m - l[k])]
+S    = e[0] + e[1] + ... + e[K-1]                    (fixed order; S >= 256)
+P[-1] = 0
+for k = 0 .. K-1:
+    P[k] = floor(256 * (e[0] + ... + e[k]) / S)      (64-bit product)
+    w[k] = P[k] - P[k-1]
+```
+
+The prefix-sum rounding makes `w[0] + ... + w[K-1] = 256` exactly, with every
+`w[k] >= 0`. With hidden units `H` and shared hidden weights `W1`:
+
+```
+if H > 0:
+    for j = 0 .. H-1: h[j] = min(max(dot4(W1[j], x, 26), -8), 8)
+    for k = 0 .. K-1: z[k] = dot4(V[k], h, H) + b[k]     (H weights + bias)
+else:
+    for k = 0 .. K-1: z[k] = dot4(V[k], x, 26)           (26 weights, no bias)
+
+acc = 0
+for k = 0 .. K-1: acc = acc + (float)w[k] * z[k]        (fixed order)
+zb  = acc * (1 / 256)
+zb  = min(max(zb, -2047/256), 2047/256)
+t   = trunc(zb * 256)
+p_mix = squash(t)
+```
+
+`dot4` is the profile 1 accumulator of §2.2.8. `p_mix` then enters the
+unchanged APM stages of §2.2.9. With flag bit 1 set, expert 0 is the **fixed
+raw context mixture** `V[0][i] = 1/25` for `i = 0..24` (bias 0), so the gate
+can move weight to the plain context average when the contexts agree; this
+variant is only valid when `H = 0`.
+
 ## 3. Quantization formats
 
 The format in which model weights are stored. Encoders may pick any format
@@ -442,6 +534,40 @@ code bits. Profile 1 accepts the row formats (`quant` 1 and 4..11);
 A decoder needs about `10 * 2^L * 64 + 2^HB + 4 * 2^MB` bytes of tables
 plus about 4.6 MB fixed (o1 table and APM), and resets them per coding
 unit.
+
+### 5.2 Profile 3 model
+
+An 8-byte head, then the weight payload:
+
+| off | size | field | valid range |
+|-----|------|-------|-------------|
+| 0 | 1 | `K` (experts) | 2..4 |
+| 1 | 1 | `hidden` (H) | 0..8 |
+| 2 | 1 | `lines_log2` (L) | 8..22 |
+| 3 | 1 | `hist_log2` (HB) | 12..26 |
+| 4 | 1 | `match_log2` (MB) | 10..24 |
+| 5 | 1 | `gate_flags` | bit 0: msel table, bit 1: confidence table; others 0 |
+| 6 | 2 | reserved | `0` |
+
+If bit 1 is set, `hidden` MUST be `0` (the fixed context expert is defined
+only in the input domain). The payload is, in this order:
+
+1. Hidden layer, only if `H > 0`: `H` rows of 26 weights `W1[j][0..25]`
+   in input order.
+2. Expert rows: for each `k = 0..K-1`, one row of `H + 1` weights
+   (`V[k][0..H-1]`, then bias `b[k]`), or of 26 weights if `H = 0`.
+3. Gate table `G0`: `K` rows of 256 int8 logits.
+4. Gate table `GM`, only if flag bit 0: `K` rows of 8 int8 logits.
+5. Gate table `GF`, only if flag bit 1: `K` rows of 16 int8 logits.
+
+Rows of weights use exactly the profile 1 `F16` / `Q8` row encodings of
+§5.1; gate logits are raw int8 with no scale. `model_size` MUST equal `8`
+plus the payload size exactly. A decoder MUST refuse an out-of-range field,
+a non-zero reserved byte or flag bit, a size mismatch, a non-finite F16
+weight or Q8 scale, or a Q8 value of -128. Profile 3 accepts `quant` `F16`
+and `Q8` only; other quant values are unsupported.
+
+`model_size` is still bounded by `floor(raw_size / 32)` (§5).
 
 ## 6. aw body (kind 0)
 

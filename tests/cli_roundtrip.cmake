@@ -63,13 +63,13 @@ if(rc EQUAL 0)
   message(FATAL_ERROR "out-of-range extract succeeded")
 endif()
 
-# Profile 1 (the fitted mixer), forced, both weight formats.
+# The fitted mixer, forced, both weight formats (profile 1 or 3).
 foreach(w f16 q8)
   run("${TAW}" c -l 1 -p mix -w ${w} "${INPUT}" "${WORK}/in.${w}.aw")
   run("${TAW}" d "${WORK}/in.${w}.aw" "${WORK}/out.${w}.bin")
   same("${INPUT}" "${WORK}/out.${w}.bin")
   execute_process(COMMAND "${TAW}" i "${WORK}/in.${w}.aw" OUTPUT_VARIABLE info)
-  if(NOT info MATCHES "profile: +1 \\(F32_STRICT_MIX\\)" OR NOT info MATCHES "\\(${w}\\)")
+  if(NOT info MATCHES "profile: +[13] \\((F32_STRICT_MIX|SOFT_GATED)\\)" OR NOT info MATCHES "\\(${w}\\)")
     message(FATAL_ERROR "unexpected info output:\n${info}")
   endif()
 endforeach()

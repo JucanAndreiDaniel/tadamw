@@ -9,6 +9,7 @@
 #include "half.h"
 #include "header.h"
 #include "p1.h"
+#include "p3.h"
 #include "quant.h"
 #include "taw_internal.h"
 #include "testdata.h"
@@ -478,6 +479,153 @@ static void golden(void)
 	p1_isa_force(-1);
 }
 
+/* ---- profile 3: soft-gated mixture of experts ----------------------------- */
+
+typedef struct {
+	p3_shape s;
+	uint8_t quant;
+	uint64_t seed;
+	float scale;
+} p3_spec;
+
+static void put_g8(taw_buf *b, uint64_t *r, size_t n)
+{
+	for (size_t i = 0; i < n; i++)
+		taw_buf_put_u8(b, (uint8_t)(int8_t)((int)(td_next(r) % 255) - 127));
+}
+
+static taw_buf build_model_p3(const p3_spec *m)
+{
+	taw_buf b = {0};
+	uint8_t head[P3_HEAD];
+	p3_head_write(head, &m->s);
+	taw_buf_put(&b, head, sizeof head);
+	uint64_t r = m->seed;
+	const unsigned H = m->s.hidden;
+	if (H)
+		for (unsigned j = 0; j < H; j++)
+			put_row(&b, m->quant, &r, m->scale, P1_F);
+	for (unsigned k = 0; k < m->s.K; k++)
+		put_row(&b, m->quant, &r, m->scale, H ? H + 1 : P1_F);
+	for (unsigned k = 0; k < m->s.K; k++)
+		put_g8(&b, &r, P3_GC0);
+	if (m->s.gate_flags & P3_FLAG_MSEL)
+		for (unsigned k = 0; k < m->s.K; k++)
+			put_g8(&b, &r, P3_GMSEL);
+	if (m->s.gate_flags & P3_FLAG_CONF)
+		for (unsigned k = 0; k < m->s.K; k++)
+			put_g8(&b, &r, P3_GCONF);
+	REQUIRE(!b.oom);
+	REQUIRE(b.n == P3_HEAD + p3_weights_size(&m->s, m->quant));
+	return b;
+}
+
+static taw_status load_p3(const taw_buf *mb, uint8_t quant)
+{
+	taw_pred pr;
+	taw_status st = taw_pred_init(&pr, TAW_PROFILE_SOFT_GATED, quant,
+	    mb->p, mb->n);
+	taw_pred_free(&pr);
+	return st;
+}
+
+static taw_status load_p3_patched(const taw_buf *mb, uint8_t quant, size_t off,
+    uint8_t v)
+{
+	uint8_t saved = mb->p[off];
+	mb->p[off] = v;
+	taw_status st = load_p3(mb, quant);
+	mb->p[off] = saved;
+	return st;
+}
+
+static void validate_p3(void)
+{
+	p3_spec m = {.s = {.K = 3, .hidden = 4, .lines_log2 = 12,
+		.hist_log2 = 16, .match_log2 = 12,
+		.gate_flags = P3_FLAG_MSEL},
+		.quant = TAW_QUANT_F16, .seed = 9, .scale = 0.5f};
+	taw_buf mb = build_model_p3(&m);
+	CHECK(load_p3(&mb, TAW_QUANT_F16) == TAW_OK);
+	CHECK(load_p3(&mb, TAW_QUANT_Q8) == TAW_E_FORMAT);   /* size mismatch */
+	CHECK(load_p3(&mb, TAW_QUANT_BF16) == TAW_E_UNSUPPORTED);
+	CHECK(load_p3_patched(&mb, TAW_QUANT_F16, 0, P3_KMAX + 1) == TAW_E_FORMAT);
+	CHECK(load_p3_patched(&mb, TAW_QUANT_F16, 0, P3_KMIN - 1) == TAW_E_FORMAT);
+	CHECK(load_p3_patched(&mb, TAW_QUANT_F16, 1, P3_HMAX + 1) == TAW_E_FORMAT);
+	CHECK(load_p3_patched(&mb, TAW_QUANT_F16, 5, 4) == TAW_E_FORMAT);
+	CHECK(load_p3_patched(&mb, TAW_QUANT_F16, 6, 1) == TAW_E_FORMAT);
+	taw_buf_free(&mb);
+
+	/* The confidence gate is only valid with hidden = 0. */
+	m.s.hidden = 0;
+	m.s.gate_flags = P3_FLAG_MSEL | P3_FLAG_CONF;
+	mb = build_model_p3(&m);
+	CHECK(load_p3(&mb, TAW_QUANT_F16) == TAW_OK);
+	m.s.hidden = 4;
+	taw_buf bad = build_model_p3(&m);
+	CHECK(load_p3(&bad, TAW_QUANT_F16) == TAW_E_FORMAT);
+	taw_buf_free(&bad);
+	taw_buf_free(&mb);
+}
+
+static uint32_t golden_p3_crc(uint8_t quant, uint32_t *coded_len)
+{
+	enum { N = 1 << 16 };
+	uint8_t *src = malloc(N), *dst = malloc(N);
+	REQUIRE(src && dst);
+	td_fill(src, N, TD_TEXT, 1234);
+	for (size_t i = 0; i < N; i += 4096)
+		memcpy(src + i, src, 64);
+	p3_spec m = {.s = {.K = 3, .hidden = 0, .lines_log2 = 12,
+		.hist_log2 = 16, .match_log2 = 12,
+		.gate_flags = P3_FLAG_MSEL | P3_FLAG_CONF},
+		.quant = quant, .seed = 77, .scale = 0.4f};
+	taw_buf mb = build_model_p3(&m);
+	taw_pred pr;
+	REQUIRE(taw_pred_init(&pr, TAW_PROFILE_SOFT_GATED, quant, mb.p,
+	    mb.n) == TAW_OK);
+	taw_buf out = {0};
+	taw_rc_enc e;
+	taw_rc_enc_init(&e, &out);
+	taw_pred_encode(&pr, &e, src, N);
+	taw_rc_enc_flush(&e);
+	REQUIRE(!out.oom);
+	taw_pred_reset(&pr);
+	taw_rc_dec d;
+	taw_rc_dec_init(&d, out.p, out.n);
+	taw_pred_decode(&pr, &d, dst, N);
+	CHECK(memcmp(src, dst, N) == 0);
+	uint32_t crc = taw_crc32c(0, out.p, out.n);
+	*coded_len = (uint32_t)out.n;
+	taw_pred_free(&pr);
+	taw_buf_free(&out);
+	taw_buf_free(&mb);
+	free(src);
+	free(dst);
+	return crc;
+}
+
+static void golden_p3(void)
+{
+	static const struct {
+		uint8_t quant;
+		uint32_t len, crc;
+	} want[] = {
+		{TAW_QUANT_F16, 61579, 0xBCC9DABAu},
+		{TAW_QUANT_Q8, 37301, 0x78F397FCu},
+	};
+	for (size_t i = 0; i < sizeof want / sizeof *want; i++) {
+		uint32_t len, crc = golden_p3_crc(want[i].quant, &len);
+		if (len != want[i].len || crc != want[i].crc) {
+			fprintf(stderr,
+			    "golden p3 quant=%u: len %u crc 0x%08X "
+			    "(want len %u crc 0x%08X)\n",
+			    want[i].quant, len, crc, want[i].len, want[i].crc);
+			check_failures++;
+		}
+	}
+}
+
 int main(void)
 {
 	tables();
@@ -485,7 +633,9 @@ int main(void)
 	parity();
 	ctx_parity();
 	validation();
+	validate_p3();
 	golden();
+	golden_p3();
 	archive_parity();
 	archive_model_damage();
 	return CHECK_DONE();

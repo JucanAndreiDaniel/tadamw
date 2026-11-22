@@ -19,6 +19,7 @@
 #include "format.h"
 #include "half.h"
 #include "p1.h"
+#include "p3.h"
 #include "quant.h"
 #include "taw_internal.h"
 
@@ -416,6 +417,345 @@ static void adam_rows(tnet *t, adamw *o, float *w, float *m, float *v,
 	(void)t;
 }
 
+static void put_row(taw_buf *b, uint8_t quant, const float *w, size_t len);
+
+/* ---- profile 3: soft-gated mixture of experts ------------------------------
+ * Fitting is encoder-only and need not be reproducible. The gate is trained
+ * in natural-log units and serialized as int8 logits scaled by 8/ln2, so the
+ * integer softmax E[d] = 256*2^(-d/8) reproduces the trained probabilities.
+ * The final score always uses the real decoder inference (p3_net_eval). */
+
+#define P3_GATE_T (11.54156033f) /* 8 / ln(2) */
+
+/* exp(x) for x <= 0, range-reduced by x/16 then a degree-6 Taylor series
+ * and four squarings. Fitting-only; no determinism requirement. */
+static float fexp_neg(float x)
+{
+	float r = x * (1.0f / 16.0f);
+	float r2 = r * r, r4 = r2 * r2, r6 = r4 * r2;
+	float e = 1.0f + r + r2 * 0.5f + r2 * r * (1.0f / 6.0f) +
+	    r4 * (1.0f / 24.0f) + r4 * r * (1.0f / 120.0f) +
+	    r6 * (1.0f / 720.0f);
+	e *= e; e *= e; e *= e; e *= e;
+	return e;
+}
+
+typedef struct {
+	float *w, *m, *v, *g;
+	size_t n;
+} pgroup;
+
+static void pg_free(pgroup *p)
+{
+	free(p->w); free(p->m); free(p->v); free(p->g);
+	memset(p, 0, sizeof *p);
+}
+
+static bool pg_init(pgroup *p, size_t n)
+{
+	*p = (pgroup){0};
+	if (n) {
+		p->w = calloc(n, sizeof(float));
+		p->m = calloc(n, sizeof(float));
+		p->v = calloc(n, sizeof(float));
+		p->g = calloc(n, sizeof(float));
+		if (!p->w || !p->m || !p->v || !p->g) {
+			pg_free(p);
+			return false;
+		}
+	}
+	p->n = n;
+	return true;
+}
+
+static void pg_step(pgroup *p, adamw *o, float scale)
+{
+	if (p->n)
+		adam_rows(nullptr, o, p->w, p->m, p->v, p->g, p->n, scale);
+}
+
+typedef struct {
+	p3_shape s;
+	unsigned K, H;
+	pgroup w1, v, g0, gm, gcf;
+} p3t;
+
+static void p3t_free(p3t *t)
+{
+	pg_free(&t->w1); pg_free(&t->v); pg_free(&t->g0); pg_free(&t->gm);
+	pg_free(&t->gcf);
+	memset(t, 0, sizeof *t);
+}
+
+static taw_status p3t_init(p3t *t, const p3_shape *s, uint64_t seed)
+{
+	memset(t, 0, sizeof *t);
+	t->s = *s;
+	t->K = s->K;
+	t->H = s->hidden;
+	const size_t n1 = (size_t)t->H * P1_F;
+	const size_t rowv = t->H ? t->H + 1u : P1_F;
+	const size_t nv = (size_t)t->K * rowv;
+	const size_t n0 = (size_t)t->K * P3_GC0;
+	const size_t nm = (s->gate_flags & P3_FLAG_MSEL)
+	    ? (size_t)t->K * P3_GMSEL : 0;
+	const size_t nf = (s->gate_flags & P3_FLAG_CONF)
+	    ? (size_t)t->K * P3_GCONF : 0;
+	if (!pg_init(&t->w1, n1) || !pg_init(&t->v, nv) ||
+	    !pg_init(&t->g0, n0) || (nm && !pg_init(&t->gm, nm)) ||
+	    (nf && !pg_init(&t->gcf, nf))) {
+		p3t_free(t);
+		return TAW_E_NOMEM;
+	}
+	uint64_t rs = seed;
+	for (unsigned j = 0; j < t->H; j++)
+		for (unsigned i = 0; i < P1_F; i++)
+			t->w1.w[j * P1_F + i] =
+			    (i == P1_IN_BIAS ? 0.0f : 0.15f) + 0.3f * rng_unif(&rs);
+	const bool fixed0 = (s->gate_flags & P3_FLAG_CONF) != 0;
+	for (unsigned k = 0; k < t->K; k++)
+		for (unsigned i = 0; i < rowv; i++) {
+			if (fixed0 && k == 0)
+				t->v.w[i] = i < P1_NCTX ? 1.0f / (float)P1_NCTX : 0.0f;
+			else
+				t->v.w[k * rowv + i] =
+				    (t->H && i == t->H) ? 0.0f : 0.2f * rng_unif(&rs);
+		}
+	for (size_t i = 0; i < n0; i++)
+		t->g0.w[i] = 0.5f * rng_unif(&rs);
+	for (size_t i = 0; i < nm; i++)
+		t->gm.w[i] = 0.5f * rng_unif(&rs);
+	for (size_t i = 0; i < nf; i++)
+		t->gcf.w[i] = 0.5f * rng_unif(&rs);
+	return TAW_OK;
+}
+
+static void p3t_train(p3t *t, const sample *sm, size_t ns, int epochs,
+    uint64_t seed)
+{
+	enum { BATCH = 256 };
+	adamw o = {.b1 = 0.9f, .b2 = 0.999f, .eps = 1e-6f, .wd = 1e-5f,
+		.b1t = 1.0f, .b2t = 1.0f};
+	const float lr0 = 0.02f, lr1 = 0.001f;
+	const uint64_t steps_total = (uint64_t)epochs *
+	    ((ns + BATCH - 1) / BATCH);
+	uint64_t step = 0, rs = seed;
+	const unsigned K = t->K, H = t->H;
+	const size_t rowv = H ? H + 1u : P1_F;
+	const unsigned flen = H ? H + 1u : P1_F;
+
+	for (int ep = 0; ep < epochs; ep++) {
+		uint64_t stride = (uint64_t)((double)ns * 0.6180339887) | 1;
+		while (ns > 1) {
+			uint64_t a = stride, b = ns;
+			while (b) {
+				uint64_t r = a % b;
+				a = b; b = r;
+			}
+			if (a == 1)
+				break;
+			stride += 2;
+		}
+		uint64_t pos = rng_next(&rs) % (ns ? ns : 1);
+		for (size_t done = 0; done < ns;) {
+			size_t nb = ns - done < BATCH ? ns - done : BATCH;
+			for (size_t q = 0; q < nb; q++) {
+				const sample *s = &sm[pos];
+				pos += stride;
+				if (pos >= ns)
+					pos %= ns;
+				float x[P1_XPAD];
+				sample_x(s, x);
+				const p1_sel_ctx sc = sample_sc(s);
+
+				/* shared hidden features (+ bias feature) */
+				float feat[P1_F], ha[P1_HMAX];
+				if (H) {
+					for (unsigned j = 0; j < H; j++) {
+						float acc = 0.0f;
+						const float *r = t->w1.w + (size_t)j * P1_F;
+						for (unsigned i = 0; i < P1_F; i++)
+							acc += r[i] * x[i];
+						ha[j] = acc;
+						feat[j] = clamp8(acc);
+					}
+					feat[H] = 1.0f;
+				} else {
+					memcpy(feat, x, P1_F * sizeof(float));
+				}
+
+				/* confidence bucket (mean absolute deviation) */
+				unsigned cbf = 0;
+				if (t->gcf.n) {
+					float mean = 0.0f;
+					for (unsigned i = 0; i < P1_NCTX; i++)
+						mean += x[i];
+					mean *= 1.0f / (float)P1_NCTX;
+					float mad = 0.0f;
+					for (unsigned i = 0; i < P1_NCTX; i++) {
+						float d = x[i] - mean;
+						mad += d < 0.0f ? -d : d;
+					}
+					mad *= 1.0f / (float)P1_NCTX;
+					cbf = (unsigned)(mad * 4.0f);
+					if (cbf >= P3_GCONF)
+						cbf = P3_GCONF - 1;
+				}
+
+				/* soft gate in natural-log units */
+				float lg[P3_KMAX], mx = -1.0e30f;
+				for (unsigned k = 0; k < K; k++) {
+					float l = t->g0.w[(size_t)k * P3_GC0 + sc.c0];
+					if (t->gm.n)
+						l += t->gm.w[(size_t)k * P3_GMSEL +
+						    (sc.msel & 7)];
+					if (t->gcf.n)
+						l += t->gcf.w[(size_t)k * P3_GCONF +
+						    cbf];
+					lg[k] = l;
+					if (l > mx)
+						mx = l;
+				}
+				float pg[P3_KMAX], den = 0.0f;
+				for (unsigned k = 0; k < K; k++) {
+					pg[k] = fexp_neg(lg[k] - mx);
+					den += pg[k];
+				}
+				for (unsigned k = 0; k < K; k++)
+					pg[k] /= den;
+
+				float z[P3_KMAX], zb = 0.0f;
+				for (unsigned k = 0; k < K; k++) {
+					const float *r = t->v.w + (size_t)k * rowv;
+					float acc = 0.0f;
+					for (unsigned i = 0; i < flen; i++)
+						acc += r[i] * feat[i];
+					z[k] = acc;
+					zb += pg[k] * acc;
+				}
+				const float lim = 2047.0f / 256.0f;
+				float zc = zb > lim ? lim : zb < -lim ? -lim : zb;
+				float p = (float)p1_squash((int32_t)(zc * 256.0f)) *
+				    (1.0f / 65536.0f);
+				float gz = p - (float)s->bit;
+
+				for (unsigned k = 0; k < K; k++) {
+					if (!(t->gcf.n && k == 0)) {
+						float *gv = t->v.g + (size_t)k * rowv;
+						for (unsigned i = 0; i < flen; i++)
+							gv[i] += gz * pg[k] * feat[i];
+					}
+					float gl = 0.25f * gz * pg[k] * (z[k] - zb);
+					t->g0.g[(size_t)k * P3_GC0 + sc.c0] += gl;
+					if (t->gm.n)
+						t->gm.g[(size_t)k * P3_GMSEL +
+						    (sc.msel & 7)] += gl;
+					if (t->gcf.n)
+						t->gcf.g[(size_t)k * P3_GCONF +
+						    cbf] += gl;
+				}
+				if (H) {
+					for (unsigned j = 0; j < H; j++) {
+						float dh = 0.0f;
+						for (unsigned k = 0; k < K; k++)
+							dh += pg[k] * t->v.w[
+							    (size_t)k * rowv + j];
+						if (ha[j] > -8.0f && ha[j] < 8.0f) {
+							float *gw = t->w1.g +
+							    (size_t)j * P1_F;
+							for (unsigned i = 0; i < P1_F; i++)
+								gw[i] += gz * dh * x[i];
+						}
+					}
+				}
+			}
+			done += nb;
+			step++;
+			o.lr = lr0 + (lr1 - lr0) *
+			    ((float)step / (float)steps_total);
+			o.b1t *= o.b1;
+			o.b2t *= o.b2;
+			const float scale = 1.0f / (float)nb;
+			pg_step(&t->w1, &o, scale);
+			pg_step(&t->v, &o, scale);
+			pg_step(&t->g0, &o, scale);
+			pg_step(&t->gm, &o, scale);
+			pg_step(&t->gcf, &o, scale);
+			/* Keep logits soft: int8 serialization and the E[d] table
+			 * resolve differences up to ~64 natural-log units. */
+			for (size_t i = 0; i < t->g0.n; i++) {
+				if (t->g0.w[i] > 8.0f) t->g0.w[i] = 8.0f;
+				else if (t->g0.w[i] < -8.0f) t->g0.w[i] = -8.0f;
+			}
+			for (size_t i = 0; i < t->gm.n; i++) {
+				if (t->gm.w[i] > 8.0f) t->gm.w[i] = 8.0f;
+				else if (t->gm.w[i] < -8.0f) t->gm.w[i] = -8.0f;
+			}
+			for (size_t i = 0; i < t->gcf.n; i++) {
+				if (t->gcf.w[i] > 8.0f) t->gcf.w[i] = 8.0f;
+				else if (t->gcf.w[i] < -8.0f) t->gcf.w[i] = -8.0f;
+			}
+		}
+	}
+}
+
+static void put_i8row(taw_buf *b, const float *g, size_t n)
+{
+	for (size_t i = 0; i < n; i++) {
+		float v = g[i] * P3_GATE_T;
+		if (v > 127.0f) v = 127.0f;
+		if (v < -128.0f) v = -128.0f;
+		int q = (int)(v + (v >= 0.0f ? 0.5f : -0.5f));
+		taw_buf_put_u8(b, (uint8_t)(int8_t)q);
+	}
+}
+
+static taw_status p3_serialize(const p3t *t, uint8_t quant, taw_buf *b)
+{
+	uint8_t head[P3_HEAD];
+	p3_head_write(head, &t->s);
+	taw_buf_put(b, head, sizeof head);
+	const unsigned H = t->H;
+	const size_t rowv = H ? H + 1u : P1_F;
+	if (H)
+		for (unsigned j = 0; j < H; j++)
+			put_row(b, quant, t->w1.w + (size_t)j * P1_F, P1_F);
+	for (unsigned k = 0; k < t->K; k++)
+		put_row(b, quant, t->v.w + (size_t)k * rowv, rowv);
+	for (unsigned k = 0; k < t->K; k++)
+		put_i8row(b, t->g0.w + (size_t)k * P3_GC0, P3_GC0);
+	if (t->gm.n)
+		for (unsigned k = 0; k < t->K; k++)
+			put_i8row(b, t->gm.w + (size_t)k * P3_GMSEL, P3_GMSEL);
+	if (t->gcf.n)
+		for (unsigned k = 0; k < t->K; k++)
+			put_i8row(b, t->gcf.w + (size_t)k * P3_GCONF, P3_GCONF);
+	return b->oom ? TAW_E_NOMEM : TAW_OK;
+}
+
+static taw_status p3_evaluate(const uint8_t *model, size_t size,
+    uint8_t quant, const sample *sm, size_t ns, double *bits)
+{
+	const float *ct = cost_tab();
+	if (!ct)
+		return TAW_E_NOMEM;
+	p3_net net;
+	taw_status st = p3_net_load(&net, quant, model, size);
+	if (st != TAW_OK)
+		return st;
+	double sum = 0.0;
+	for (size_t k = 0; k < ns; k++) {
+		alignas(32) float x[P1_XPAD];
+		sample_x(&sm[k], x);
+		const p1_sel_ctx sc = sample_sc(&sm[k]);
+		uint32_t p = p1_squash(p3_net_eval(&net, x, &sc));
+		sum += ct[sm[k].bit ? p : 65536 - p];
+	}
+	p3_net_free(&net);
+	*bits = ns ? sum / (double)ns : 8.0;
+	return TAW_OK;
+}
+
 /* Train on samples for the given epochs. Batches touch few weight sets, so
  * only those rows are updated ("lazy" AdamW). */
 static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
@@ -631,6 +971,49 @@ static size_t enumerate(const p1_shape *geo, uint64_t budget, int quant_pref,
 	return k;
 }
 
+/* Profile 3 candidates. Ordered by expected strength: Q8, a 4-unit hidden
+ * layer and the largest expert count first. */
+typedef struct {
+	p3_shape s;
+	uint8_t quant;
+	uint64_t size;
+} p3cand;
+
+static size_t p3_enumerate(const p1_shape *geo, uint64_t budget,
+    int quant_pref, p3cand *out, size_t cap)
+{
+	static const uint8_t qs[] = {TAW_QUANT_Q8, TAW_QUANT_F16};
+	static const uint8_t ks[] = {4, 3, 2};
+	static const struct { uint8_t h, flags; } vs[] = {
+		{0, P3_FLAG_MSEL | P3_FLAG_CONF}, /* fixed context expert */
+		{4, P3_FLAG_MSEL},
+		{0, P3_FLAG_MSEL},
+	};
+	size_t k = 0;
+	for (size_t qi = 0; qi < 2; qi++) {
+		uint8_t q = qs[qi];
+		if (quant_pref == TAW_WEIGHTS_F16 && q != TAW_QUANT_F16)
+			continue;
+		if (quant_pref == TAW_WEIGHTS_Q8 && q != TAW_QUANT_Q8)
+			continue;
+		for (size_t ki = 0; ki < 3; ki++)
+			for (size_t vi = 0; vi < 3; vi++) {
+				p3cand c = {.quant = q};
+				c.s = (p3_shape){
+					.K = ks[ki], .hidden = vs[vi].h,
+					.lines_log2 = geo->lines_log2,
+					.hist_log2 = geo->hist_log2,
+					.match_log2 = geo->match_log2,
+					.gate_flags = vs[vi].flags,
+				};
+				c.size = P3_HEAD + p3_weights_size(&c.s, q);
+				if (c.size <= budget && k < cap)
+					out[k++] = c;
+			}
+	}
+	return k;
+}
+
 /* Level -> effort. Epochs matter more than samples: an under-trained net
  * loses more than a smaller sample does. */
 static const struct {
@@ -819,6 +1202,73 @@ static taw_status fit_all(fit_job *F, size_t tries, unsigned threads,
 	return st;
 }
 
+/* Fitting one profile 3 candidate. */
+typedef struct {
+	const p3cand *cs;
+	const sample *sm;
+	size_t ns;
+	int epochs;
+	uint64_t n;
+	taw_buf *model;
+	double *est, *bpb;
+	taw_status *st;
+} p3fit_job;
+
+static void p3fit_one(void *arg, size_t ci, unsigned w)
+{
+	(void)w;
+	p3fit_job *J = arg;
+	p3t t;
+	taw_status st = p3t_init(&t, &J->cs[ci].s, 0x5A17ull + ci);
+	if (st == TAW_OK) {
+		p3t_train(&t, J->sm, J->ns, J->epochs, 0xBEEFull + ci);
+		st = p3_serialize(&t, J->cs[ci].quant, &J->model[ci]);
+		p3t_free(&t);
+	}
+	if (st == TAW_OK)
+		st = p3_evaluate(J->model[ci].p, J->model[ci].n,
+		    J->cs[ci].quant, J->sm, J->ns, &J->bpb[ci]);
+	J->est[ci] = J->bpb[ci] * 8.0 * (double)J->n +
+	    8.0 * (double)J->model[ci].n;
+	J->st[ci] = st;
+}
+
+/* Codelength of a middle slice with the real predictor (context models,
+ * squash, APM and range coder), including the whole model section. The
+ * sample-based estimate above ignores the APM stages, so it is not reliable
+ * for comparing two different mixers. */
+static uint64_t real_cost(const taw_model_choice *c, const taw_source *in,
+    uint64_t n, uint64_t unit)
+{
+	const uint64_t slice = n < (1u << 20) ? n : (1u << 20);
+	const uint64_t off = (n - slice) / 2;
+	uint8_t *buf = malloc((size_t)slice);
+	if (!buf)
+		return UINT64_MAX;
+	taw_status st = in->read_at(in->ctx, off, buf, (size_t)slice);
+	uint64_t cost = UINT64_MAX;
+	taw_pred pr;
+	if (st == TAW_OK && taw_pred_init(&pr, c->profile, c->quant, c->model,
+	    c->model_size) == TAW_OK) {
+		taw_buf out = {0};
+		taw_rc_enc e;
+		taw_rc_enc_init(&e, &out);
+		for (uint64_t pos = 0; pos < slice; pos += unit) {
+			size_t len = (size_t)((slice - pos < unit)
+			    ? slice - pos : unit);
+			taw_pred_reset(&pr);
+			taw_pred_encode(&pr, &e, buf + pos, len);
+		}
+		taw_rc_enc_flush(&e);
+		if (!out.oom)
+			cost = (uint64_t)out.n + c->model_size;
+		taw_buf_free(&out);
+		taw_pred_free(&pr);
+	}
+	free(buf);
+	return cost;
+}
+
 taw_status taw_model_fit(const uint8_t *src, size_t n, size_t unit,
     const taw_params *p, taw_model_choice *out)
 {
@@ -873,7 +1323,6 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 		st = TAW_E_NOMEM;
 	else
 		st = fit_all(&F, tries, threads, p->gpu, dbg != nullptr);
-	size_t best = SIZE_MAX;
 	for (size_t ci = 0; st == TAW_OK && ci < tries; ci++) {
 		if ((st = F.st[ci]) != TAW_OK)
 			break;
@@ -884,16 +1333,87 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 			    cs[ci].s.hidden, cs[ci].s.sel1, cs[ci].s.sel2,
 			    cs[ci].quant, F.model[ci].n, F.bpb[ci] * 8.0,
 			    F.est[ci] / 8.0);
-		if (best == SIZE_MAX || F.est[ci] < F.est[best])
-			best = ci;
 	}
-	if (st == TAW_OK) {
-		out->profile = TAW_PROFILE_F32_STRICT_MIX;
-		out->quant = cs[best].quant;
-		out->model = F.model[best].p;
-		out->model_size = F.model[best].n;
-		F.model[best] = (taw_buf){0};
+
+	/* Fit the soft-gated MoE candidates on the same samples and keep the
+	 * profile (1 or 3) with the smaller estimated archive. */
+	p3cand pcs[16];
+	size_t npc = p3_enumerate(&geo, budget, p->weights, pcs, 16);
+	size_t ptries = dbg && strchr(dbg, 'a') ? npc
+	    : (effort[lv].cands > 4 ? effort[lv].cands : 4);
+	if (ptries > npc)
+		ptries = npc;
+	p3fit_job G = {0};
+	if (st == TAW_OK && npc && ptries) {
+		G = (p3fit_job){.cs = pcs, .sm = sm, .ns = ns,
+			.epochs = effort[lv].epochs, .n = n};
+		G.model = calloc(ptries, sizeof *G.model);
+		G.est = calloc(ptries, sizeof *G.est);
+		G.bpb = calloc(ptries, sizeof *G.bpb);
+		G.st = calloc(ptries, sizeof *G.st);
+		if (!G.model || !G.est || !G.bpb || !G.st)
+			st = TAW_E_NOMEM;
+		else
+			st = taw_parallel(threads, ptries, 0, p3fit_one,
+			    nullptr, &G);
 	}
+	/* Rank every fitted candidate by its real coded cost over the whole
+	 * input. The sample estimate omits the APM stages, so it can rank two
+	 * mixers differently from the range coder that actually writes them. */
+	uint64_t best_cost = UINT64_MAX;
+	bool best_is_p3 = false;
+	size_t best_i = SIZE_MAX;
+	for (size_t ci = 0; st == TAW_OK && ci < tries; ci++) {
+		if (F.st[ci] != TAW_OK)
+			continue;
+		taw_model_choice c = {.profile = TAW_PROFILE_F32_STRICT_MIX,
+			.quant = cs[ci].quant, .model = F.model[ci].p,
+			.model_size = F.model[ci].n};
+		uint64_t cost = real_cost(&c, in, n, unit);
+		if (dbg)
+			fprintf(stderr,
+			    "taw real p1[%zu] H=%u q=%u model=%zu cost=%llu\n",
+			    ci, cs[ci].s.hidden, cs[ci].quant,
+			    F.model[ci].n, (unsigned long long)cost);
+		if (cost < best_cost) {
+			best_cost = cost; best_is_p3 = false; best_i = ci;
+		}
+	}
+	for (size_t ci = 0; st == TAW_OK && ci < ptries; ci++) {
+		if (G.st[ci] != TAW_OK)
+			continue;
+		taw_model_choice c = {.profile = TAW_PROFILE_SOFT_GATED,
+			.quant = pcs[ci].quant, .model = G.model[ci].p,
+			.model_size = G.model[ci].n};
+		uint64_t cost = real_cost(&c, in, n, unit);
+		if (dbg)
+			fprintf(stderr,
+			    "taw real p3[%zu] K=%u H=%u q=%u model=%zu "
+			    "cost=%llu\n",
+			    ci, pcs[ci].s.K, pcs[ci].s.hidden, pcs[ci].quant,
+			    G.model[ci].n, (unsigned long long)cost);
+		if (cost < best_cost) {
+			best_cost = cost; best_is_p3 = true; best_i = ci;
+		}
+	}
+	if (st == TAW_OK && best_i != SIZE_MAX) {
+		if (best_is_p3) {
+			out->profile = TAW_PROFILE_SOFT_GATED;
+			out->quant = pcs[best_i].quant;
+			out->model = G.model[best_i].p;
+			out->model_size = G.model[best_i].n;
+			G.model[best_i] = (taw_buf){0};
+		} else {
+			out->profile = TAW_PROFILE_F32_STRICT_MIX;
+			out->quant = cs[best_i].quant;
+			out->model = F.model[best_i].p;
+			out->model_size = F.model[best_i].n;
+			F.model[best_i] = (taw_buf){0};
+		}
+	}
+	for (size_t ci = 0; G.model && ci < ptries; ci++)
+		taw_buf_free(&G.model[ci]);
+	free(G.model); free(G.est); free(G.bpb); free(G.st);
 	for (size_t ci = 0; F.model && ci < tries; ci++)
 		taw_buf_free(&F.model[ci]);
 	free(F.model);

@@ -72,7 +72,8 @@ static void random_access_mix(void)
 	void *arc = compress_seek_p(src, N, BS, TAW_PREDICTOR_MIX, &arc_n);
 	taw_info info;
 	CHECK(taw_read_info(arc, arc_n, &info) == TAW_OK);
-	CHECK(info.arith_profile == TAW_PROFILE_F32_STRICT_MIX);
+	CHECK(info.arith_profile == TAW_PROFILE_F32_STRICT_MIX ||
+	    info.arith_profile == TAW_PROFILE_SOFT_GATED);
 	taw_source mem;
 	taw_source_memory(&mem, arc, arc_n);
 	taw_seek *s;

@@ -144,6 +144,7 @@ static const char *profile_name(unsigned p)
 	switch (p) {
 	case 0: return "INT_ORDER0";
 	case 1: return "F32_STRICT_MIX";
+	case 3: return "SOFT_GATED";
 	default: return "?";
 	}
 }
