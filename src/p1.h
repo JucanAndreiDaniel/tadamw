@@ -211,12 +211,16 @@ p1_isa p1_isa_current(void);
 
 /* ---- the per-bit loop ------------------------------------------------------- */
 
-/* Profile 1 state. After the mixer, two adaptive APM (SSE) stages refine
- * the probability in the contexts c0 and c1:c0 (format.md §2.2.9). */
+/* Profile 1/12 state. After the mixer/tree, two adaptive APM (SSE) stages
+ * refine the probability in the contexts c0 and c1:c0 (format.md §2.2.9).
+ * p12_tree is defined in p12.h (which includes this header). */
 enum { P1_APM_RATE = 6 };
+struct p12_tree;
 struct taw_p1 {
 	p1_ctx ctx;
-	p1_net net;
+	p1_net net;            /* profile 1 */
+	struct p12_tree *tree; /* profile 12 */
+	bool is_tree;
 	uint16_t apm1[256 * 33];
 	uint16_t *apm2;    /* [65536 * 33] */
 	uint32_t a1, a2;   /* entries to update after the bit */

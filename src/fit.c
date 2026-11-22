@@ -19,6 +19,7 @@
 #include "format.h"
 #include "half.h"
 #include "p1.h"
+#include "p12.h"
 #include "quant.h"
 #include "taw_internal.h"
 
@@ -139,6 +140,7 @@ typedef struct {
 	const taw_source *in;
 	const uint8_t *view; /* the input itself, for memory sources */
 	uint64_t n, unit, total, want;
+	unsigned phase; /* 0: bits at stride want; 1: rotate through bitpos */
 	const p1_shape *geo;
 	sample *sm;
 	p1_ctx *ctx;    /* [threads], set up on first use */
@@ -819,6 +821,471 @@ static taw_status fit_all(fit_job *F, size_t tries, unsigned threads,
 	return st;
 }
 
+/* ---- profile 12: MDL-pruned input-specific context tree ------------------
+ * Adaptation of the tri-plane context-tree idea (Bai et al.,
+ * arXiv:2608.13897) to the bit stream: all leaves share a frozen hidden
+ * layer, each leaf has its own small output row, and a binary tree over
+ * cheap decoder-visible features selects one row per bit. Splits are kept
+ * only when the measured coding gain pays for the node and leaf bytes
+ * (minimum description length). Decoding is integer except for the two
+ * dot products, which follow profile 1's float conventions exactly. */
+
+typedef struct {
+	float w[P1_XPAD]; /* 0..H-1: hidden units; H: bias */
+} lmod;
+
+typedef struct {
+	float *x;         /* [nfit][d] hidden activations + 1.0 */
+	int16_t *st;      /* [nfit][P12_NF] stretched context inputs */
+	p1_sel_ctx *sc;   /* [nfit] */
+	uint8_t *bit;     /* [nfit] */
+	uint8_t *fv;      /* [nfit][P12_NFEAT] split features */
+	float *prob, *err; /* [nfit] scratch */
+	uint32_t *idx, *tmp; /* [nfit] work list and partition scratch */
+	size_t nfit;
+	unsigned d;       /* H + 1 */
+	uint8_t quant;
+	p12_tree *t;
+	float models[P12_MAX_LEAVES][P1_XPAD]; /* unquantized leaf rows */
+	float init[8][P1_XPAD]; /* profile-1-style per-bitpos output rows */
+	unsigned next_node, next_leaf;
+	unsigned leaf_max, depth_max, epochs;
+	float lr;
+	double penalty;
+} treejob;
+
+/* Quantize a leaf row exactly as put_row() does, then dequantize it exactly
+ * as the decoder does. Fitting therefore sees the bits the coder will see. */
+static void row_deq(const float *w, uint8_t quant, unsigned len, float *deq)
+{
+	uint8_t row[256];
+	const size_t n = (size_t)taw_quant_row_bytes(quant, len);
+	(void)n;
+	taw_quant_row_encode(quant, w, len, row);
+	(void)taw_quant_row_decode(quant, row, len, deq);
+}
+
+/* The hidden layer, computed with the same operations as p12_hidden(). */
+static void hidden_calc(const p1_net *n, unsigned sel1, const float *x,
+    unsigned h, const p1_sel_ctx *sc, float *out)
+{
+	const float *w1 = n->w1 +
+	    (size_t)p1_sel_value(sel1, sc) * P1_F * n->hpad;
+	for (unsigned j = 0; j < h; j++) {
+		float s[4] = {0, 0, 0, 0};
+		for (unsigned i = 0; i < P1_F; i++)
+			s[i & 3] += w1[j + i * n->hpad] * x[i];
+		float a = (s[0] + s[1]) + (s[2] + s[3]);
+		out[j] = a < -8.0f ? -8.0f : a > 8.0f ? 8.0f : a;
+	}
+}
+
+static void lm_train(treejob *F, lmod *m, const uint32_t *idx, size_t n,
+    int epochs, float lr)
+{
+	const unsigned d = F->d;
+	float mm[P1_XPAD] = {0}, vv[P1_XPAD] = {0};
+	float b1 = 0.9f, b2 = 0.999f, b1t = 1.0f, b2t = 1.0f;
+	for (int ep = 0; ep < epochs; ep++) {
+		float step = lr * (1.0f - 0.8f * (float)ep /
+		    (float)(epochs > 1 ? epochs - 1 : 1));
+		for (size_t k = 0; k < n; k++) {
+			const uint32_t j = idx[k];
+			const float *xx = F->x + (size_t)j * d;
+			float t = m->w[d - 1];
+			for (unsigned i = 0; i + 1 < d; i++)
+				t += m->w[i] * xx[i];
+			float p = (float)p1_squash((int32_t)t) * (1.0f / 65536.0f);
+			float e = p - (float)F->bit[j];
+			b1t *= b1;
+			b2t *= b2;
+			float c1 = 1.0f / (1.0f - b1t), c2 = 1.0f / (1.0f - b2t);
+			for (unsigned q = 0; q < d; q++) {
+				float g = e * xx[q];
+				mm[q] = b1 * mm[q] + (1.0f - b1) * g;
+				vv[q] = b2 * vv[q] + (1.0f - b2) * g * g;
+				m->w[q] -= step * (mm[q] * c1) /
+				    (fsqrt(vv[q] * c2) + 1e-8f);
+			}
+		}
+	}
+}
+
+static double leaf_bits(const treejob *F, const lmod *m,
+    const uint32_t *idx, size_t n)
+{
+	const float *ct = cost_tab();
+	if (!ct)
+		return 8.0 * (double)n;
+	float deq[P1_XPAD];
+	row_deq(m->w, F->quant, F->d, deq);
+	double sum = 0.0;
+	for (size_t k = 0; k < n; k++) {
+		const uint32_t j = idx[k];
+		uint32_t p = p1_squash(p12_leaf_t(deq,
+		    F->x + (size_t)j * F->d, F->d - 1));
+		sum += ct[F->bit[j] ? p : 65536u - p];
+	}
+	return sum;
+}
+
+static void prep(treejob *F, const uint32_t *idx, size_t n, const lmod *m)
+{
+	float deq[P1_XPAD];
+	row_deq(m->w, F->quant, F->d, deq);
+	for (size_t k = 0; k < n; k++) {
+		const uint32_t j = idx[k];
+		int32_t z = p12_leaf_t(deq, F->x + (size_t)j * F->d, F->d - 1);
+		float p = (float)p1_squash(z) * (1.0f / 65536.0f);
+		F->prob[j] = p;
+		F->err[j] = p - (float)F->bit[j];
+	}
+}
+
+/* Cross-entropy keeping the direction of a trained row but choosing its
+ * overall magnitude on the samples. Long Adam runs saturate the logit; a
+ * calibrated scale recovers the probability quality of a short fit. */
+static void lm_calibrate(const treejob *F, lmod *m, const uint32_t *idx,
+    size_t n)
+{
+	lmod best = *m;
+	double bb = leaf_bits(F, m, idx, n);
+	for (float sc = 0.5f; sc >= 0.002f; sc *= 0.5f) {
+		lmod t = *m;
+		for (unsigned q = 0; q < F->d; q++)
+			t.w[q] *= sc;
+		double b = leaf_bits(F, &t, idx, n);
+		if (b < bb) {
+			bb = b;
+			best = t;
+		}
+	}
+	*m = best;
+}
+
+typedef struct { unsigned f; uint8_t thr; double gain; } split_best;
+
+/* One Newton step with a diagonal Hessian estimates the cross-entropy drop
+ * of the best child models. This only ranks splits; the keep decision uses
+ * the exact MDL cost after fitting and quantization. */
+static split_best best_split(const treejob *F, const uint32_t *idx, size_t n)
+{
+	const unsigned d = F->d;
+	split_best best = {.f = 0, .thr = 0, .gain = 0.0};
+	const char *envf = getenv("TAW_P12_FEATURE");
+	unsigned fmax = envf ? (unsigned)atoi(envf) + 1u : P12_NFEAT;
+	unsigned fmin = envf ? (unsigned)atoi(envf) : 0u;
+	for (unsigned f = fmin; f < fmax; f++) {
+		uint8_t present[256] = {0};
+		for (size_t k = 0; k < n; k++)
+			present[F->fv[(size_t)idx[k] * P12_NFEAT + f]] = 1;
+		uint8_t vals[256];
+		unsigned nv = 0;
+		for (unsigned v = 0; v < 256; v++)
+			if (present[v])
+				vals[nv++] = (uint8_t)v;
+		if (nv < 2)
+			continue;
+		unsigned ntry = nv - 1 < 4 ? nv - 1 : 4;
+		for (unsigned a = 0; a < ntry; a++) {
+			unsigned kth = 1 + (unsigned)((uint64_t)a * (nv - 1) / ntry);
+			uint8_t thr = vals[kth];
+			float gl[P1_XPAD] = {0}, hl[P1_XPAD] = {0};
+			float gr[P1_XPAD] = {0}, hr[P1_XPAD] = {0};
+			for (size_t k = 0; k < n; k++) {
+				const uint32_t j = idx[k];
+				const float *xx = F->x + (size_t)j * d;
+				float e = F->err[j], p = F->prob[j];
+				float h = p * (1.0f - p) + 1e-7f;
+				bool left = F->fv[(size_t)j * P12_NFEAT + f] < thr;
+				float *g = left ? gl : gr;
+				float *hh = left ? hl : hr;
+				for (unsigned q = 0; q < d; q++) {
+					float xd = xx[q];
+					g[q] += e * xd;
+					hh[q] += h * xd * xd;
+				}
+			}
+			double gain = 0.0;
+			for (unsigned q = 0; q < d; q++)
+				gain += 0.5 * ((double)gl[q] * gl[q] / hl[q] +
+				    (double)gr[q] * gr[q] / hr[q]);
+			gain *= 1.4426950408889634; /* nats -> bits */
+			if (gain > best.gain)
+				best = (split_best){.f = f, .thr = thr, .gain = gain};
+		}
+	}
+	return best;
+}
+
+/* The first three levels are a fixed balanced bit-position tree. They
+ * reproduce profile 1's per-bitpos output sets, so the MDL tree starts from
+ * a proven model; only deeper splits are data-adaptive and MDL-pruned. */
+static unsigned tree_grow(treejob *F, uint32_t *idx, size_t n, unsigned depth,
+    unsigned bitprefix, const lmod *m)
+{
+	unsigned ni = F->next_node++;
+	bool forced = depth < 3;
+	if (getenv("TAW_FIT_DEBUG"))
+		fprintf(stderr, " tree_grow ni=%u depth=%u forced=%d n=%zu fv0=%u,%u,%u,%u sc0=%u,%u,%u\n",
+		    ni, depth, (int)forced, n, F->fv[0], F->fv[P12_NFEAT],
+		    F->fv[2 * P12_NFEAT], F->fv[3 * P12_NFEAT],
+		    F->sc[0].bitpos, F->sc[1].bitpos, F->sc[2].bitpos);
+	unsigned thr = forced ? (bitprefix | (1u << (2 - depth))) : 0;
+	split_best best = {.f = P12_F_BITPOS, .thr = (uint8_t)thr,
+		.gain = 1e30};
+	if (!forced) {
+		double cost = 8.0 * (P12_NODE_BYTES +
+		    ((F->quant == TAW_QUANT_Q8 ? 2u + F->d : 2u * F->d))) *
+		    F->penalty;
+		if (n >= 256 && depth < F->depth_max &&
+		    F->next_leaf < F->leaf_max) {
+			prep(F, idx, n, m);
+			best = best_split(F, idx, n);
+			if (getenv("TAW_FIT_DEBUG"))
+				fprintf(stderr,
+				    " grow d=%u n=%zu f=%u thr=%u gain=%.1f cost=%.1f\n",
+				    depth, n, best.f, best.thr, best.gain, cost);
+			best.gain -= cost;
+		} else
+			best.gain = 0.0;
+	}
+	if (best.gain > 0.0) {
+		size_t nl = 0;
+		for (size_t k = 0; k < n; k++)
+			nl += F->fv[(size_t)idx[k] * P12_NFEAT + best.f] < best.thr;
+		size_t nr = n - nl, l = 0, r = nl;
+		for (size_t k = 0; k < n; k++) {
+			uint32_t j = idx[k];
+			if (F->fv[(size_t)j * P12_NFEAT + best.f] < best.thr)
+				F->tmp[l++] = j;
+			else
+				F->tmp[r++] = j;
+		}
+		if (getenv("TAW_FIT_DEBUG"))
+			fprintf(stderr, "  partition f=%u thr=%u nl=%zu nr=%zu\n",
+			    best.f, best.thr, nl, nr);
+		if (nl >= 64 && nr >= 64) {
+			memcpy(idx, F->tmp, n * sizeof *idx);
+			lmod ml, mr;
+			if (forced) {
+				memcpy(&ml, F->init[bitprefix], sizeof ml);
+				memcpy(&mr, F->init[bitprefix | (1u << (2 - depth))],
+				    sizeof mr);
+			} else {
+				ml = *m;
+				mr = *m;
+				lm_train(F, &ml, idx, nl, (int)F->epochs, F->lr);
+				lm_train(F, &mr, idx + nl, nr, (int)F->epochs,
+				    F->lr);
+				lm_calibrate(F, &ml, idx, nl);
+				lm_calibrate(F, &mr, idx + nl, nr);
+			}
+			F->t->node[ni] = (p12_node){.feat = (uint8_t)best.f,
+				.thr = best.thr, .left = 0, .right = 0};
+			unsigned lc = tree_grow(F, idx, nl, depth + 1, bitprefix,
+			    &ml);
+			unsigned rc = tree_grow(F, idx + nl, nr, depth + 1,
+			    bitprefix | (1u << (2 - depth)), &mr);
+			F->t->node[ni].left = (uint8_t)lc;
+			F->t->node[ni].right = (uint8_t)rc;
+			return ni;
+		}
+	}
+	unsigned li = F->next_leaf++;
+	memcpy(F->models[li], m->w, F->d * sizeof *m->w);
+	F->t->node[ni] = (p12_node){.feat = 0xFF, .thr = 0,
+		.left = (uint8_t)li, .right = 0};
+	return ni;
+}
+
+static double tree_full_bits(const p12_tree *t, const p1_net *pnet,
+    const sample *sm, size_t ns)
+{
+	const float *ct = cost_tab();
+	if (!ct)
+		return 8.0 * (double)ns;
+	double sum = 0.0;
+	for (size_t k = 0; k < ns; k++) {
+		alignas(32) float xv[P1_XPAD];
+		sample_x(&sm[k], xv);
+		const p1_sel_ctx sc = sample_sc(&sm[k]);
+		float h[P1_HMAX] = {0};
+		hidden_calc(pnet, t->sel1, xv, t->h, &sc, h);
+		int16_t st[P12_NF];
+		for (unsigned i = 0; i < P12_NF; i++)
+			st[i] = sm[k].st[i];
+		uint32_t p = p1_squash(p12_eval_h(t, h, &sc, st));
+		sum += ct[sm[k].bit ? p : 65536u - p];
+	}
+	return sum;
+}
+
+static taw_status fit_tree(const p1_shape *geo, const sample *sm, size_t ns,
+    unsigned leaf_max, unsigned depth_max, double penalty, uint8_t quant,
+    unsigned hidden, unsigned sel1, int mix_epochs, taw_buf *out,
+    double *bpb)
+{
+	if (leaf_max > P12_MAX_LEAVES || hidden < 1 || hidden > P12_HMAX)
+		return TAW_E_ARG;
+	size_t nfit = ns < (1u << 17) ? ns : (1u << 17);
+	if (!nfit)
+		return TAW_E_ARG;
+	const unsigned d = hidden + 1;
+	treejob F = {0};
+	F.nfit = nfit;
+	F.d = d;
+	F.quant = quant;
+	F.leaf_max = leaf_max;
+	F.depth_max = depth_max;
+	F.penalty = penalty;
+	F.epochs = 30;
+	F.lr = 0.01f;
+	if (getenv("TAW_P12_EPOCHS"))
+		F.epochs = (unsigned)atoi(getenv("TAW_P12_EPOCHS"));
+	if (getenv("TAW_P12_LR"))
+		F.lr = (float)atof(getenv("TAW_P12_LR"));
+
+	F.x = malloc(nfit * P1_XPAD * sizeof *F.x);
+	F.st = malloc(nfit * P12_NF * sizeof *F.st);
+	F.sc = malloc(nfit * sizeof *F.sc);
+	F.bit = malloc(nfit);
+	F.fv = malloc(nfit * P12_NFEAT);
+	F.prob = malloc(nfit * sizeof *F.prob);
+	F.err = malloc(nfit * sizeof *F.err);
+	F.idx = malloc(nfit * sizeof *F.idx);
+	F.tmp = malloc(nfit * sizeof *F.tmp);
+	F.t = calloc(1, sizeof *F.t);
+	taw_buf w1b = {0}, leafb = {0}, pm = {0};
+	p1_net pnet = {0};
+	taw_status st = TAW_E_NOMEM;
+	if (!F.x || !F.st || !F.sc || !F.bit || !F.fv || !F.prob || !F.err ||
+	    !F.idx || !F.tmp || !F.t)
+		goto done;
+
+	for (size_t i = 0; i < nfit; i++) {
+		size_t j = (size_t)((uint64_t)i * ns / nfit);
+		const sample *s = &sm[j];
+		F.idx[i] = (uint32_t)i;
+		F.bit[i] = s->bit;
+		F.sc[i] = sample_sc(s);
+		if (getenv("TAW_FIT_DEBUG") && i < 4)
+			fprintf(stderr, " sample i=%zu j=%zu c0=%u c1=%u bp=%u\n",
+			    i, j, s->c0, s->c1, F.sc[i].bitpos);
+		memcpy(F.st + i * P12_NF, s->st, P12_NF * sizeof *F.st);
+		for (unsigned f = 0; f < P12_NFEAT; f++)
+			F.fv[i * P12_NFEAT + f] =
+			    (uint8_t)p12_feature(f, &F.sc[i], s->st);
+	}
+
+	/* Train the shared hidden layer with the existing mixer trainer. */
+	unsigned base_sel = P1_SEL_BITPOS;
+	if (getenv("TAW_P12_BASESEL"))
+		base_sel = (unsigned)atoi(getenv("TAW_P12_BASESEL"));
+	p1_shape sh = *geo;
+	sh.sel1 = (uint8_t)sel1;
+	sh.sel2 = (uint8_t)base_sel;
+	sh.hidden = (uint8_t)hidden;
+	tnet net;
+	st = tnet_init(&net, &sh, 0x7A57A11ull + 12);
+	if (st != TAW_OK)
+		goto done;
+	tnet_train(&net, sm, ns, mix_epochs, 0xC0FFEEull + 12);
+	/* The eight bit-position output rows become the tree's base experts. */
+	for (unsigned c = 0; c < 8; c++) {
+		for (unsigned q = 0; q < d; q++)
+			F.init[c][q] = 0.0f;
+		if (base_sel == P1_SEL_BITPOS) {
+			const float *row = net.w + net.n1 + (size_t)c * net.row2;
+			for (unsigned q = 0; q < d; q++)
+				F.init[c][q] = row[q];
+		} else {
+			for (size_t s = 0; s < net.s2; s++) {
+				const float *row = net.w + net.n1 + s * net.row2;
+				for (unsigned q = 0; q < d; q++)
+					F.init[c][q] += row[q] / (float)net.s2;
+			}
+		}
+	}
+	if (getenv("TAW_FIT_DEBUG"))
+		fprintf(stderr, " tnet w1[0..5]=%f %f %f %f %f %f row1=%zu\n",
+		    net.w[0], net.w[1], net.w[2], net.w[3], net.w[4], net.w[5],
+		    net.row1);
+	for (size_t set = 0; set < net.s1; set++)
+		for (unsigned j = 0; j < hidden; j++)
+			put_row(&w1b, quant, net.w + set * net.row1 + j * P1_F,
+			    P1_F);
+	tnet_free(&net);
+	if (w1b.oom)
+		goto done;
+
+	/* Load that first layer so hidden activations use exact decoder math. */
+	uint8_t head[P1_MODEL_HEAD];
+	p1_shape shtmp = sh;
+	shtmp.sel2 = P1_SEL_NONE; /* only one dummy output row is appended */
+	p1_head_write(head, &shtmp);
+	taw_buf_put(&pm, head, sizeof head);
+	taw_buf_put(&pm, w1b.p, w1b.n);
+	float zero[P1_XPAD] = {0};
+	put_row(&pm, quant, zero, d);
+	st = p1_net_load(&pnet, quant, pm.p, pm.n);
+	if (st != TAW_OK)
+		goto done;
+
+	for (size_t i = 0; i < nfit; i++) {
+		alignas(32) float xv[P1_XPAD] = {0};
+		for (unsigned q = 0; q < P12_NF; q++)
+			xv[q] = (float)F.st[i * P12_NF + q] * (1.0f / 256.0f);
+		xv[P1_IN_BIAS] = 1.0f;
+		float h[P1_HMAX] = {0};
+		hidden_calc(&pnet, sel1, xv, hidden, &F.sc[i], h);
+		for (unsigned q = 0; q < hidden; q++)
+			F.x[i * d + q] = h[q];
+		F.x[i * d + hidden] = 1.0f;
+	}
+
+	if (getenv("TAW_FIT_DEBUG"))
+		fprintf(stderr, " hidden[0..7]=%f %f %f %f %f %f %f %f bit=%u\n",
+		    F.x[0], F.x[1], F.x[2], F.x[3], F.x[4], F.x[5], F.x[6],
+		    F.x[7], F.bit[0]);
+	F.t->geo = *geo;
+	F.t->h = hidden;
+	F.t->sel1 = sel1;
+	lmod root;
+	memcpy(&root, F.init[0], sizeof root);
+	tree_grow(&F, F.idx, nfit, 0, 0, &root);
+	F.t->nnodes = F.next_node;
+	F.t->nleaves = F.next_leaf;
+	if (getenv("TAW_FIT_DEBUG"))
+		fprintf(stderr, " built tree nodes=%u leaves=%u\n", F.next_node,
+		    F.next_leaf);
+	for (unsigned i = 0; i < F.t->nleaves; i++)
+		row_deq(F.models[i], quant, d, F.t->w2[i]);
+	for (unsigned i = 0; i < F.t->nleaves; i++)
+		put_row(&leafb, quant, F.models[i], d);
+	if (leafb.oom)
+		goto done;
+	p12_serialize(F.t, w1b.p, w1b.n, leafb.p, leafb.n, out);
+	*bpb = tree_full_bits(F.t, &pnet, sm, ns) / (double)ns;
+	st = out->oom ? TAW_E_NOMEM : TAW_OK;
+done:
+	free(pm.p);
+	free(w1b.p);
+	free(leafb.p);
+	p1_net_free(&pnet);
+	free(F.t);
+	free(F.x);
+	free(F.st);
+	free(F.sc);
+	free(F.bit);
+	free(F.fv);
+	free(F.prob);
+	free(F.err);
+	free(F.idx);
+	free(F.tmp);
+	return st;
+}
+
 taw_status taw_model_fit(const uint8_t *src, size_t n, size_t unit,
     const taw_params *p, taw_model_choice *out)
 {
@@ -835,7 +1302,8 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 	if (p->predictor == TAW_PREDICTOR_ORDER0)
 		return TAW_OK;
 	const uint64_t n = in->size;
-	const bool forced = p->predictor == TAW_PREDICTOR_MIX;
+	const bool force_mix = p->predictor == TAW_PREDICTOR_MIX;
+	const bool force_tree = p->predictor == TAW_PREDICTOR_MDL;
 	const uint64_t budget = n / 32;
 	if (unit == 0 || unit > n)
 		unit = n;
@@ -843,9 +1311,12 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 	p1_shape geo = {0};
 	geometry((size_t)unit, &geo);
 	cand cs[1024];
-	size_t ncand = enumerate(&geo, budget, p->weights, (size_t)n, cs, 1024);
-	if (ncand == 0)
-		return forced ? TAW_E_ARG : TAW_OK;
+	size_t ncand = 0;
+	if (!force_tree) {
+		ncand = enumerate(&geo, budget, p->weights, (size_t)n, cs, 1024);
+		if (ncand == 0)
+			return force_mix ? TAW_E_ARG : TAW_OK;
+	}
 
 	const int lv = p->level;
 	const unsigned threads = p->threads ? p->threads : 1;
@@ -857,49 +1328,137 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 		return st;
 
 	const char *dbg = getenv("TAW_FIT_DEBUG");
-	size_t tries = effort[lv].cands;
-	if (dbg && strchr(dbg, 'a'))
-		tries = ncand;
-	if (tries > ncand)
-		tries = ncand;
+	taw_model_choice best = {0};
+	double best_est = 1e300;
+	taw_status st_mix = TAW_OK;
 
-	fit_job F = {.cs = cs, .sm = sm, .ns = ns, .epochs = effort[lv].epochs,
-		.n = n};
-	F.model = calloc(tries, sizeof *F.model);
-	F.est = calloc(tries, sizeof *F.est);
-	F.bpb = calloc(tries, sizeof *F.bpb);
-	F.st = calloc(tries, sizeof *F.st);
-	if (!F.model || !F.est || !F.bpb || !F.st)
-		st = TAW_E_NOMEM;
-	else
-		st = fit_all(&F, tries, threads, p->gpu, dbg != nullptr);
-	size_t best = SIZE_MAX;
-	for (size_t ci = 0; st == TAW_OK && ci < tries; ci++) {
-		if ((st = F.st[ci]) != TAW_OK)
-			break;
-		if (dbg)
-			fprintf(stderr,
-			    "taw fit: H=%u sel1=%u sel2=%u q=%u model=%zu "
-			    "bpc=%.4f est=%.0f B\n",
-			    cs[ci].s.hidden, cs[ci].s.sel1, cs[ci].s.sel2,
-			    cs[ci].quant, F.model[ci].n, F.bpb[ci] * 8.0,
-			    F.est[ci] / 8.0);
-		if (best == SIZE_MAX || F.est[ci] < F.est[best])
-			best = ci;
+	if (!force_tree) {
+		size_t tries = effort[lv].cands;
+		if (dbg && strchr(dbg, 'a'))
+			tries = ncand;
+		if (tries > ncand)
+			tries = ncand;
+
+		fit_job F = {.cs = cs, .sm = sm, .ns = ns,
+			.epochs = effort[lv].epochs, .n = n};
+		F.model = calloc(tries, sizeof *F.model);
+		F.est = calloc(tries, sizeof *F.est);
+		F.bpb = calloc(tries, sizeof *F.bpb);
+		F.st = calloc(tries, sizeof *F.st);
+		if (!F.model || !F.est || !F.bpb || !F.st)
+			st_mix = TAW_E_NOMEM;
+		else
+			st_mix = fit_all(&F, tries, threads, p->gpu,
+			    dbg != nullptr);
+		size_t bi = SIZE_MAX;
+		for (size_t ci = 0; st_mix == TAW_OK && ci < tries; ci++) {
+			if ((st_mix = F.st[ci]) != TAW_OK)
+				break;
+			if (dbg)
+				fprintf(stderr,
+				    "taw fit: H=%u sel1=%u sel2=%u q=%u "
+				    "model=%zu bpc=%.4f est=%.0f B\n",
+				    cs[ci].s.hidden, cs[ci].s.sel1,
+				    cs[ci].s.sel2, cs[ci].quant,
+				    F.model[ci].n, F.bpb[ci] * 8.0,
+				    F.est[ci] / 8.0);
+			if (bi == SIZE_MAX || F.est[ci] < F.est[bi])
+				bi = ci;
+		}
+		if (st_mix == TAW_OK) {
+			best = (taw_model_choice){
+				.profile = TAW_PROFILE_F32_STRICT_MIX,
+				.quant = cs[bi].quant,
+				.model = F.model[bi].p,
+				.model_size = F.model[bi].n,
+			};
+			best_est = F.est[bi];
+			F.model[bi] = (taw_buf){0};
+		}
+		for (size_t ci = 0; F.model && ci < tries; ci++)
+			taw_buf_free(&F.model[ci]);
+		free(F.model);
+		free(F.est);
+		free(F.bpb);
+		free(F.st);
 	}
+
+	/* A forced mixer must not be displaced by the tree, and tiny inputs
+	 * may not have room for a tree model at all. */
+	if (force_mix) {
+		free(sm);
+		if (st_mix != TAW_OK)
+			return st_mix;
+		if (best.model)
+			*out = best;
+		return TAW_OK;
+	}
+
+	/* Fit the MDL tree and compare its MDL to the best mixer. */
+	unsigned leaf_max = lv <= 3 ? 16 : lv <= 6 ? 24 : 32;
+	unsigned depth_max = 6;
+	double penalty = 1.0;
+	if (getenv("TAW_P12_LEAVES"))
+		leaf_max = (unsigned)atoi(getenv("TAW_P12_LEAVES"));
+	if (getenv("TAW_P12_PENALTY"))
+		penalty = atof(getenv("TAW_P12_PENALTY"));
+	uint8_t tquant = p->weights == TAW_WEIGHTS_F16 ? TAW_QUANT_F16
+	    : TAW_QUANT_Q8;
+	unsigned hidden = 12, sel1 = P1_SEL_NONE;
+	int mix_epochs = effort[lv].epochs;
+	if (getenv("TAW_P12_H"))
+		hidden = (unsigned)atoi(getenv("TAW_P12_H"));
+	if (getenv("TAW_P12_SEL1"))
+		sel1 = (unsigned)atoi(getenv("TAW_P12_SEL1"));
+	if (getenv("TAW_P12_MIXEPOCHS"))
+		mix_epochs = atoi(getenv("TAW_P12_MIXEPOCHS"));
+	/* The format caps the model at raw/32 bytes; shrink the shared
+	 * hidden layer until the smallest possible tree fits. */
+	const unsigned rw1 = tquant == TAW_QUANT_Q8 ? 28u : 52u;
+	while (hidden > 2 && P12_MODEL_HEAD +
+	    (uint64_t)p1_sel_size[sel1] * hidden * rw1 + P12_NODE_BYTES +
+	    (tquant == TAW_QUANT_Q8 ? 2u + hidden : 2u * (hidden + 1)) > budget)
+		hidden >>= 1;
+	if (P12_MODEL_HEAD + (uint64_t)p1_sel_size[sel1] * hidden * rw1 +
+	    P12_NODE_BYTES + (tquant == TAW_QUANT_Q8 ? 2u + hidden
+	    : 2u * (hidden + 1)) > budget && sel1 != P1_SEL_NONE)
+		sel1 = P1_SEL_NONE;
+	taw_buf tb = {0};
+	double tree_bpb = 8.0;
+	st = fit_tree(&geo, sm, ns, leaf_max, depth_max, penalty, tquant,
+	    hidden, sel1, mix_epochs, &tb, &tree_bpb);
 	if (st == TAW_OK) {
-		out->profile = TAW_PROFILE_F32_STRICT_MIX;
-		out->quant = cs[best].quant;
-		out->model = F.model[best].p;
-		out->model_size = F.model[best].n;
-		F.model[best] = (taw_buf){0};
+		double tree_est = tree_bpb * 8.0 * (double)n + 8.0 * (double)tb.n;
+		if (dbg) {
+			fprintf(stderr,
+			    "taw fit: tree H=%u sel1=%u q=%u model=%zu "
+			    "bpc=%.4f est=%.0f B\n",
+			    hidden, sel1, tquant, tb.n, tree_bpb * 8.0,
+			    tree_est / 8.0);
+		}
+		if (tb.n > budget)
+			st = st_mix == TAW_OK ? TAW_OK : TAW_E_NOMEM;
+		else if (!force_mix && (force_tree || tree_est < best_est)) {
+			free(best.model);
+			best = (taw_model_choice){
+				.profile = TAW_PROFILE_MDL_TREE,
+				.quant = tquant,
+				.model = tb.p,
+				.model_size = tb.n,
+			};
+			tb = (taw_buf){0};
+		}
 	}
-	for (size_t ci = 0; F.model && ci < tries; ci++)
-		taw_buf_free(&F.model[ci]);
-	free(F.model);
-	free(F.est);
-	free(F.bpb);
-	free(F.st);
+	taw_buf_free(&tb);
 	free(sm);
-	return st;
+	if (st != TAW_OK)
+		return st;
+	if (force_tree && best.model == nullptr)
+		return TAW_E_ARG;
+	if (!force_mix && !force_tree && best.model == nullptr &&
+	    st_mix != TAW_OK)
+		return st_mix;
+	if (best.model)
+		*out = best;
+	return TAW_OK;
 }

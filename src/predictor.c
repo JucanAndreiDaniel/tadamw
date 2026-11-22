@@ -1,10 +1,12 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* Arithmetic profiles: 0 = INT_ORDER0 (placeholder), 1 = F32_STRICT_MIX. */
+/* Arithmetic profiles: 0 = INT_ORDER0 (placeholder), 1 = F32_STRICT_MIX,
+ * 12 = MDL_TREE (input-specific context tree of linear experts). */
 #include <stdlib.h>
 #include <string.h>
 
 #include "format.h"
 #include "p1.h"
+#include "p12.h"
 #include "taw_internal.h"
 
 enum { APM_RATE = P1_APM_RATE };
@@ -42,6 +44,7 @@ bool taw_pred_supported(uint8_t profile, uint8_t quant)
 	switch (profile) {
 	case TAW_PROFILE_INT_ORDER0: return quant == TAW_QUANT_NONE;
 	case TAW_PROFILE_F32_STRICT_MIX: return p1_quant_supported(quant);
+	case TAW_PROFILE_MDL_TREE: return p1_quant_supported(quant);
 	default: return false;
 	}
 }
@@ -69,11 +72,27 @@ taw_status taw_pred_init(taw_pred *pr, uint8_t profile, uint8_t quant,
 		free(m);
 		return TAW_E_NOMEM;
 	}
-	taw_status st = p1_net_load(&m->net, quant, model, model_size);
+	m->is_tree = profile == TAW_PROFILE_MDL_TREE;
+	taw_status st;
+	if (m->is_tree) {
+		m->tree = calloc(1, sizeof *m->tree);
+		if (!m->tree) {
+			free(m->apm2);
+			free(m);
+			return TAW_E_NOMEM;
+		}
+		st = p12_load(m->tree, quant, model, model_size);
+	} else
+		st = p1_net_load(&m->net, quant, model, model_size);
 	if (st == TAW_OK) {
-		st = p1_ctx_init(&m->ctx, &m->net.s);
-		if (st != TAW_OK)
-			p1_net_free(&m->net);
+		const p1_shape *shape = m->is_tree ? &m->tree->geo : &m->net.s;
+		st = p1_ctx_init(&m->ctx, shape);
+		if (st != TAW_OK) {
+			if (m->is_tree)
+				p12_free(m->tree);
+			else
+				p1_net_free(&m->net);
+		}
 	}
 	if (st != TAW_OK) {
 		free(m->apm2);
@@ -89,7 +108,11 @@ void taw_pred_free(taw_pred *pr)
 {
 	if (pr->p1) {
 		p1_ctx_free(&pr->p1->ctx);
-		p1_net_free(&pr->p1->net);
+		if (pr->p1->is_tree) {
+			p12_free(pr->p1->tree);
+			free(pr->p1->tree);
+		} else
+			p1_net_free(&pr->p1->net);
 		free(pr->p1->apm2);
 		free(pr->p1);
 		pr->p1 = nullptr;
@@ -130,7 +153,9 @@ static inline uint32_t p1_p16(struct taw_p1 *m)
 	x[P1_IN_BIAS] = 1.0f;
 	for (unsigned i = P1_F; i < P1_XPAD; i++)
 		x[i] = 0.0f;
-	const uint32_t p = p1_squash(p1_net_eval(&m->net, x, &sc));
+	const uint32_t p = p1_squash(m->is_tree
+	    ? p12_eval(m->tree, x, &sc)
+	    : p1_net_eval(&m->net, x, &sc));
 	const int32_t s12 = p1_stretch_tab[p >> 4];
 	const uint32_t q1 = apm_p(m->apm1, sc.c0, s12, &m->a1);
 	const uint32_t q2 =
@@ -153,7 +178,7 @@ void taw_pred_encode(taw_pred *pr, taw_rc_enc *e, const uint8_t *src,
 	if (pr->p1) {
 		struct taw_p1 *m = pr->p1;
 #if TAW_X86_SIMD
-		if (m->ctx.avx2) {
+		if (m->ctx.avx2 && !m->is_tree) {
 			p1_encode_avx2(m, e, src, n);
 			return;
 		}
@@ -188,7 +213,7 @@ void taw_pred_skip(taw_pred *pr, const uint8_t *src, size_t n)
 		/* the same predictions and updates as coding, without a coder */
 		struct taw_p1 *m = pr->p1;
 #if TAW_X86_SIMD
-		if (m->ctx.avx2) {
+		if (m->ctx.avx2 && !m->is_tree) {
 			p1_skip_avx2(m, src, n);
 			return;
 		}
@@ -212,7 +237,7 @@ void taw_pred_decode(taw_pred *pr, taw_rc_dec *d, uint8_t *dst, size_t n)
 	if (pr->p1) {
 		struct taw_p1 *m = pr->p1;
 #if TAW_X86_SIMD
-		if (m->ctx.avx2) {
+		if (m->ctx.avx2 && !m->is_tree) {
 			p1_decode_avx2(m, d, dst, n);
 			return;
 		}

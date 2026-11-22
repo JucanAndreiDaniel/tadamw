@@ -9,6 +9,7 @@
 #include "half.h"
 #include "header.h"
 #include "p1.h"
+#include "p12.h"
 #include "quant.h"
 #include "taw_internal.h"
 #include "testdata.h"
@@ -478,6 +479,163 @@ static void golden(void)
 	p1_isa_force(-1);
 }
 
+/* ---- profile 12: MDL_TREE ---------------------------------------------------- */
+
+static taw_buf build_tree_model(uint8_t quant)
+{
+	p12_tree t = {0};
+	t.geo = geo;
+	t.h = 4;
+	t.sel1 = P1_SEL_BITPOS;
+	t.nnodes = 5;
+	t.nleaves = 3;
+	t.node[0] = (p12_node){.feat = P12_F_BITPOS, .thr = 4,
+	    .left = 1, .right = 2};
+	t.node[1] = (p12_node){.feat = 0xFF, .left = 0};
+	t.node[2] = (p12_node){.feat = P12_F_MATCH, .thr = 2,
+	    .left = 3, .right = 4};
+	t.node[3] = (p12_node){.feat = 0xFF, .left = 1};
+	t.node[4] = (p12_node){.feat = 0xFF, .left = 2};
+
+	taw_buf w1 = {0}, leaves = {0}, b = {0};
+	uint64_t r = 31337;
+	for (size_t set = 0; set < p1_sel_size[t.sel1]; set++)
+		for (unsigned j = 0; j < t.h; j++)
+			put_row(&w1, quant, &r, 0.3f, P1_F);
+	for (unsigned i = 0; i < t.nleaves; i++)
+		put_row(&leaves, quant, &r, 0.25f, t.h + 1);
+	REQUIRE(!w1.oom && !leaves.oom);
+	p12_serialize(&t, w1.p, w1.n, leaves.p, leaves.n, &b);
+	REQUIRE(!b.oom);
+	REQUIRE(b.n == p12_model_size(p1_sel_size[t.sel1], t.h, t.nnodes,
+	    t.nleaves, quant));
+	taw_buf_free(&w1);
+	taw_buf_free(&leaves);
+	return b;
+}
+
+static taw_status tree_load(const taw_buf *b, uint8_t quant)
+{
+	taw_pred pr;
+	taw_status st = taw_pred_init(&pr, TAW_PROFILE_MDL_TREE, quant,
+	    b->p, b->n);
+	taw_pred_free(&pr);
+	return st;
+}
+
+static taw_status tree_load_patched(const taw_buf *b, uint8_t quant,
+    size_t off, uint8_t v)
+{
+	uint8_t saved = b->p[off];
+	b->p[off] = v;
+	taw_status st = tree_load(b, quant);
+	b->p[off] = saved;
+	return st;
+}
+
+static void tree_validation(void)
+{
+	taw_buf mb = build_tree_model(TAW_QUANT_Q8);
+	CHECK(tree_load(&mb, TAW_QUANT_Q8) == TAW_OK);
+	CHECK(tree_load(&mb, TAW_QUANT_NONE) == TAW_E_UNSUPPORTED);
+	CHECK(tree_load(&mb, TAW_QUANT_BF16) == TAW_E_UNSUPPORTED);
+	CHECK(tree_load_patched(&mb, TAW_QUANT_Q8, 3, P12_HMAX + 1) ==
+	    TAW_E_FORMAT);
+	CHECK(tree_load_patched(&mb, TAW_QUANT_Q8, 4, P1_SEL_COUNT) ==
+	    TAW_E_FORMAT);
+	CHECK(tree_load_patched(&mb, TAW_QUANT_Q8, 5, 4) == TAW_E_FORMAT);
+	CHECK(tree_load_patched(&mb, TAW_QUANT_Q8, 7, 1) == TAW_E_FORMAT);
+	CHECK(tree_load_patched(&mb, TAW_QUANT_Q8, P12_MODEL_HEAD +
+	    p1_sel_size[P1_SEL_BITPOS] * 4 * 28, P12_NFEAT) ==
+	    TAW_E_FORMAT);
+	mb.n--;
+	CHECK(tree_load(&mb, TAW_QUANT_Q8) == TAW_E_FORMAT);
+	taw_buf_free(&mb);
+}
+
+/* Every row quant the container allows must load and code identically. */
+static void tree_quants(void)
+{
+	enum { N = 4096 };
+	uint8_t *src = malloc(N), *dst = malloc(N);
+	REQUIRE(src && dst);
+	td_fill(src, N, TD_TEXT, 909);
+	for (unsigned q = 0; q < 256; q++) {
+		if (!taw_quant_is_row_format((uint8_t)q))
+			continue;
+		taw_buf mb = build_tree_model((uint8_t)q);
+		taw_pred pr;
+		REQUIRE(taw_pred_init(&pr, TAW_PROFILE_MDL_TREE, (uint8_t)q,
+		    mb.p, mb.n) == TAW_OK);
+		taw_buf out = {0};
+		taw_rc_enc e;
+		taw_rc_enc_init(&e, &out);
+		taw_pred_encode(&pr, &e, src, N);
+		taw_rc_enc_flush(&e);
+		CHECK(!out.oom);
+		taw_pred_reset(&pr);
+		taw_rc_dec d;
+		taw_rc_dec_init(&d, out.p, out.n);
+		taw_pred_decode(&pr, &d, dst, N);
+		CHECK(memcmp(src, dst, N) == 0);
+		taw_pred_free(&pr);
+		taw_buf_free(&out);
+		taw_buf_free(&mb);
+	}
+	free(src);
+	free(dst);
+}
+
+static uint32_t tree_golden(uint8_t quant, uint32_t *coded_len)
+{
+	enum { N = 1 << 16 };
+	uint8_t *src = malloc(N), *dst = malloc(N);
+	REQUIRE(src && dst);
+	td_fill(src, N, TD_TEXT, 4242);
+	for (size_t i = 0; i < N; i += 2048)
+		memcpy(src + i, src, 48);
+	taw_buf mb = build_tree_model(quant);
+	taw_pred pr;
+	REQUIRE(taw_pred_init(&pr, TAW_PROFILE_MDL_TREE, quant, mb.p,
+	    mb.n) == TAW_OK);
+	taw_buf out = {0};
+	taw_rc_enc e;
+	taw_rc_enc_init(&e, &out);
+	taw_pred_encode(&pr, &e, src, N);
+	taw_rc_enc_flush(&e);
+	REQUIRE(!out.oom);
+	taw_pred_reset(&pr);
+	taw_rc_dec d;
+	taw_rc_dec_init(&d, out.p, out.n);
+	taw_pred_decode(&pr, &d, dst, N);
+	CHECK(memcmp(src, dst, N) == 0);
+	uint32_t crc = taw_crc32c(0, out.p, out.n);
+	*coded_len = (uint32_t)out.n;
+	taw_pred_free(&pr);
+	taw_buf_free(&out);
+	taw_buf_free(&mb);
+	free(src);
+	free(dst);
+	return crc;
+}
+
+static void tree_golden_test(void)
+{
+	static const struct { uint8_t quant; uint32_t len, crc; } want[] = {
+		{TAW_QUANT_Q8, 44239, 0x211B478Au},
+		{TAW_QUANT_F16, 48918, 0x51D83A69u},
+	};
+	for (size_t i = 0; i < sizeof want / sizeof *want; i++) {
+		uint32_t len, crc = tree_golden(want[i].quant, &len);
+		if (want[i].crc && (len != want[i].len || crc != want[i].crc)) {
+			fprintf(stderr,
+			    "tree golden quant=%u: len %u crc 0x%08X\n",
+			    want[i].quant, len, crc);
+			check_failures++;
+		}
+	}
+}
+
 int main(void)
 {
 	tables();
@@ -485,7 +643,10 @@ int main(void)
 	parity();
 	ctx_parity();
 	validation();
+	tree_validation();
+	tree_quants();
 	golden();
+	tree_golden_test();
 	archive_parity();
 	archive_model_damage();
 	return CHECK_DONE();

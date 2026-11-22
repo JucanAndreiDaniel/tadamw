@@ -52,7 +52,8 @@ identical probabilities for every bit.
 |----|-----------------|---------------|--------|
 | 0  | `INT_ORDER0`    | empty (`model_size = 0`, `quant = 0`) | implemented, placeholder |
 | 1  | `F32_STRICT_MIX`| mixer shape and weights, §5.1; quant `F16`, `Q8`, `Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4` or `IQ2` | implemented |
-| 2..255 | — | — | reserved, refuse |
+| 12 | `MDL_TREE`      | context tree + shared first layer, §5.2; quant `F16`, `Q8`, `Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4` or `IQ2` | implemented |
+| 2..11, 13..255 | — | — | reserved, refuse |
 
 ### 2.1 Profile 0: `INT_ORDER0`
 
@@ -306,6 +307,46 @@ and the same `A2` entry are updated: `e += (65535 - e) >> 6` if `b`, else
    `nib = 1` and select lines with `q = c0`. At `bitpos` 8: byte end
    (§2.2.5).
 
+### 2.3 Profile 12: `MDL_TREE`
+
+The 25 context inputs, the two APM stages, the squash/stretch tables, the
+context models and the range coder are exactly those of §2.2. The frozen
+mixer is replaced by an **input-specific binary context tree of linear
+output experts**:
+
+- A shared first layer with `H` hidden units and selector `sel1` produces
+  `h[j] = clamp(dot4(W1[a][j], x, 26), -8, 8)` for `j = 0..H-1`, with the
+  same `dot4` order and clamping as §2.2.8. `a = sel1`'s value. The first
+  layer never changes while coding.
+- Each bit walks the tree from node 0. An internal node stores a feature
+  id `f` and a threshold `thr`; the next node is `left` if
+  `feature(f) < thr`, otherwise `right`. A leaf stores one output row
+  `W2[leaf]` of `H + 1` dequantized weights. With `c` the leaf index,
+  `z = dot4(W2[c], h, H) + W2[c][H]`, then
+  `z = min(max(z, -2047/256), 2047/256)`, `t = trunc(z * 256)`,
+  `p_mix = squash(t)`. APM and the coded probability follow §2.2.9.
+
+`feature(f)` is a deterministic integer from decoder state:
+
+| f | value | range |
+|---|-------|-------|
+| 0 | `bitpos` | 0..7 |
+| 1 | `msel` | 0..7 |
+| 2 | `c0 >> 4` | 0..15 |
+| 3 | `c1 >> 4` | 0..15 |
+| 4 | `msel != 0` | 0..1 |
+| 5 | `st[0] >= 0` | 0..1 |
+| 6 | `st[12] >= 0` | 0..1 |
+| 7 | `c0 & 15` | 0..15 |
+| 8 | `c1 & 15` | 0..15 |
+| 9 | `st[2] >= 0` | 0..1 |
+
+`st[i]` are the 25 stretched integer inputs of §2.2.3, so every decision
+is reproducible without look-ahead. The tree structure and all weights
+are in the model section (§5.2); they are fitted once over the input and
+shared by all chunks or blocks. All coding-unit state is reset as in
+§2.2.2 for both profiles.
+
 ## 3. Quantization formats
 
 The format in which model weights are stored. Encoders may pick any format
@@ -442,6 +483,50 @@ code bits. Profile 1 accepts the row formats (`quant` 1 and 4..11);
 A decoder needs about `10 * 2^L * 64 + 2^HB + 4 * 2^MB` bytes of tables
 plus about 4.6 MB fixed (o1 table and APM), and resets them per coding
 unit.
+
+### 5.2 Profile 12 model
+
+An 8-byte head, then the shared first-layer weights, then the tree nodes,
+then one output row per leaf. Weight rows use any quant accepted for
+profile 1 (`F16`, `Q8`, `Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4`, `IQ2`;
+§3, §5.1) with the same row encoding; `quant = NONE` is refused.
+
+| off | size | field | valid range |
+|-----|------|-------|-------------|
+| 0 | 1 | `lines_log2` (L) | 8..22 |
+| 1 | 1 | `hist_log2` (HB) | 12..26 |
+| 2 | 1 | `match_log2` (MB) | 10..24 |
+| 3 | 1 | `hidden` (H) | 1..16 |
+| 4 | 1 | `sel1` (§2.2.7) | 0..5 |
+| 5 | 1 | node count | 1..63, odd |
+| 6 | 1 | leaf count | 1..32, `(nodes+1)/2` |
+| 7 | 1 | reserved | 0 |
+
+Payload order:
+
+1. First layer: for each set `a` of `sel1`, for each `j = 0..H-1`, one row
+   of 26 weights in input order.
+2. Nodes: `node_count` records of four bytes — `feat`, `thr`, `left`,
+   `right`. A leaf has `feat = 255`, `thr = 0`, `left = leaf index`,
+   `right = 0`. An internal node has `feat < 10`, `thr >= 1`, and both
+   child indices `< node_count`. Node 0 is the root.
+3. Leaves: `leaf_count` rows of `H + 1` weights (hidden units, then the
+   bias), encoded with the same row format as §5.1.
+
+`model_size` MUST equal the exact payload size. A decoder MUST refuse an
+invalid geometry, an out-of-range field, a non-zero reserved byte, a
+weight size mismatch, a non-finite F16 value or scale, a Q8 value of -128,
+a leaf index out of range, an internal threshold of 0, an unreachable
+node, or a cycle. A walk from the root must visit every node exactly once.
+
+The encoder fits the tree on a sample of the input. In the reference
+encoder the first three levels are a fixed balanced `bitpos` tree (eight
+base experts, matching profile 1's per-bitpos output layer); every deeper
+split is chosen greedily from the ten features above and kept only if the
+measured coding gain exceeds the 4-byte node plus one output row, charged
+at eight bits per byte. Splits are fitted with a small logistic model and
+quantized before scoring, so the MDL decision uses the decoder's exact
+integer probabilities.
 
 ## 6. aw body (kind 0)
 
