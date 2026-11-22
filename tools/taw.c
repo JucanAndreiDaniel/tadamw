@@ -23,9 +23,9 @@ static void usage(FILE *f)
 	    "             [-j threads] <in> <out>\n"
 #endif
 #if TAW_HAVE_DECODER
-	    "       taw d <in> <out>\n"
-	    "       taw x <in.awseek> <offset> <length> <out>\n"
-	    "       taw x <in.awseek> </file/name> <out>\n"
+	    "       taw d [-j threads] <in> <out>\n"
+	    "       taw x [-j threads] <in.awseek> <offset> <length> <out>\n"
+	    "       taw x [-j threads] <in.awseek> </file/name> <out>\n"
 #endif
 	    "       taw i <in>\n"
 	    "       taw --version\n"
@@ -38,6 +38,8 @@ static void usage(FILE *f)
 	    "                       mixer weight format (default auto)\n"
 	    "      -j N             worker threads for .awseek (default 1)\n"
 	    "  d   decompress a .aw or .awseek archive\n"
+	    "      -j N             decode .awseek blocks on N threads (default 1;\n"
+	    "                       each holds its own decoder tables)\n"
 	    "  x   extract a byte range, or a named file, from a .awseek archive\n"
 	    "  i   print header information\n"
 	    "  '-' as <in>/<out> means stdin/stdout (not for x's <in>).\n");
@@ -210,8 +212,30 @@ static int cmd_compress(int argc, char **argv)
 #endif
 
 #if TAW_HAVE_DECODER
+/* A leading "-j N"; returns the arguments consumed (0 or 2), -1 on error. */
+static int parse_threads(int argc, char **argv, unsigned *threads)
+{
+	*threads = 1;
+	if (argc >= 1 && strcmp(argv[0], "-j") == 0) {
+		uint64_t v;
+		if (argc < 2 || !parse_u64(argv[1], &v) || v < 1 || v > 256)
+			return -1;
+		*threads = (unsigned)v;
+		return 2;
+	}
+	return 0;
+}
+
 static int cmd_decompress(int argc, char **argv)
 {
+	unsigned threads;
+	const int used = parse_threads(argc, argv, &threads);
+	if (used < 0) {
+		usage(stderr);
+		return 2;
+	}
+	argc -= used;
+	argv += used;
 	if (argc != 2) {
 		usage(stderr);
 		return 2;
@@ -222,7 +246,7 @@ static int cmd_decompress(int argc, char **argv)
 		return fail(argv[0], strerror(errno));
 	void *dst;
 	size_t dst_n;
-	taw_status st = taw_decompress(arc, n, &dst, &dst_n);
+	taw_status st = taw_decompress_mt(arc, n, threads, &dst, &dst_n);
 	free(arc);
 	if (st != TAW_OK)
 		return fail(argv[0], taw_strerror(st));
@@ -251,6 +275,14 @@ static taw_status fd_read_at(void *ctx, uint64_t off, void *dst, size_t n)
 
 static int cmd_extract(int argc, char **argv)
 {
+	unsigned threads;
+	const int used = parse_threads(argc, argv, &threads);
+	if (used < 0) {
+		usage(stderr);
+		return 2;
+	}
+	argc -= used;
+	argv += used;
 	uint64_t off = 0, len = 0;
 	const char *name = nullptr, *out;
 	if (argc == 3 && argv[1][0] == '/') {
@@ -279,6 +311,7 @@ static int cmd_extract(int argc, char **argv)
 		close(fd);
 		return fail(argv[0], taw_strerror(st));
 	}
+	taw_seek_set_threads(s, threads); /* pread is thread safe */
 	if (name) {
 		const taw_file *f;
 		long k = taw_seek_find(s, name);

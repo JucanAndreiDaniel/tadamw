@@ -169,6 +169,12 @@ TAW_NODISCARD TAW_API taw_status taw_seek_encode(const taw_source *src,
 TAW_NODISCARD TAW_API taw_status taw_decompress(const void *src, size_t n,
     void **out, size_t *out_n);
 
+/* The same, decoding .awseek blocks on up to `threads` threads (0 or 1 =
+ * this thread only; .aw streams always decode on one). Each thread holds
+ * its own decoder tables (docs/format.md §5.1 gives their size). */
+TAW_NODISCARD TAW_API taw_status taw_decompress_mt(const void *src, size_t n,
+    unsigned threads, void **out, size_t *out_n);
+
 typedef struct taw_seek taw_seek;
 
 /* Open a .awseek archive: reads and validates header, model and index. The
@@ -177,6 +183,12 @@ typedef struct taw_seek taw_seek;
  * read_at is thread safe). */
 TAW_NODISCARD TAW_API taw_status taw_seek_open(const taw_source *src,
     taw_seek **out);
+
+/* Let taw_seek_read decode the blocks of one request on up to `threads`
+ * threads (0 or 1: serial, the default). The source's read_at must then be
+ * safe to call from several threads. Each thread holds its own decoder
+ * tables. */
+TAW_API void taw_seek_set_threads(taw_seek *s, unsigned threads);
 
 /* Uncompressed size of the archive's data. */
 TAW_API uint64_t taw_seek_size(const taw_seek *s);

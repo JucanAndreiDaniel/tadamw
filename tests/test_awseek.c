@@ -78,7 +78,9 @@ static void random_access_mix(void)
 	taw_seek *s;
 	REQUIRE(taw_seek_open(&mem, &s) == TAW_OK);
 	uint64_t r = 5;
-	for (int t = 0; t < 40; t++) {
+	for (int t = 0; t < 60; t++) {
+		/* serial, then parallel reads (several blocks, partial edges) */
+		taw_seek_set_threads(s, t < 20 ? 1 : t < 40 ? 3 : 8);
 		uint64_t off = td_next(&r) % N;
 		size_t len = (size_t)(td_next(&r) % (2 * BS));
 		if (len > N - off)
@@ -87,6 +89,12 @@ static void random_access_mix(void)
 		CHECK(memcmp(buf, src + off, len) == 0);
 	}
 	taw_seek_close(s);
+	/* The whole archive on several threads. */
+	void *dec;
+	size_t dec_n;
+	CHECK(taw_decompress_mt(arc, arc_n, 4, &dec, &dec_n) == TAW_OK);
+	CHECK(dec_n == N && memcmp(dec, src, N) == 0);
+	free(dec);
 	free(arc);
 	free(buf);
 	free(src);

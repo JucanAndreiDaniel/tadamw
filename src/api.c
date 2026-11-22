@@ -82,8 +82,8 @@ taw_status taw_compress(const void *src, size_t n, const taw_params *params,
 #endif
 
 #if TAW_HAVE_DECODER
-static taw_status decompress_seekable(const void *src, size_t n, void **out,
-    size_t *out_n)
+static taw_status decompress_seekable(const void *src, size_t n,
+    unsigned threads, void **out, size_t *out_n)
 {
 	taw_source in;
 	taw_source_memory(&in, src, n);
@@ -91,6 +91,7 @@ static taw_status decompress_seekable(const void *src, size_t n, void **out,
 	taw_status st = taw_seek_open(&in, &s);
 	if (st != TAW_OK)
 		return st;
+	taw_seek_set_threads(s, threads);
 	uint64_t total = taw_seek_size(s);
 	uint8_t *dst = total < SIZE_MAX ? malloc(total ? (size_t)total : 1)
 					: nullptr;
@@ -112,6 +113,12 @@ static taw_status decompress_seekable(const void *src, size_t n, void **out,
 taw_status taw_decompress(const void *src, size_t n, void **out,
     size_t *out_n)
 {
+	return taw_decompress_mt(src, n, 1, out, out_n);
+}
+
+taw_status taw_decompress_mt(const void *src, size_t n, unsigned threads,
+    void **out, size_t *out_n)
+{
 	if (!src || !out || !out_n)
 		return TAW_E_ARG;
 	taw_info info;
@@ -119,7 +126,7 @@ taw_status taw_decompress(const void *src, size_t n, void **out,
 	if (st != TAW_OK)
 		return st;
 	if (info.kind == TAW_KIND_SEEKABLE)
-		return decompress_seekable(src, n, out, out_n);
+		return decompress_seekable(src, n, threads, out, out_n);
 	taw_buf b = {0};
 	st = taw_aw_decode(src, n, &b);
 	return finish(st, &b, out, out_n);

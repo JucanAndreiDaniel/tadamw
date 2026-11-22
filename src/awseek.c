@@ -267,7 +267,17 @@ struct taw_seek {
 	size_t coded_cap;
 	uint8_t *block;   /* last decoded block */
 	int64_t cached;   /* its index, or -1 */
+	/* parallel reads (taw_seek_set_threads): per-worker state */
+	unsigned threads;
+	struct seek_worker *wk;
 };
+
+typedef struct seek_worker {
+	taw_pred pr;
+	bool pr_ok;
+	uint8_t *coded, *block;
+	size_t coded_cap;
+} seek_worker;
 
 static taw_status src_read(const taw_source *s, uint64_t off, void *dst,
     uint64_t n)
@@ -451,42 +461,137 @@ static size_t block_raw_len(const taw_seek *s, uint32_t i)
 	return left < s->h.block_size ? (size_t)left : s->h.block_size;
 }
 
+/* Decode block i into out (block_raw_len bytes) with pr and the coded
+ * scratch *coded; checks the CRC. */
+static taw_status decode_block_into(const taw_seek *s, uint32_t i,
+    taw_pred *pr, uint8_t **coded, size_t *cap, uint8_t *out)
+{
+	const seek_entry *en = &s->ent[i];
+	const size_t len = block_raw_len(s, i);
+	taw_status st;
+	if (en->coded_len == len) { /* stored */
+		if ((st = src_read(&s->src, en->offset, out, len)) != TAW_OK)
+			return st;
+	} else {
+		if (en->coded_len > *cap) {
+			uint8_t *c = realloc(*coded, en->coded_len);
+			if (!c)
+				return TAW_E_NOMEM;
+			*coded = c;
+			*cap = en->coded_len;
+		}
+		if ((st = src_read(&s->src, en->offset, *coded,
+			 en->coded_len)) != TAW_OK)
+			return st;
+		taw_pred_reset(pr);
+		taw_rc_dec d;
+		taw_rc_dec_init(&d, *coded, en->coded_len);
+		taw_pred_decode(pr, &d, out, len);
+	}
+	return taw_crc32c(0, out, len) == en->crc ? TAW_OK : TAW_E_CHECKSUM;
+}
+
 static taw_status load_block(taw_seek *s, uint32_t i)
 {
 	if (s->cached == i)
 		return TAW_OK;
 	s->cached = -1;
-	const seek_entry *en = &s->ent[i];
-	const size_t len = block_raw_len(s, i);
 	if (!s->block) {
 		s->block = malloc(s->h.block_size);
 		if (!s->block)
 			return TAW_E_NOMEM;
 	}
-	taw_status st;
-	if (en->coded_len == len) { /* stored */
-		if ((st = src_read(&s->src, en->offset, s->block, len)) != TAW_OK)
-			return st;
-	} else {
-		if (en->coded_len > s->coded_cap) {
-			uint8_t *c = realloc(s->coded, en->coded_len);
-			if (!c)
-				return TAW_E_NOMEM;
-			s->coded = c;
-			s->coded_cap = en->coded_len;
-		}
-		if ((st = src_read(&s->src, en->offset, s->coded,
-			 en->coded_len)) != TAW_OK)
-			return st;
-		taw_pred_reset(&s->pr);
-		taw_rc_dec d;
-		taw_rc_dec_init(&d, s->coded, en->coded_len);
-		taw_pred_decode(&s->pr, &d, s->block, len);
-	}
-	if (taw_crc32c(0, s->block, len) != en->crc)
-		return TAW_E_CHECKSUM;
+	taw_status st = decode_block_into(s, i, &s->pr, &s->coded,
+	    &s->coded_cap, s->block);
+	if (st != TAW_OK)
+		return st;
 	s->cached = i;
 	return TAW_OK;
+}
+
+void taw_seek_set_threads(taw_seek *s, unsigned threads)
+{
+	if (!s)
+		return;
+	if (threads > 256)
+		threads = 256;
+	if (threads != s->threads) {
+		for (unsigned w = 0; s->wk && w < s->threads; w++) {
+			if (s->wk[w].pr_ok)
+				taw_pred_free(&s->wk[w].pr);
+			free(s->wk[w].coded);
+			free(s->wk[w].block);
+		}
+		free(s->wk);
+		s->wk = nullptr;
+	}
+	s->threads = threads;
+}
+
+typedef struct {
+	taw_seek *s;
+	uint64_t off;    /* of the request */
+	size_t n;
+	uint8_t *dst;
+	uint32_t first;  /* block of job 0 */
+	taw_status *st;  /* per job */
+} par_read;
+
+static void read_one(void *arg, size_t j, unsigned w)
+{
+	par_read *R = arg;
+	taw_seek *s = R->s;
+	seek_worker *k = &s->wk[w];
+	const uint32_t i = R->first + (uint32_t)j;
+	const uint64_t bs = s->h.block_size, start = (uint64_t)i * bs;
+	const size_t len = block_raw_len(s, i);
+	taw_status st = TAW_OK;
+	if (!k->pr_ok) {
+		st = taw_pred_init(&k->pr, s->h.profile, s->h.quant, s->model,
+		    (size_t)s->h.model_size);
+		if (st != TAW_OK) {
+			R->st[j] = st;
+			return;
+		}
+		k->pr_ok = true;
+	}
+	/* Whole blocks go straight to dst; the edges through a buffer. */
+	const bool whole = start >= R->off && start + len <= R->off + R->n;
+	uint8_t *out = R->dst + (start - R->off);
+	if (!whole) {
+		if (!k->block && !(k->block = malloc((size_t)bs))) {
+			R->st[j] = TAW_E_NOMEM;
+			return;
+		}
+		out = k->block;
+	}
+	st = decode_block_into(s, i, &k->pr, &k->coded, &k->coded_cap, out);
+	if (st == TAW_OK && !whole) {
+		const uint64_t a = R->off > start ? R->off : start;
+		const uint64_t b = R->off + R->n < start + len ? R->off + R->n :
+		    start + len;
+		memcpy(R->dst + (a - R->off), k->block + (a - start),
+		    (size_t)(b - a));
+	}
+	R->st[j] = st;
+}
+
+static taw_status read_parallel(taw_seek *s, uint64_t off, void *dst,
+    size_t n, uint32_t first, uint32_t last)
+{
+	const size_t jobs = (size_t)(last - first) + 1;
+	const unsigned tw = s->threads < jobs ? s->threads : (unsigned)jobs;
+	if (!s->wk && !(s->wk = calloc(s->threads, sizeof *s->wk)))
+		return TAW_E_NOMEM;
+	par_read R = {.s = s, .off = off, .n = n, .dst = dst, .first = first};
+	R.st = calloc(jobs, sizeof *R.st);
+	if (!R.st)
+		return TAW_E_NOMEM;
+	taw_status st = taw_parallel(tw, jobs, 0, read_one, nullptr, &R);
+	for (size_t j = 0; j < jobs && st == TAW_OK; j++)
+		st = R.st[j];
+	free(R.st);
+	return st;
 }
 
 taw_status taw_seek_read(taw_seek *s, uint64_t off, void *dst, size_t n)
@@ -495,6 +600,13 @@ taw_status taw_seek_read(taw_seek *s, uint64_t off, void *dst, size_t n)
 		return TAW_E_ARG;
 	if (off > s->total || n > s->total - off)
 		return TAW_E_RANGE;
+	if (n && s->threads > 1) {
+		const uint64_t bs = s->h.block_size;
+		const uint32_t first = (uint32_t)(off / bs);
+		const uint32_t last = (uint32_t)((off + n - 1) / bs);
+		if (last > first)
+			return read_parallel(s, off, dst, n, first, last);
+	}
 	uint8_t *d = dst;
 	const uint64_t bs = s->h.block_size;
 	while (n) {
@@ -518,6 +630,7 @@ void taw_seek_close(taw_seek *s)
 {
 	if (!s)
 		return;
+	taw_seek_set_threads(s, 0);
 	taw_pred_free(&s->pr);
 	free(s->model);
 	free(s->ent);

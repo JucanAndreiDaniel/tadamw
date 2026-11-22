@@ -296,8 +296,13 @@ bit-identical between the encoder and every decoder. The rules:
 
 `.awseek` resets the predictor history at every block but shares the one
 model. A seek costs reading the header, model and index, plus decoding
-the overlapping blocks. Blocks are independent, so encoding and decoding
-can run in parallel later.
+the overlapping blocks. Blocks are independent: the encoder codes them
+on `threads` workers, and a reader may decode the blocks of one request
+in parallel (`taw_seek_set_threads`, `taw_decompress_mt`, `taw d -j N`).
+Each decoding thread holds its own tables (about 175 MB for 1 MiB
+blocks), whole blocks are decoded straight into the caller's buffer and
+the partial ones at the edges through a per-thread buffer. The source's
+`read_at` must then be thread safe (`pread` is).
 
 ## Source layout
 
