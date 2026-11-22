@@ -100,10 +100,21 @@ over. That shapes the code:
   than computing them once at the boundary. Scalar table lookups instead
   of the stretch gathers were 7% slower. `-O3` gains 1-2%.
 
-What is left is a serial per-bit chain: inputs, mixer, squash, APM, the
-coder, then the update, at about 600 cycles per bit with IPC near 1.7.
-Further gains probably need restructuring across bits, for example
-evaluating both outcomes of the next bit.
+- **Evaluating the next bit's outcomes ahead** (branch
+  `exp/two-outcome-decode`). While bit i is decoded, the next bit's
+  prediction is prepared from the state before bit i's update. That is
+  exact: within a nibble bit i+1 reads other slots and APM rows, and the
+  history-map entries and match counter it may share with bit i come from
+  bit i's update precomputed for that outcome. Measured (words1m /
+  libc1m, level 1): main 1.23 / 1.42 s; both outcomes 1.81 / 2.07 s; only
+  the likely outcome (redo on a miss) 1.29 / 1.48 s. The per-candidate
+  records cost the sequential path about 5% on their own.
+
+The decoder is throughput-bound, not latency-bound: about 600 cycles and
+1050 instructions per bit, IPC near 1.7, few memory or branch stalls.
+Evaluating more than one outcome multiplies the work, so it loses. What
+would help is doing less per bit: fewer or cheaper context models, a
+cheaper mixer, or AVX-512 scatter for the write-back.
 
 ## Encoder pipeline
 
@@ -209,9 +220,10 @@ can run in parallel later.
 ## Open items
 
 - Decoder speed: about 0.75-0.85 MB/s with AVX2 (see "Decoder
-  performance"). Ideas: evaluate both outcomes of the next bit to break
-  the per-bit chain; AVX-512 scatter for the counter write-back; fewer
-  models where some never earn weight.
+  performance"). It is throughput-bound, so the ideas are about doing less
+  per bit: fewer context models where some never earn weight, cheaper
+  updates, AVX-512 scatter for the counter write-back. Evaluating several
+  outcomes of the next bit was tried and is slower.
 - Encoder speed: about 2.8 s/MB at level 1, 7.5 s/MB at level 5, and
   around 2 minutes/MB at level 9. That is two context passes
   (features, then coding) plus fitting. Fitting could run on a GPU
