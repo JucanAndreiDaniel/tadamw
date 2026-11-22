@@ -177,7 +177,17 @@ the leader's small W2 LR.
 
 # Experiment: learned probability calibration (arithmetic profile 6)
 
-Branch `exp/calibration`, base `origin/main` `a427e7f`.
+Branch `exp/calibration`, rebased onto `origin/main` `1aa3dd7`
+(upstream PR #3 MALTER and PR #4 Muon, opt-in env knobs; previously e64cc83
+with GPU fitting, new quant formats, bit-position sampling, fused AVX2
+decoder and parallel awseek decode). Upstream's own MALT report is preserved
+verbatim above; this section is only the profile-6 delta.
+
+> **Stale-numbers note.** The first version of this report (base `a427e7f`)
+> quoted text L1 190610 → 186508, text L5 187956 → 186098, libc L1
+> 388792 → 384244, libc L5 385741 → 382830. Those archives came from the old
+> sampler/fitter/decoder and are **invalid** after the rebase. The table
+> below is the only current result.
 
 ## Design
 
@@ -199,27 +209,33 @@ per-bit path are touched:
 With `temp = 256`, `bias = 0`, `(w0,w1,w2) = (2,1,1)`, profile 6 produces
 exactly the same coded bytes as profile 1. A test asserts this.
 
+The upstream fused AVX2 per-bit loop is **not** used for profile 6: it
+hardcodes profile 1's probability, so encode/decode/skip dispatch to the
+generic loop when `m->calibrated` is set. Profile 1 keeps the fast path.
+
 ### Fitting (`src/fit.c`)
 
 * The network is trained on 7/8 of the sampled bits. Every 8th (position-
   evenly-spread) sample is held out. Fitting temperature/bias on the training
   samples was tried first and was badly overconfident: it applied heavy
-  tempering (`temp=112`, `bias=-272`) and made archives ~12 KB **larger**.
-  Holding out samples fixed it (fitted values became mild, e.g.
-  `temp=248, bias=2` on text L1).
+  tempering (`temp=112`, `bias=-272`) and made archives ~12 KB larger under
+  the old base. Holding out samples fixed it; new-base fits are mild
+  (`temp=220..254`, `|bias| <= 24`).
 * `temp`/`bias` are found by a two-stage grid search minimising cross-entropy
   on a 4096-bin histogram of the held-out samples' integer `t`. Cost per
   grid point is one pass over the bins; no libm is used.
 * The APM weights are chosen from a fixed 14-triple set by measuring actual
   coding cost on a 16 KiB probe with the real predictor (`taw_pred_prob` /
   `taw_pred_advance`, including live APM adaptation) and unit resets.
-* AUTO fitting evaluates profile 1 and profile 6 candidates together and
-  picks the smaller estimated archive; `-p mix` and `-p cal` force one.
+* AUTO fitting evaluates profile 1 and profile 6 candidates together over
+  all nine quant formats and picks the smaller estimated archive; `-p mix`
+  and `-p cal` force one. Profile 6 candidates always fit on the CPU even
+  with `-g on`/`-g auto`, because they need the held-out-sample path.
   Fitted archives are deterministic and thread-count independent.
 
-A larger 26-triple APM grid was also tried: it overfit the 16 KiB probe
-(e.g. chose `w=(0,3,1)`) and made three of the four benchmarks worse, so the
-smaller grid was kept.
+A larger 26-triple APM grid was also tried on the old base: it overfit the
+16 KiB probe and made three of four benchmarks worse, so the smaller grid
+was kept.
 
 ## Format additions
 
@@ -235,50 +251,52 @@ smaller grid was kept.
 | 14  | 1 | `w2` | 0..15, not all zero |
 | 15  | 1 | reserved | 0 |
 
-followed by the unchanged profile 1 weight payload. Overhead versus profile 1
-is **8 bytes**. Loaders validate all ranges and the exact size; profile 1
-loaders reject profile 6 models (and vice versa). Public API:
-`TAW_PREDICTOR_CALIBRATED`, CLI `-p cal`.
+followed by the unchanged profile 1 weight payload (all nine quant formats
+are accepted). Overhead versus profile 1 is **8 bytes**. Loaders validate all
+ranges and the exact size; profile 1 loaders reject profile 6 models (and
+vice versa). Public API: `TAW_PREDICTOR_CALIBRATED`, CLI `-p cal`.
 
-## Results
+## Results (post-rebase, new clean baseline)
 
 Archives made with `-p mix` (baseline, profile 1) and `-p cal` (profile 6),
-clang Release build, read-only corpora in `/tmp/opencode/tadamw-bench`. Size
-is the whole `.aw` file in bytes. All profile-6 archives decompress back to
-the exact input.
+clang Release build at `e64cc83`, read-only corpora in
+`/tmp/opencode/tadamw-bench`. Size is the whole `.aw` file in bytes. All
+profile-6 archives decompress back to the exact input.
 
-| corpus | level | baseline | profile 6 | delta | model base → cal |
-|--------|-------|----------|-----------|-------|------------------|
-| text1m | 1 | 190610 | 186508 | **-4102** (-2.15%) | 1888 → 1896 |
-| text1m | 5 | 187956 | 186098 | **-1858** (-0.99%) | 2696 → 2704 |
-| libc1m | 1 | 388792 | 384244 | **-4548** (-1.17%) | 1888 → 1896 |
-| libc1m | 5 | 385741 | 382830 | **-2911** (-0.76%) | 2696 → 2704 |
+| corpus | level | new baseline | profile 6 | delta | quant base → cal | model base → cal |
+|--------|-------|--------------|-----------|-------|------------------|------------------|
+| text1m | 1 | 181557 | 180874 | **-683** (-0.38%) | q8 → q8 | 608 → 616 |
+| text1m | 5 | 179166 | 178997 | **-169** (-0.09%) | q8 → fp8 | 608 → 616 |
+| libc1m | 1 | 379197 | 375305 | **-3892** (-1.03%) | q8 → q8 | 608 → 616 |
+| libc1m | 5 | 375291 | 373312 | **-1979** (-0.53%) | fp8 → fp8 | 608 → 616 |
 
-Breakdown at text L1 (archive bytes, same fitted weights; intermediate
-variants were measured during development with temporary encoder-only
-parameter overrides, since removed from the final code):
+**APM weights after the rebase:** `w=(0,1,1)` was still chosen for all four
+runs, so the APM-dominant blend also wins under the new bit-position sampler.
+Fitted temperatures/biases were `(250,12)`, `(250,0)`, `(254,-6)` and
+`(220,20)` / `(224,24)` / `(206,22)` (three L5 candidates) respectively.
+The 8-byte head cost is paid back 21×–486×.
 
-| variant | size |
-|---------|------|
-| profile 1 baseline | 190610 |
-| profile 6, identity cal, identity APM weights | 190019 |
-| + fitted temp/bias only | 189892 |
-| + fitted APM weights only | 186631 |
-| full profile 6 | 186508 |
-
-The APM mixture is the dominant gain; temperature/bias contributes ~0.1–0.3%.
-Fitted APM weights were `w=(0,1,1)` on all four runs, i.e. the two adaptive
-APM stages alone beat the frozen MLP blend on these corpora.
+The text L5 gain is small partly because the selected quant changed from q8
+to fp8 in the profile-6 candidate set; the libc L5 gain is at the same quant
+and is a cleaner comparison.
 
 ## Verification
 
-* `ctest --test-dir build --output-on-failure`: **10/10 pass**.
-* Profile 1 golden vectors (`tests/test_p1.c`) are unchanged; new profile 6
-  goldens (F16 `len=43914 crc=0xD593C4D1`, Q8 `len=39189 crc=0xEBF4AF55`)
-  are pinned across every available ISA and decode round-trip.
+* `ctest --test-dir build --output-on-failure`: **12/12 pass** on the rebased
+  tree (including upstream's quant and GPU suites).
+* Existing profile 1 golden vectors are unchanged; profile 6 goldens
+  (F16 `len=43914 crc=0xD593C4D1`, Q8 `len=39189 crc=0xEBF4AF55`) still pass
+  across every available ISA, so the upstream context/decoder changes did not
+  disturb the pinned arithmetic.
 * Added validation tests for out-of-range temp/bias/weights and reserved
   bytes, cross-profile model rejection, and identity-equivalence with
   profile 1.
+* All four benchmark archives round-trip to their original corpora.
+* With MALT/Muon knobs off (`TAW_HYBRID`/`TAW_MALT` unset), profile 1 output
+  is byte-identical to the pre-MALT base on all four corpora/levels; all four
+  profile-6 archives are likewise byte-identical to the pre-MALT rebase run.
+  Upstream's opt-in optimizers therefore change neither baseline nor the
+  calibration result.
 
 ## Caveats
 
@@ -293,6 +311,12 @@ APM stages alone beat the frozen MLP blend on these corpora.
   the APM stages being under-weighted in profile 1, not about calibration
   alone. On very small inputs, where APM adaptation has no time to converge,
   a non-zero `w0` may be preferable; the probe chooses per file.
+* Profile 6 does not use the new fused AVX2 per-bit loop, so its decode is
+  slower than profile 1 on the same machine. Only archive bytes were measured
+  here; a throughput evaluation is outstanding.
+* Profile 6 candidates are excluded from GPU training even with `-g on` to
+  keep the held-out-sample calibration path; on GPU-equipped machines this
+  makes `-p cal` fitting slower than `-p mix`.
 * Fit time grows by roughly one predictor pass over 16 KiB per APM triple
   (14 triples) plus a 4096-bin grid search per candidate; measured wall time
   at L1/L5 was comparable to the baseline within noise on this shared box.
