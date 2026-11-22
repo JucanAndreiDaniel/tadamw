@@ -36,7 +36,8 @@
 #include "tadamw/tadamw.h"
 
 constexpr size_t COPY_CHUNK = 4u << 20;
-constexpr uint64_t CARD_INFO = 0x190, CARD_IV = 0x120;
+constexpr uint64_t CARD_INFO = 0x190;
+constexpr uint64_t CARD_IV = 0x120;
 constexpr size_t CARD_INFO_LEN = 0x70;
 #define META_NAME "/.meta"
 #define META_MAGIC "tadamw-nx 1"

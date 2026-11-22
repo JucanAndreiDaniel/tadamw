@@ -77,8 +77,9 @@ void p1_tables_init(void)
  * Each context model also owns an adaptive map h -> P(1) (indirect model).
  * The match model uses ps and n only. */
 
-constexpr uint32_t LIMIT_SLOW = P1_LIMIT_SLOW, LIMIT_MATCH = 63,
-    LIMIT_HMAP = P1_LIMIT_HMAP;
+constexpr uint32_t LIMIT_SLOW = P1_LIMIT_SLOW;
+constexpr uint32_t LIMIT_MATCH = 63;
+constexpr uint32_t LIMIT_HMAP = P1_LIMIT_HMAP;
 constexpr uint32_t SLOT_INIT = P1_SLOT_INIT;
 
 static inline uint32_t slot_ps12(uint32_t v)
