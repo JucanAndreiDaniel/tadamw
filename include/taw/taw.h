@@ -66,4 +66,32 @@ typedef struct {
 [[nodiscard]] taw_status taw_read_info(const void *src, size_t n,
     taw_info *info);
 
+/* ---- random access (.awseek) -------------------------------------------- */
+
+/* A random-access byte source. read_at must fill exactly n bytes at off;
+ * the library never asks for bytes past size. */
+typedef struct {
+	taw_status (*read_at)(void *ctx, uint64_t off, void *dst, size_t n);
+	void *ctx;
+	uint64_t size;
+} taw_source;
+
+/* Source over a memory buffer (which must outlive the source). */
+void taw_source_memory(taw_source *s, const void *p, size_t n);
+
+typedef struct taw_seek taw_seek;
+
+/* Open a .awseek archive: reads and validates header, model and index. The
+ * source is copied; its ctx must stay valid until taw_seek_close. */
+[[nodiscard]] taw_status taw_seek_open(const taw_source *src, taw_seek **out);
+
+/* Uncompressed size of the archive's data. */
+uint64_t taw_seek_size(const taw_seek *s);
+
+/* Read uncompressed bytes [off, off+n), decoding only overlapping blocks. */
+[[nodiscard]] taw_status taw_seek_read(taw_seek *s, uint64_t off, void *dst,
+    size_t n);
+
+void taw_seek_close(taw_seek *s);
+
 #endif

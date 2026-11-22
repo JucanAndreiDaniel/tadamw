@@ -1,6 +1,7 @@
 add_library(taw STATIC
   api.c
   aw.c
+  awseek.c
   buf.c
   crc32c.c
   header.c
