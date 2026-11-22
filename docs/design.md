@@ -20,6 +20,11 @@ drive a binary range coder (format.md §4).
 | arithmetic | tagged arithmetic profile; decoders refuse unknown profiles/quants |
 | variants | `.aw` stream, `.awseek` seekable with one global model |
 | language | C23, libc only, CMake + CTest |
+| libm | never used, in the encoder or the decoder; squash/exp go through SIMD intrinsics or tables |
+| model shape | table/MLP split chosen heuristically per input, not fixed |
+| weight formats (profile 1) | F16 and INT8 (Q8) from the start |
+| SIMD | scalar reference + AVX2/F16C and AVX-512 paths (ideas: ~/ucas, ~/q2_kernel kernels) |
+| GPU | the encoder may use a GPU for fitting, as a hybrid; decoders never use a GPU |
 
 ## Encoder pipeline
 
@@ -53,9 +58,10 @@ bit-identical between the encoder and every decoder. The rules:
   rounding and squash function.
 - The build disables FP contraction and fast-math
   (`-ffp-contract=off -fno-fast-math`).
-- Profiles must not call libm transcendentals (`expf`, `tanhf`, …),
-  because their results differ between libcs. Squash and stretch use
-  tables or integer formulas defined in the spec.
+- Nothing links libm: it is slow, and its results differ between libcs.
+  Squash and stretch use SIMD-intrinsic or table formulas defined in the
+  spec. Every SIMD path (scalar, AVX2/F16C, AVX-512) must give the scalar
+  reference's exact bits.
 - The probability handed to the coder is a 16-bit integer, and the
   float-to-integer conversion is defined by the profile.
 
@@ -84,9 +90,11 @@ can run in parallel later.
 
 ## Open items
 
-- Specify profile 1 (`F32_STRICT_MIX`): feature hashing, table and MLP
-  shapes as functions of the model budget, the squash table, and the
+- Specify profile 1 (`F32_STRICT_MIX`): feature hashing, the heuristic
+  for table vs. MLP shape within the budget, the squash formula, and the
   F16/Q8 weight layout.
+- Optional GPU fitting path for the encoder. Its results only have to be
+  good, not reproducible, because the quantized weights are what get coded.
 - The size heuristic and the level → effort mapping.
 - Streaming encode for inputs larger than memory. (Fitting needs a pass
   over the data, so this probably means fitting on a sample.)
