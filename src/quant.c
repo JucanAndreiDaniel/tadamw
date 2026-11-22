@@ -426,13 +426,30 @@ bool taw_quant_simulate(uint8_t quant, const float *w, unsigned len,
 			*scale_out = 0.0f;
 		return true;
 	}
-	levels L;
-	levels_for(quant, &L);
-	if (!L.n)
-		return false;
 	const float d = scale > 0.0f ? scale : taw_quant_row_scale(quant, w, len);
-	for (unsigned i = 0; i < len; i++)
-		(void)nearest(&L, d, w[i], &out[i]);
+	/* Q8/Q4 have uniform integer levels: nearest() is just round(w / d)
+	 * clamped to the level range, i.e. O(1) per weight instead of a
+	 * binary search. This matters: QAT runs this on every forward pass. */
+	if (quant == TAW_QUANT_Q8 || quant == TAW_QUANT_Q4) {
+		const int lim = quant == TAW_QUANT_Q8 ? 127 : 7;
+		const int lo = quant == TAW_QUANT_Q8 ? -127 : -8;
+		for (unsigned i = 0; i < len; i++) {
+			int q = 0;
+			if (d > 0.0f) {
+				float r = w[i] / d;
+				q = (int)(r + (r >= 0 ? 0.5f : -0.5f));
+				q = q > lim ? lim : q < lo ? lo : q;
+			}
+			out[i] = (float)q * d;
+		}
+	} else {
+		levels L;
+		levels_for(quant, &L);
+		if (!L.n)
+			return false;
+		for (unsigned i = 0; i < len; i++)
+			(void)nearest(&L, d, w[i], &out[i]);
+	}
 	if (scale_out)
 		*scale_out = d;
 	return true;
