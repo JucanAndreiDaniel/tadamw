@@ -138,55 +138,121 @@ static void geometry(size_t unit, p1_shape *s)
 	s->match_log2 = (uint8_t)clampu(lu >= 2 ? lu - 2 : 0, P1_MATCH_MIN, 22);
 }
 
-/* One pass of the context models over src with the decoder's unit resets,
- * keeping about want bits as training samples. */
-static taw_status collect(const uint8_t *src, size_t n, size_t unit,
-    const p1_shape *geo, size_t want, sample **out, size_t *out_n)
+/* One pass of the context models over the input with the decoder's unit
+ * resets, keeping an evenly spread set of about `want` bits as training
+ * samples. Bit i (of 8n) is kept when floor((i+1) want / 8n) passes an
+ * integer, and lands at index floor(i want / 8n): a rule of the position
+ * alone, so units can run in parallel and the samples do not depend on the
+ * thread count. */
+typedef struct {
+	const taw_source *in;
+	const uint8_t *view; /* the input itself, for memory sources */
+	uint64_t n, unit, total, want;
+	const p1_shape *geo;
+	sample *sm;
+	p1_ctx *ctx;    /* [threads], set up on first use */
+	uint8_t **buf;  /* [threads] unit buffers (non-memory sources) */
+	taw_status *st; /* [units] */
+} collect_job;
+
+static inline uint64_t sample_index(uint64_t bit, uint64_t want,
+    uint64_t total)
 {
-	p1_ctx c;
-	taw_status st = p1_ctx_init(&c, geo);
-	if (st != TAW_OK)
-		return st;
-	const uint64_t total = (uint64_t)n * 8;
-	if (want > total)
-		want = (size_t)total;
-	sample *sm = malloc((want ? want : 1) * sizeof *sm);
-	if (!sm) {
-		p1_ctx_free(&c);
-		return TAW_E_NOMEM;
+#if defined(__SIZEOF_INT128__)
+	return (uint64_t)(((unsigned __int128)bit * want) / total);
+#else
+	/* want <= 2^22 and bit <= total: exact while total < 2^42 bits */
+	return bit / total * want + bit % total * want / total;
+#endif
+}
+
+static void collect_unit(void *arg, size_t u, unsigned w)
+{
+	collect_job *J = arg;
+	const uint64_t start = (uint64_t)u * J->unit;
+	const uint64_t len = J->n - start < J->unit ? J->n - start : J->unit;
+	p1_ctx *c = &J->ctx[w];
+	if (!c->arena) {
+		if ((J->st[u] = p1_ctx_init(c, J->geo)) != TAW_OK)
+			return;
+	} else {
+		p1_ctx_reset(c);
 	}
-	size_t k = 0;
-	uint64_t acc = 0;
-	size_t in_unit = 0;
-	for (size_t i = 0; i < n; i++) {
-		if (in_unit == unit) {
-			p1_ctx_reset(&c);
-			in_unit = 0;
+	const uint8_t *src = J->view ? J->view + start : nullptr;
+	if (!src) {
+		if (!J->buf[w] && !(J->buf[w] = malloc((size_t)J->unit))) {
+			J->st[u] = TAW_E_NOMEM;
+			return;
 		}
-		in_unit++;
+		if ((J->st[u] = J->in->read_at(J->in->ctx, start, J->buf[w],
+			 (size_t)len)) != TAW_OK)
+			return;
+		src = J->buf[w];
+	}
+	uint64_t bit = start * 8;
+	uint64_t at = sample_index(bit, J->want, J->total);
+	for (uint64_t i = 0; i < len; i++) {
 		const unsigned ch = src[i];
-		for (int b = 7; b >= 0; b--) {
-			const int bit = (ch >> b) & 1;
+		for (int b = 7; b >= 0; b--, bit++) {
+			const int v = (ch >> b) & 1;
 			float xv[32];
 			p1_sel_ctx sc;
-			p1_ctx_inputs(&c, xv, &sc);
-			acc += want;
-			if (acc >= total && k < want) {
-				acc -= total;
-				sample *s = &sm[k++];
+			p1_ctx_inputs(c, xv, &sc);
+			const uint64_t next = sample_index(bit + 1, J->want, J->total);
+			if (next != at) {
+				sample *s = &J->sm[at];
 				for (unsigned q = 0; q < P1_NCTX; q++) /* exact */
 					s->st[q] = (int16_t)(xv[q] * 256.0f);
 				s->c0 = sc.c0;
 				s->c1 = sc.c1;
 				s->msel = sc.msel;
-				s->bit = (uint8_t)bit;
+				s->bit = (uint8_t)v;
+				at = next;
 			}
-			p1_ctx_update(&c, bit);
+			p1_ctx_update(c, v);
 		}
 	}
-	p1_ctx_free(&c);
-	*out = sm;
-	*out_n = k;
+}
+
+static taw_status collect(const taw_source *in, uint64_t unit,
+    const p1_shape *geo, uint64_t want, unsigned threads, sample **out,
+    size_t *out_n)
+{
+	const uint64_t n = in->size, total = n * 8;
+	if (want > total)
+		want = total;
+	const uint64_t units = n ? (n + unit - 1) / unit : 0;
+	if (threads == 0)
+		threads = 1;
+	if (threads > units)
+		threads = units ? (unsigned)units : 1;
+	collect_job J = {.in = in, .view = taw_source_view(in), .n = n,
+		.unit = unit, .total = total, .want = want, .geo = geo};
+	J.sm = malloc((size_t)(want ? want : 1) * sizeof *J.sm);
+	J.ctx = calloc(threads, sizeof *J.ctx);
+	J.buf = calloc(threads, sizeof *J.buf);
+	J.st = calloc(units ? (size_t)units : 1, sizeof *J.st);
+	taw_status st = TAW_E_NOMEM;
+	if (J.sm && J.ctx && J.buf && J.st) {
+		st = taw_parallel(threads, (size_t)units, 0, collect_unit, nullptr,
+		    &J);
+		for (uint64_t u = 0; u < units && st == TAW_OK; u++)
+			st = J.st[u];
+	}
+	for (unsigned w = 0; J.ctx && w < threads; w++)
+		if (J.ctx[w].arena)
+			p1_ctx_free(&J.ctx[w]);
+	for (unsigned w = 0; J.buf && w < threads; w++)
+		free(J.buf[w]);
+	free(J.ctx);
+	free(J.buf);
+	free(J.st);
+	if (st != TAW_OK) {
+		free(J.sm);
+		return st;
+	}
+	*out = J.sm;
+	*out_n = (size_t)want;
 	return TAW_OK;
 }
 
@@ -620,82 +686,117 @@ static const struct {
 	{1u << 22, 8, 12},
 };
 
+/* Fitting one candidate: train, quantize, score with the real inference. */
+typedef struct {
+	const cand *cs;
+	const sample *sm;
+	size_t ns;
+	int epochs;
+	uint64_t n;
+	taw_buf *model; /* [tries] */
+	double *est, *bpb;
+	taw_status *st;
+} fit_job;
+
+static void fit_one(void *arg, size_t ci, unsigned w)
+{
+	(void)w;
+	fit_job *F = arg;
+	tnet t;
+	taw_status st = tnet_init(&t, &F->cs[ci].s, 0x7A57A11ull + ci);
+	if (st == TAW_OK) {
+		tnet_train(&t, F->sm, F->ns, F->epochs, 0xC0FFEEull + ci);
+		st = serialize(&t, F->cs[ci].quant, &F->model[ci]);
+		tnet_free(&t);
+	}
+	if (st == TAW_OK)
+		st = evaluate(F->model[ci].p, F->model[ci].n, F->cs[ci].quant,
+		    F->sm, F->ns, &F->bpb[ci]);
+	F->est[ci] = F->bpb[ci] * 8.0 * (double)F->n + 8.0 * (double)F->model[ci].n;
+	F->st[ci] = st;
+}
+
 taw_status taw_model_fit(const uint8_t *src, size_t n, size_t unit,
+    const taw_params *p, taw_model_choice *out)
+{
+	taw_source in;
+	taw_source_memory(&in, src, n);
+	return taw_model_fit_source(&in, unit, p, out);
+}
+
+taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
     const taw_params *p, taw_model_choice *out)
 {
 	*out = (taw_model_choice){.profile = TAW_PROFILE_INT_ORDER0,
 		.quant = TAW_QUANT_NONE};
 	if (p->predictor == TAW_PREDICTOR_ORDER0)
 		return TAW_OK;
+	const uint64_t n = in->size;
 	const bool forced = p->predictor == TAW_PREDICTOR_MIX;
 	const uint64_t budget = n / 32;
+	if (unit == 0 || unit > n)
+		unit = n;
 
 	p1_shape geo = {0};
-	geometry(unit < n ? unit : n, &geo);
+	geometry((size_t)unit, &geo);
 	cand cs[256];
-	size_t ncand = enumerate(&geo, budget, p->weights, n, cs, 256);
+	size_t ncand = enumerate(&geo, budget, p->weights, (size_t)n, cs, 256);
 	if (ncand == 0)
 		return forced ? TAW_E_ARG : TAW_OK;
 
 	const int lv = p->level;
+	const unsigned threads = p->threads ? p->threads : 1;
 	sample *sm;
 	size_t ns;
-	taw_status st = collect(src, n, unit ? unit : n, &geo,
-	    effort[lv].samples, &sm, &ns);
+	taw_status st = collect(in, unit, &geo, effort[lv].samples, threads,
+	    &sm, &ns);
 	if (st != TAW_OK)
 		return st;
 
 	const char *dbg = getenv("TAW_FIT_DEBUG");
 	size_t tries = effort[lv].cands;
-	const int epochs = effort[lv].epochs;
 	if (dbg && strchr(dbg, 'a'))
 		tries = ncand;
 	if (tries > ncand)
 		tries = ncand;
 
-	double best = 0.0;
-	taw_buf best_model = {0};
-	uint8_t best_quant = 0;
-	for (size_t ci = 0; ci < tries && st == TAW_OK; ci++) {
-		tnet t;
-		st = tnet_init(&t, &cs[ci].s, 0x7A57A11ull + ci);
-		if (st != TAW_OK)
+	fit_job F = {.cs = cs, .sm = sm, .ns = ns, .epochs = effort[lv].epochs,
+		.n = n};
+	F.model = calloc(tries, sizeof *F.model);
+	F.est = calloc(tries, sizeof *F.est);
+	F.bpb = calloc(tries, sizeof *F.bpb);
+	F.st = calloc(tries, sizeof *F.st);
+	if (!F.model || !F.est || !F.bpb || !F.st)
+		st = TAW_E_NOMEM;
+	else
+		st = taw_parallel(threads, tries, 0, fit_one, nullptr, &F);
+	size_t best = SIZE_MAX;
+	for (size_t ci = 0; st == TAW_OK && ci < tries; ci++) {
+		if ((st = F.st[ci]) != TAW_OK)
 			break;
-		tnet_train(&t, sm, ns, epochs, 0xC0FFEEull + ci);
-		taw_buf mb = {0};
-		st = serialize(&t, cs[ci].quant, &mb);
-		tnet_free(&t);
-		double bpb = 0.0;
-		if (st == TAW_OK)
-			st = evaluate(mb.p, mb.n, cs[ci].quant, sm, ns, &bpb);
-		if (st != TAW_OK) {
-			taw_buf_free(&mb);
-			break;
-		}
-		double est = bpb * 8.0 * (double)n + 8.0 * (double)mb.n;
 		if (dbg)
 			fprintf(stderr,
 			    "taw fit: H=%u sel1=%u sel2=%u q=%u model=%zu "
 			    "bpc=%.4f est=%.0f B\n",
 			    cs[ci].s.hidden, cs[ci].s.sel1, cs[ci].s.sel2,
-			    cs[ci].quant, mb.n, bpb * 8.0, est / 8.0);
-		if (best_model.p == nullptr || est < best) {
-			taw_buf_free(&best_model);
-			best_model = mb;
-			best = est;
-			best_quant = cs[ci].quant;
-		} else {
-			taw_buf_free(&mb);
-		}
+			    cs[ci].quant, F.model[ci].n, F.bpb[ci] * 8.0,
+			    F.est[ci] / 8.0);
+		if (best == SIZE_MAX || F.est[ci] < F.est[best])
+			best = ci;
 	}
+	if (st == TAW_OK) {
+		out->profile = TAW_PROFILE_F32_STRICT_MIX;
+		out->quant = cs[best].quant;
+		out->model = F.model[best].p;
+		out->model_size = F.model[best].n;
+		F.model[best] = (taw_buf){0};
+	}
+	for (size_t ci = 0; F.model && ci < tries; ci++)
+		taw_buf_free(&F.model[ci]);
+	free(F.model);
+	free(F.est);
+	free(F.bpb);
+	free(F.st);
 	free(sm);
-	if (st != TAW_OK) {
-		taw_buf_free(&best_model);
-		return st;
-	}
-	out->profile = TAW_PROFILE_F32_STRICT_MIX;
-	out->quant = best_quant;
-	out->model = best_model.p;
-	out->model_size = best_model.n;
-	return TAW_OK;
+	return st;
 }

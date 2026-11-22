@@ -8,6 +8,7 @@
 
 typedef struct {
 	uint8_t kind, profile, quant, level;
+	uint8_t flags; /* TAW_FLAG_FILES */
 	uint32_t block_size;
 	uint64_t model_size;
 	uint32_t model_crc;

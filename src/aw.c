@@ -6,6 +6,7 @@
 #include "aw.h"
 #include "header.h"
 
+#if TAW_HAVE_ENCODER
 /* Encoder chunk size; the format allows up to TAW_CHUNK_MAX. */
 constexpr size_t AW_CHUNK = 1u << 20;
 
@@ -39,10 +40,13 @@ taw_status taw_aw_encode(const uint8_t *src, size_t n, const taw_params *p,
 		taw_rc_enc_flush(&e);
 		if (coded.oom || coded.n > UINT32_MAX)
 			break;
+		/* stored when coding does not shrink it (format.md §6); the
+		 * predictor has advanced over it either way */
+		const bool stored = coded.n >= len;
 		taw_buf_put_u32(out, (uint32_t)len);
-		taw_buf_put_u32(out, (uint32_t)coded.n);
+		taw_buf_put_u32(out, (uint32_t)(stored ? len : coded.n));
 		taw_buf_put_u32(out, taw_crc32c(0, src + off, len));
-		taw_buf_put(out, coded.p, coded.n);
+		taw_buf_put(out, stored ? src + off : coded.p, stored ? len : coded.n);
 	}
 	bool oom = coded.oom || coded.n > UINT32_MAX;
 	taw_buf_free(&coded);
@@ -57,6 +61,9 @@ taw_status taw_aw_encode(const uint8_t *src, size_t n, const taw_params *p,
 	return out->oom ? TAW_E_NOMEM : TAW_OK;
 }
 
+#endif
+
+#if TAW_HAVE_DECODER
 static taw_status aw_decode_body(taw_pred *pr, const uint8_t *p,
     const uint8_t *end, taw_buf *out);
 
@@ -101,11 +108,18 @@ static taw_status aw_decode_body(taw_pred *pr, const uint8_t *p,
 		uint8_t *dst = taw_buf_extend(out, raw_len);
 		if (!dst)
 			return TAW_E_NOMEM;
-		taw_rc_dec d;
-		taw_rc_dec_init(&d, p, coded_len);
-		taw_pred_decode(pr, &d, dst, raw_len);
+		if (coded_len == raw_len) { /* stored */
+			memcpy(dst, p, raw_len);
+			taw_pred_skip(pr, dst, raw_len);
+		} else {
+			taw_rc_dec d;
+			taw_rc_dec_init(&d, p, coded_len);
+			taw_pred_decode(pr, &d, dst, raw_len);
+		}
 		if (crc != taw_crc32c(0, dst, raw_len))
 			return TAW_E_CHECKSUM;
 		p += coded_len;
 	}
 }
+
+#endif

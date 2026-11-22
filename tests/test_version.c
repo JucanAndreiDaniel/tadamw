@@ -2,7 +2,7 @@
 #include <string.h>
 
 #include "check.h"
-#include "taw/taw.h"
+#include "tadamw/tadamw.h"
 
 int main(void)
 {

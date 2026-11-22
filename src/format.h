@@ -19,6 +19,9 @@ constexpr uint8_t TAW_QUANT_BF16 = 2;
 constexpr uint8_t TAW_QUANT_F32 = 3;
 constexpr uint8_t TAW_QUANT_Q8 = 4;
 
+constexpr uint8_t TAW_FLAG_FILES = 1; /* awseek: the index has a directory */
+constexpr size_t TAW_NAME_MAX = 4096;
+
 constexpr size_t TAW_HEADER_SIZE = 32;
 constexpr uint32_t TAW_CHUNK_MAX = 1u << 26;
 constexpr uint32_t TAW_BLOCK_MIN = 1u << 12;

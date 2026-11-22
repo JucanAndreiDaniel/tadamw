@@ -1,18 +1,19 @@
-# tar_aw
+# tadamw
 
 A general-purpose compressed archive format whose byte predictor is a small
-model fitted to the input with AdamW and embedded in the archive. Two
-variants:
+model fitted to the input with AdamW and embedded in the archive, as a C
+library (`libtadamw`) plus command-line tools. Two variants:
 
 - `.aw`: a single compressed stream
-- `.awseek`: fixed-size blocks plus a seek table for random access
+- `.awseek`: fixed-size blocks plus a seek table for random access, and
+  optionally a directory of named files
 
 Status: working draft. The container, range coder, seeking and both
 arithmetic profiles work: profile 0 is an integer order-0 placeholder, and
 profile 1 (`F32_STRICT_MIX`) is the fitted mixer. Adaptive integer
 context models feed a small MLP that the encoder fits with AdamW and
-stores as F16 or Q8. The decoder has scalar, AVX2/F16C and AVX-512 paths
-that produce identical bits. See `docs/`.
+stores as F16 or Q8. Every SIMD path (AVX2/F16C, AVX-512, SSE4.2 CRC) has a
+generic one beside it that produces identical bits. See `docs/`.
 
 ## Build
 
@@ -20,22 +21,50 @@ that produce identical bits. See `docs/`.
 cmake -S . -B build
 cmake --build build
 ctest --test-dir build --output-on-failure
+cmake --install build --prefix /usr/local     # optional
 ```
 
-Sanitizer build: `cmake -S . -B build-san -DTAW_SANITIZE=ON -DTAW_WERROR=ON`.
+Requires a C23 compiler (clang >= 18 or gcc >= 14) and CMake >= 3.25.
+Sanitizer build: `-DTADAMW_SANITIZE=ON -DTADAMW_WERROR=ON`.
+
+| option | default | |
+|--------|---------|-|
+| `TADAMW_ENCODER` | ON | compression and model fitting |
+| `TADAMW_DECODER` | ON | decompression and random access |
+| `BUILD_SHARED_LIBS` | OFF | `libtadamw.so` instead of `libtadamw.a` |
+| `TADAMW_TOOLS` | ON | the `taw` tool |
+| `TADAMW_TESTS` | ON | the tests (need both halves) |
+| `TADAMW_INSTALL` | ON | install rules |
+
+## Library
+
+```cmake
+find_package(tadamw 0.1 REQUIRED)
+target_link_libraries(app PRIVATE tadamw::tadamw)
+```
+
+or `pkg-config --cflags --libs tadamw`. The header is
+`<tadamw/tadamw.h>` (the API keeps the `taw_` prefix) and works from C99,
+C11, C23 and C++. `<tadamw/config.h>` says which halves the installed library
+has (`TAW_HAVE_ENCODER`, `TAW_HAVE_DECODER`), and only their functions are
+declared. A shared library exports the `taw_*` API alone.
+
+- `taw_compress` / `taw_decompress`: whole buffers, either variant.
+- `taw_seek_encode`: a `.awseek` from any byte source to any sink, in
+  parallel and with bounded memory, optionally with named files.
+- `taw_seek_open` / `taw_seek_read` / `taw_seek_files`: random access.
 
 ## Usage
 
 ```sh
 taw c [-l 1..9] in out.aw              # stream
 taw c -p mix -w q8 in out.aw           # force the mixer, Q8 weights
-taw c [-B block_size] in out.awseek    # seekable (or -s)
+taw c [-B block_size] [-j N] in out.awseek   # seekable (or -s), N threads
 taw d archive out
 taw x archive.awseek OFFSET LENGTH out # random-access range
-taw i archive                          # header info
+taw x archive.awseek /name out         # a named file
+taw i archive                          # header info and files
 ```
-
-Requires a C23 compiler (clang >= 18 or gcc >= 14) and CMake >= 3.25.
 
 ## License
 

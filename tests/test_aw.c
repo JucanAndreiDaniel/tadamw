@@ -121,6 +121,25 @@ int main(void)
 		free(src);
 	}
 
+	/* Random data is stored, not grown (format.md §6). */
+	{
+		const size_t n = (1u << 20) + 77;
+		uint8_t *src = malloc(n);
+		REQUIRE(src);
+		td_fill(src, n, TD_RANDOM, 99);
+		void *arc;
+		size_t arc_n;
+		REQUIRE(taw_compress(src, n, &order0, &arc, &arc_n) == TAW_OK);
+		CHECK(arc_n <= n + 96); /* header, 2 chunk heads, end, trailer */
+		void *dec;
+		size_t dec_n;
+		CHECK(taw_decompress(arc, arc_n, &dec, &dec_n) == TAW_OK);
+		CHECK(dec_n == n && memcmp(dec, src, n) == 0);
+		free(dec);
+		free(arc);
+		free(src);
+	}
+
 	/* Defaults (auto predictor, level 5) on small inputs. */
 	{
 		uint8_t src[20000];

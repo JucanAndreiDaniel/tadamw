@@ -153,6 +153,7 @@ static inline void p1_update(struct taw_p1 *m, int bit)
 	p1_ctx_update(&m->ctx, bit);
 }
 
+#if TAW_HAVE_ENCODER
 void taw_pred_encode(taw_pred *pr, taw_rc_enc *e, const uint8_t *src,
     size_t n)
 {
@@ -179,6 +180,28 @@ void taw_pred_encode(taw_pred *pr, taw_rc_enc *e, const uint8_t *src,
 	}
 }
 
+#endif
+
+#if TAW_HAVE_DECODER
+void taw_pred_skip(taw_pred *pr, const uint8_t *src, size_t n)
+{
+	if (pr->p1) {
+		/* the same predictions and updates as coding, without a coder */
+		struct taw_p1 *m = pr->p1;
+		for (size_t i = 0; i < n; i++)
+			for (int k = 7; k >= 0; k--) {
+				(void)p1_p16(m);
+				p1_update(m, (src[i] >> k) & 1);
+			}
+		return;
+	}
+	for (size_t i = 0; i < n; i++) {
+		for (int k = 7; k >= 0; k--)
+			o0_update(pr, (src[i] >> k) & 1);
+		pr->c0 = 1;
+	}
+}
+
 void taw_pred_decode(taw_pred *pr, taw_rc_dec *d, uint8_t *dst, size_t n)
 {
 	if (pr->p1) {
@@ -201,3 +224,5 @@ void taw_pred_decode(taw_pred *pr, taw_rc_dec *d, uint8_t *dst, size_t n)
 		pr->c0 = 1;
 	}
 }
+
+#endif

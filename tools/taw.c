@@ -11,17 +11,22 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "taw/taw.h"
+#include "tadamw/tadamw.h"
 
 static const char *prog = "taw";
 
 static void usage(FILE *f)
 {
 	fprintf(f,
+#if TAW_HAVE_ENCODER
 	    "usage: taw c [-l level] [-s] [-B block_size] [-p predictor] [-w weights]\n"
-	    "             <in> <out>\n"
+	    "             [-j threads] <in> <out>\n"
+#endif
+#if TAW_HAVE_DECODER
 	    "       taw d <in> <out>\n"
 	    "       taw x <in.awseek> <offset> <length> <out>\n"
+	    "       taw x <in.awseek> </file/name> <out>\n"
+#endif
 	    "       taw i <in>\n"
 	    "       taw --version\n"
 	    "\n"
@@ -30,8 +35,9 @@ static void usage(FILE *f)
 	    "      -p auto|order0|mix  predictor (default auto: the fitted mixer\n"
 	    "                       if it beats order0)\n"
 	    "      -w auto|f16|q8   mixer weight format (default auto)\n"
+	    "      -j N             worker threads for .awseek (default 1)\n"
 	    "  d   decompress a .aw or .awseek archive\n"
-	    "  x   extract an uncompressed byte range from a .awseek archive\n"
+	    "  x   extract a byte range, or a named file, from a .awseek archive\n"
 	    "  i   print header information\n"
 	    "  '-' as <in>/<out> means stdin/stdout (not for x's <in>).\n");
 }
@@ -92,7 +98,7 @@ static bool write_all(const char *path, const void *p, size_t n)
 	return ok;
 }
 
-static bool ends_with(const char *s, const char *suffix)
+[[maybe_unused]] static bool ends_with(const char *s, const char *suffix)
 {
 	size_t a = strlen(s), b = strlen(suffix);
 	return a >= b && strcmp(s + a - b, suffix) == 0;
@@ -109,6 +115,7 @@ static bool parse_u64(const char *s, uint64_t *v)
 	return true;
 }
 
+#if TAW_HAVE_ENCODER
 static const char *const predictors[] = {"auto", "order0", "mix", nullptr};
 static const char *const weights[] = {"auto", "f16", "q8", nullptr};
 
@@ -122,6 +129,8 @@ static bool parse_choice(const char *s, const char *const *names,
 		}
 	return false;
 }
+
+#endif
 
 static const char *profile_name(unsigned p)
 {
@@ -138,6 +147,7 @@ static const char *quant_name(unsigned q)
 	return q < 5 ? n[q] : "?";
 }
 
+#if TAW_HAVE_ENCODER
 static int cmd_compress(int argc, char **argv)
 {
 	taw_params p = {0};
@@ -157,6 +167,10 @@ static int cmd_compress(int argc, char **argv)
 		} else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc &&
 		    parse_choice(argv[i + 1], weights, &v)) {
 			p.weights = (taw_weights)v;
+			i++;
+		} else if (strcmp(argv[i], "-j") == 0 && i + 1 < argc &&
+		    parse_u64(argv[i + 1], &v) && v >= 1 && v <= 256) {
+			p.threads = (unsigned)v;
 			i++;
 		} else if (strcmp(argv[i], "-B") == 0 && i + 1 < argc &&
 		    parse_u64(argv[i + 1], &v) && v <= UINT32_MAX) {
@@ -190,6 +204,9 @@ static int cmd_compress(int argc, char **argv)
 	return ok ? 0 : fail(out, strerror(errno));
 }
 
+#endif
+
+#if TAW_HAVE_DECODER
 static int cmd_decompress(int argc, char **argv)
 {
 	if (argc != 2) {
@@ -231,9 +248,15 @@ static taw_status fd_read_at(void *ctx, uint64_t off, void *dst, size_t n)
 
 static int cmd_extract(int argc, char **argv)
 {
-	uint64_t off, len;
-	if (argc != 4 || !parse_u64(argv[1], &off) || !parse_u64(argv[2], &len) ||
-	    len > SIZE_MAX) {
+	uint64_t off = 0, len = 0;
+	const char *name = nullptr, *out;
+	if (argc == 3 && argv[1][0] == '/') {
+		name = argv[1];
+		out = argv[2];
+	} else if (argc == 4 && parse_u64(argv[1], &off) &&
+	    parse_u64(argv[2], &len) && len <= SIZE_MAX) {
+		out = argv[3];
+	} else {
 		usage(stderr);
 		return 2;
 	}
@@ -253,6 +276,17 @@ static int cmd_extract(int argc, char **argv)
 		close(fd);
 		return fail(argv[0], taw_strerror(st));
 	}
+	if (name) {
+		const taw_file *f;
+		long k = taw_seek_find(s, name);
+		if (k < 0 || taw_seek_files(s, &f) == 0 || f[k].size > SIZE_MAX) {
+			taw_seek_close(s);
+			close(fd);
+			return fail(name, "no such file in the archive");
+		}
+		off = f[k].offset;
+		len = f[k].size;
+	}
 	uint8_t *buf = malloc(len ? (size_t)len : 1);
 	if (!buf)
 		st = TAW_E_NOMEM;
@@ -264,10 +298,12 @@ static int cmd_extract(int argc, char **argv)
 		free(buf);
 		return fail(argv[0], taw_strerror(st));
 	}
-	bool ok = write_all(argv[3], buf, (size_t)len);
+	bool ok = write_all(out, buf, (size_t)len);
 	free(buf);
-	return ok ? 0 : fail(argv[3], strerror(errno));
+	return ok ? 0 : fail(out, strerror(errno));
 }
+
+#endif
 
 static int cmd_info(int argc, char **argv)
 {
@@ -295,6 +331,28 @@ static int cmd_info(int argc, char **argv)
 	if (info.kind == TAW_KIND_SEEKABLE)
 		printf("block_size: %" PRIu32 "\n", info.block_size);
 	printf("model_size: %" PRIu64 "\n", info.model_size);
+#if TAW_HAVE_DECODER
+	if (info.has_files && strcmp(argv[0], "-") != 0) {
+		int fd = open(argv[0], O_RDONLY);
+		struct stat sb;
+		taw_seek *s;
+		if (fd >= 0 && fstat(fd, &sb) == 0) {
+			taw_source src = {.read_at = fd_read_at, .ctx = &fd,
+				.size = (uint64_t)sb.st_size};
+			if (taw_seek_open(&src, &s) == TAW_OK) {
+				const taw_file *fl;
+				size_t nf = taw_seek_files(s, &fl);
+				printf("files:      %zu\n", nf);
+				for (size_t j = 0; j < nf; j++)
+					printf("  %12" PRIu64 "  %s\n", fl[j].size,
+					    fl[j].name);
+				taw_seek_close(s);
+			}
+		}
+		if (fd >= 0)
+			close(fd);
+	}
+#endif
 	return 0;
 }
 
@@ -316,12 +374,16 @@ int main(int argc, char **argv)
 	const char *cmd = argv[1];
 	argc -= 2;
 	argv += 2;
+#if TAW_HAVE_ENCODER
 	if (strcmp(cmd, "c") == 0)
 		return cmd_compress(argc, argv);
+#endif
+#if TAW_HAVE_DECODER
 	if (strcmp(cmd, "d") == 0)
 		return cmd_decompress(argc, argv);
 	if (strcmp(cmd, "x") == 0)
 		return cmd_extract(argc, argv);
+#endif
 	if (strcmp(cmd, "i") == 0)
 		return cmd_info(argc, argv);
 	usage(stderr);

@@ -12,7 +12,8 @@ void taw_header_write(taw_buf *b, const taw_header *h)
 	p[6] = h->profile;
 	p[7] = h->quant;
 	p[8] = h->level;
-	/* p[9] flags, p[10..11] reserved: zero */
+	p[9] = h->flags;
+	/* p[10..11] reserved: zero */
 	taw_wr32(p + 12, h->block_size);
 	taw_wr64(p + 16, h->model_size);
 	taw_wr32(p + 24, h->model_crc);
@@ -33,13 +34,16 @@ taw_status taw_header_parse(const uint8_t *p, size_t n, taw_header *h)
 		return TAW_E_CHECKSUM;
 	if (p[4] != TAW_FORMAT_VERSION)
 		return TAW_E_UNSUPPORTED;
-	if (p[9] != 0 || taw_rd16(p + 10) != 0)
+	if ((p[9] & ~TAW_FLAG_FILES) || taw_rd16(p + 10) != 0)
+		return TAW_E_UNSUPPORTED;
+	if ((p[9] & TAW_FLAG_FILES) && p[5] != TAW_KIND_AWSEEK)
 		return TAW_E_UNSUPPORTED;
 	*h = (taw_header){
 		.kind = p[5],
 		.profile = p[6],
 		.quant = p[7],
 		.level = p[8],
+		.flags = p[9],
 		.block_size = taw_rd32(p + 12),
 		.model_size = taw_rd64(p + 16),
 		.model_crc = taw_rd32(p + 24),

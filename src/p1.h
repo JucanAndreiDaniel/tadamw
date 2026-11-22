@@ -12,7 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "taw/taw.h"
+#include "tadamw/tadamw.h"
 
 /* ---- shape constants (normative) ---------------------------------------- */
 
@@ -211,6 +211,10 @@ typedef struct {
  * .aw, block_size for .awseek). Falls back to profile 0 when profile 1 is
  * not possible inside the budget. */
 taw_status taw_model_fit(const uint8_t *src, size_t n, size_t unit,
+    const taw_params *p, taw_model_choice *out);
+/* The same over any source (read_at may be called from several threads),
+ * with params->threads workers; the result does not depend on them. */
+taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
     const taw_params *p, taw_model_choice *out);
 
 #endif

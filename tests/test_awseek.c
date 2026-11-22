@@ -92,6 +92,105 @@ static void random_access_mix(void)
 	free(src);
 }
 
+static taw_status buf_write(void *ctx, const void *p, size_t n)
+{
+	taw_buf *b = ctx;
+	taw_buf_put(b, p, n);
+	return b->oom ? TAW_E_NOMEM : TAW_OK;
+}
+
+static taw_status encode_files(const uint8_t *src, size_t n,
+    const taw_params *p, const taw_file *f, size_t nf, taw_buf *out)
+{
+	taw_source in;
+	taw_source_memory(&in, src, n);
+	*out = (taw_buf){0};
+	const taw_sink sink = {.write = buf_write, .ctx = out};
+	return taw_seek_encode(&in, p, f, nf, &sink);
+}
+
+/* Directory, stored blocks, and archives independent of the thread count. */
+static void files_and_threads(void)
+{
+	enum { N = 200000, BS = 1 << 14 };
+	uint8_t *src = malloc(N);
+	REQUIRE(src);
+	td_fill(src, N / 2, TD_TEXT, 7);
+	td_fill(src + N / 2, N - N / 2, TD_RANDOM, 8); /* stored blocks */
+	const taw_file f[] = {
+		{"/text.txt", 0, N / 2},
+		{"/noise.bin", N / 2, N - N / 2 - 100},
+		{"/.meta", N - 50, 50},
+	};
+	taw_params p = {.block_size = BS, .level = 1,
+		.predictor = TAW_PREDICTOR_MIX, .threads = 1};
+	taw_buf a, b;
+	REQUIRE(encode_files(src, N, &p, f, 3, &a) == TAW_OK);
+	p.threads = 4;
+	REQUIRE(encode_files(src, N, &p, f, 3, &b) == TAW_OK);
+	CHECK(a.n == b.n && memcmp(a.p, b.p, a.n) == 0);
+	taw_buf_free(&b);
+
+	taw_info info;
+	CHECK(taw_read_info(a.p, a.n, &info) == TAW_OK && info.has_files);
+	taw_source in;
+	taw_source_memory(&in, a.p, a.n);
+	taw_seek *s;
+	REQUIRE(taw_seek_open(&in, &s) == TAW_OK);
+	const taw_file *got;
+	CHECK(taw_seek_files(s, &got) == 3);
+	CHECK(!strcmp(got[2].name, "/.meta") && got[2].offset == N - 50);
+	CHECK(taw_seek_find(s, "/noise.bin") == 1);
+	CHECK(taw_seek_find(s, "/nope") == -1);
+	uint8_t buf[50];
+	CHECK(taw_seek_read(s, got[2].offset, buf, 50) == TAW_OK);
+	CHECK(memcmp(buf, src + N - 50, 50) == 0);
+	taw_seek_close(s);
+
+	/* the random half is stored: some index entry has coded_len == raw */
+	{
+		uint64_t ix = taw_rd64(a.p + a.n - 16);
+		uint32_t nb = taw_rd32(a.p + ix + 4), stored = 0;
+		for (uint32_t i = 0; i < nb; i++)
+			stored += taw_rd32(a.p + ix + 16 + 16 * i + 8) == BS;
+		CHECK(stored >= (N / 2) / BS - 1);
+		CHECK(a.n < N + 4096); /* random data does not grow */
+	}
+	void *dec;
+	size_t dec_n;
+	CHECK(taw_decompress(a.p, a.n, &dec, &dec_n) == TAW_OK);
+	CHECK(dec_n == N && memcmp(dec, src, N) == 0);
+	free(dec);
+
+	/* a corrupt directory (CRC fixed up) is refused */
+	{
+		uint64_t ix = taw_rd64(a.p + a.n - 16);
+		uint32_t nb = taw_rd32(a.p + ix + 4);
+		uint8_t *d = a.p + ix + 16 + 16 * (uint64_t)nb;
+		uint8_t save = d[4 + 18]; /* first name's '/' */
+		d[4 + 18] = 'x';
+		taw_wr32(a.p + a.n - 8, taw_crc32c(0, a.p + ix, a.n - 16 - ix));
+		taw_source_memory(&in, a.p, a.n);
+		CHECK(taw_seek_open(&in, &s) == TAW_E_FORMAT);
+		d[4 + 18] = save;
+	}
+	taw_buf_free(&a);
+
+	/* invalid directories */
+	const taw_file unsorted[] = {{"/b", 100, 10}, {"/a", 0, 10}};
+	const taw_file overlap[] = {{"/a", 0, 20}, {"/b", 10, 10}};
+	const taw_file noslash[] = {{"a", 0, 10}};
+	const taw_file dup[] = {{"/a", 0, 10}, {"/a", 10, 10}};
+	const taw_file past[] = {{"/a", N - 5, 10}};
+	p.threads = 1;
+	CHECK(encode_files(src, N, &p, unsorted, 2, &a) == TAW_E_ARG);
+	CHECK(encode_files(src, N, &p, overlap, 2, &a) == TAW_E_ARG);
+	CHECK(encode_files(src, N, &p, noslash, 1, &a) == TAW_E_ARG);
+	CHECK(encode_files(src, N, &p, dup, 2, &a) == TAW_E_ARG);
+	CHECK(encode_files(src, N, &p, past, 1, &a) == TAW_E_ARG);
+	free(src);
+}
+
 static void random_access(void)
 {
 	enum { N = (1 << 20) + 12345, BS = 4096 };
@@ -221,5 +320,6 @@ int main(void)
 
 	random_access();
 	random_access_mix();
+	files_and_threads();
 	return CHECK_DONE();
 }

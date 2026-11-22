@@ -6,7 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "taw/taw.h"
+#include "tadamw/tadamw.h"
 
 /* ---- growable byte buffer ---------------------------------------------- */
 
@@ -49,6 +49,21 @@ static inline void taw_wr64(uint8_t *p, uint64_t v)
 	taw_wr32(p, (uint32_t)v);
 	taw_wr32(p + 4, (uint32_t)(v >> 32));
 }
+
+/* ---- parallel jobs (pool.c) --------------------------------------------- */
+
+/* work(ctx, i, worker) runs job i on worker thread `worker` (0..threads-1,
+ * for per-thread scratch). done(ctx, i), if given, runs on the calling thread
+ * for i = 0, 1, ... in order as jobs finish; at most `window` jobs past the
+ * last done one are started (0 = no limit). A done that fails stops the
+ * queue; its status is returned. threads <= 1 runs everything inline. */
+typedef void (*taw_work_fn)(void *ctx, size_t i, unsigned worker);
+typedef taw_status (*taw_done_fn)(void *ctx, size_t i);
+taw_status taw_parallel(unsigned threads, size_t n, size_t window,
+    taw_work_fn work, taw_done_fn done, void *ctx);
+
+/* The bytes of a memory source (taw_source_memory), or nullptr for others. */
+const uint8_t *taw_source_view(const taw_source *s);
 
 /* ---- CRC-32C ------------------------------------------------------------ */
 
@@ -133,5 +148,7 @@ void taw_pred_reset(taw_pred *pr);
 void taw_pred_encode(taw_pred *pr, taw_rc_enc *e, const uint8_t *src,
     size_t n);
 void taw_pred_decode(taw_pred *pr, taw_rc_dec *d, uint8_t *dst, size_t n);
+/* Advance the state over n known bytes without a coder (stored aw chunks). */
+void taw_pred_skip(taw_pred *pr, const uint8_t *src, size_t n);
 
 #endif

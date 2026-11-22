@@ -19,7 +19,11 @@ drive a binary range coder (format.md §4).
 | weights | stored in a tagged quant format; F16 is standard |
 | arithmetic | tagged arithmetic profile; decoders refuse unknown profiles/quants |
 | variants | `.aw` stream, `.awseek` seekable with one global model |
-| language | C23, libc only, CMake + CTest |
+| language | C23 inside, CMake + CTest; libtadamw needs libc and pthreads |
+| library | `libtadamw` (static or shared), `<tadamw/tadamw.h>` usable from C99+/C++, encoder and decoder halves selectable at build time |
+| portability | every SIMD path has a generic one with identical results; byte-wise little-endian I/O, so big-endian hosts (ppc64) work too (not yet run on one) |
+| license | GPL-3.0-or-later, since `tools/hactool` carries ScarletNX's code |
+| awseek extras | file directory (format.md §7.1), stored blocks/chunks, parallel streaming encoder (`taw_seek_encode`) whose output does not depend on the thread count |
 | libm | never used, in the encoder or the decoder; squash/exp go through SIMD intrinsics or tables |
 | model shape | table/MLP split chosen heuristically per input, not fixed |
 | weight formats (profile 1) | F16 and INT8 (Q8) from the start |
@@ -141,8 +145,12 @@ cheaper mixer, or AVX-512 scatter for the write-back.
    load the bytes through the decoder's own loader, and estimate
    `bits/bit × 8n + 8 × model bytes` on the samples with the real
    inference code. Keep the best.
-7. Code the input with profile 1. With `predictor = auto` also code it
-   with profile 0 and keep the smaller archive.
+7. Code the input with profile 1. For `.aw` with `predictor = auto`, also
+   code it with profile 0 and keep the smaller archive. `.awseek` streams
+   through `taw_seek_encode` instead. It codes each block once with the chosen
+   model and stores the blocks that do not shrink. Collection, candidate
+   fitting and block coding run on `threads` workers. The samples are picked
+   by position, so the archive does not depend on the thread count.
 
 Level sets the effort only:
 
@@ -197,10 +205,11 @@ can run in parallel later.
 
 | path | role |
 |------|------|
-| `include/taw/taw.h` | public API |
+| `include/tadamw/tadamw.h` | public API (`cmake/config.h.in` gives `<tadamw/config.h>`) |
 | `src/api.c` | public entry points, variant dispatch |
 | `src/buf.c` | growable output buffer |
-| `src/crc32c.c` | CRC-32C |
+| `src/crc32c.c`, `src/crc32c_sse42.c` | CRC-32C: slicing-by-8, SSE4.2 |
+| `src/pool.c` | worker threads (`taw_parallel`) |
 | `src/rc.c` | binary range coder (format.md §4) |
 | `src/predictor.c` | arithmetic profiles: dispatch, profile 0, profile 1 APM and per-bit loop |
 | `src/p1.h` | profile 1 internal interface and constants |
@@ -241,9 +250,7 @@ can run in parallel later.
   machine has no AVX-512, so it has never actually run. The parity tests
   cover it automatically on a machine that has it. Its context models use
   the AVX2 kernels.
-- Streaming encode for inputs larger than memory. (Fitting needs a pass
-  over the data, so this probably means fitting on a sample.)
-- Parallel block coding for awseek.
-- A stored (uncoded) mode for incompressible chunks/blocks. Profile 0 grows
-  random data by about 2.4%. Under `auto`, random input stays with
-  profile 0.
+- `.aw` streams are still encoded from memory; `.awseek` has the streaming
+  encoder (`taw_seek_encode`), which fits on an even sample of the whole input.
+- Big-endian: the code is written for it (byte-wise I/O, CRC table path
+  byte-swaps), but it has not run on a big-endian machine yet.

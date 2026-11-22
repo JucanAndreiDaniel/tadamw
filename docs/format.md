@@ -26,7 +26,7 @@ Two variants share one header and one model section:
 | 6   | 1    | arith_profile  | §2 |
 | 7   | 1    | quant          | §3 |
 | 8   | 1    | level          | encoder effort 1..9, informational |
-| 9   | 1    | flags          | must be `0` |
+| 9   | 1    | flags          | bit 0: the awseek index has a file directory (§7.1); other bits `0` |
 | 10  | 2    | reserved       | must be `0` |
 | 12  | 4    | block_size     | awseek: raw bytes per block; aw: `0` |
 | 16  | 8    | model_size     | bytes in the model section |
@@ -34,7 +34,8 @@ Two variants share one header and one model section:
 | 28  | 4    | header_crc     | crc32c of bytes 0..27 |
 
 A decoder MUST refuse a file if any of these hold: wrong magic, unknown
-version or kind, non-zero flags or reserved, bad `header_crc` or
+version or kind, a flag bit other than bit 0 (or bit 0 on an aw stream),
+non-zero reserved bytes, bad `header_crc` or
 `model_crc`, or an unsupported `(arith_profile, quant)` pair. Decoders never
 fall back to a different arithmetic: an archive decodes exactly or not at all.
 
@@ -407,6 +408,11 @@ trailer: u64 total_raw_len
 - `raw_crc` is crc32c of the chunk's decoded bytes, and `stream_crc` is
   crc32c of the whole decoded stream.
 - `1 <= raw_len <= 2^26`.
+- A chunk with `coded_len == raw_len` is **stored**: `coded` is the raw bytes.
+  The predictor state still advances over them exactly as if they had been
+  coded (each bit predicted and updated, no range coder). Encoders store a
+  chunk whenever coding would not make it smaller, so a coded chunk is always
+  shorter than its raw bytes.
 - Chunks only frame the data. The predictor state carries across chunks,
   and only the range coder is restarted.
 - The decoded size MUST equal `total_raw_len`.
@@ -419,7 +425,10 @@ header | model | block[0] ... block[n-1] | index | footer
 
 Block `i` holds raw bytes `[i*block_size, min((i+1)*block_size, total))`.
 Each block is one range-coder segment, and the predictor state is reset at
-the start of each block. That is what makes random access possible.
+the start of each block. That is what makes random access possible. A block
+whose `coded_len` equals its raw length is **stored**: its bytes are the raw
+bytes. Encoders store a block whenever coding would not make it smaller.
+Blocks are independent, so they may be coded and decoded in parallel.
 
 Index:
 
@@ -430,7 +439,9 @@ Index:
 | 8    | total_raw_len |
 | 16 × block_count | entries: `u64 coded_offset` (absolute), `u32 coded_len`, `u32 raw_crc` |
 
-`block_count` MUST equal `ceil(total_raw_len / block_size)`.
+`block_count` MUST equal `ceil(total_raw_len / block_size)`. With flag bit 0
+the entries are followed by the file directory (§7.1), still inside the index
+and covered by `index_crc`.
 
 Footer (the last 16 bytes of the file):
 
@@ -442,3 +453,24 @@ Footer (the last 16 bytes of the file):
 
 A random-access read of `[off, off+len)` decodes only the blocks that
 overlap it.
+
+### 7.1 File directory
+
+The directory names byte ranges of the decoded data, so one `.awseek` can hold
+several files:
+
+| size | field |
+|------|-------|
+| 4 | file_count |
+| per file | `u64 offset`, `u64 size`, `u16 name_len`, `name[name_len]` |
+
+Rules (a decoder MUST refuse a directory that breaks one):
+
+- Names are UTF-8 paths that start with `/`, 1 to 4096 bytes, without NUL, and
+  are unique.
+- Files are sorted by offset and do not overlap: `offset + size` of one file
+  is at most the next file's offset, and the last one ends by
+  `total_raw_len`.
+- The directory must end exactly where the footer starts.
+
+Bytes outside every file are allowed but carry no name.

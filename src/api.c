@@ -7,7 +7,8 @@
 #include "format.h"
 #include "header.h"
 
-static taw_status finish(taw_status st, taw_buf *b, void **out, size_t *out_n)
+[[maybe_unused]] static taw_status finish(taw_status st, taw_buf *b, void **out,
+    size_t *out_n)
 {
 	if (st != TAW_OK) {
 		taw_buf_free(b);
@@ -22,11 +23,18 @@ static taw_status finish(taw_status st, taw_buf *b, void **out, size_t *out_n)
 	return *out ? TAW_OK : TAW_E_NOMEM;
 }
 
+#if TAW_HAVE_ENCODER
 static taw_status encode_with(const uint8_t *src, size_t n,
     const taw_params *p, const taw_model_choice *m, taw_buf *b)
 {
-	return p->seekable ? taw_awseek_encode(src, n, p, m, b)
-			   : taw_aw_encode(src, n, p, m, b);
+	return taw_aw_encode(src, n, p, m, b);
+}
+
+static taw_status buf_sink(void *ctx, const void *p, size_t n)
+{
+	taw_buf *b = ctx;
+	taw_buf_put(b, p, n);
+	return b->oom ? TAW_E_NOMEM : TAW_OK;
 }
 
 taw_status taw_compress(const void *src, size_t n, const taw_params *params,
@@ -38,7 +46,15 @@ taw_status taw_compress(const void *src, size_t n, const taw_params *params,
 	taw_status st = taw_params_resolve(params, &p);
 	if (st != TAW_OK)
 		return st;
-	const size_t unit = p.seekable && p.block_size < n ? p.block_size : n;
+	if (p.seekable) {
+		taw_source in;
+		taw_source_memory(&in, src, n);
+		taw_buf b = {0};
+		const taw_sink sink = {.write = buf_sink, .ctx = &b};
+		st = taw_seek_encode(&in, &p, nullptr, 0, &sink);
+		return finish(st, &b, out, out_n);
+	}
+	const size_t unit = n;
 	taw_model_choice m;
 	st = taw_model_fit(src, n, unit, &p, &m);
 	if (st != TAW_OK)
@@ -63,6 +79,9 @@ taw_status taw_compress(const void *src, size_t n, const taw_params *params,
 	return finish(st, &b, out, out_n);
 }
 
+#endif
+
+#if TAW_HAVE_DECODER
 static taw_status decompress_seekable(const void *src, size_t n, void **out,
     size_t *out_n)
 {
@@ -106,6 +125,7 @@ taw_status taw_decompress(const void *src, size_t n, void **out,
 	return finish(st, &b, out, out_n);
 }
 
+#endif
 taw_status taw_read_info(const void *src, size_t n, taw_info *info)
 {
 	if (!src || !info)
@@ -116,6 +136,7 @@ taw_status taw_read_info(const void *src, size_t n, taw_info *info)
 		return st;
 	*info = (taw_info){
 		.kind = (taw_kind)h.kind,
+		.has_files = (h.flags & TAW_FLAG_FILES) != 0,
 		.arith_profile = h.profile,
 		.quant = h.quant,
 		.level = h.level,

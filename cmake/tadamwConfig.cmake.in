@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+include("${CMAKE_CURRENT_LIST_DIR}/tadamwTargets.cmake")
+set(tadamw_ENCODER @TAW_HAVE_ENCODER@)
+set(tadamw_DECODER @TAW_HAVE_DECODER@)
+check_required_components(tadamw)
