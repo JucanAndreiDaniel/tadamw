@@ -190,25 +190,33 @@ static void collect_unit(void *arg, size_t u, unsigned w)
 			return;
 		src = J->buf[w];
 	}
-	uint64_t bit = start * 8;
-	uint64_t at = sample_index(bit, J->want, J->total);
+	/* Inside each byte the bits are visited in a rotated order for the
+	 * selection (the rotation is a hash of the byte's position): a plain
+	 * stride over bit positions keeps the same bit of every byte whenever
+	 * 8n / want is a multiple of 8, e.g. for any power-of-two input size,
+	 * and the mixer then never sees the other seven bit positions. */
 	for (uint64_t i = 0; i < len; i++) {
+		const uint64_t byte = start + i;
+		uint64_t idx[9];
+		for (unsigned j = 0; j <= 8; j++)
+			idx[j] = sample_index(byte * 8 + j, J->want, J->total);
+		const unsigned rot =
+		    (unsigned)((byte * 0x9E3779B97F4A7C15ull) >> 61);
 		const unsigned ch = src[i];
-		for (int b = 7; b >= 0; b--, bit++) {
-			const int v = (ch >> b) & 1;
+		for (unsigned bp = 0; bp < 8; bp++) {
+			const int v = (ch >> (7 - bp)) & 1;
+			const unsigned j = (bp + rot) & 7;
 			float xv[32];
 			p1_sel_ctx sc;
-			p1_ctx_inputs(c, xv, &sc);
-			const uint64_t next = sample_index(bit + 1, J->want, J->total);
-			if (next != at) {
-				sample *s = &J->sm[at];
+			p1_ctx_inputs(c, xv, &sc); /* the update needs them */
+			if (idx[j + 1] != idx[j]) {
+				sample *s = &J->sm[idx[j]];
 				for (unsigned q = 0; q < P1_NCTX; q++) /* exact */
 					s->st[q] = (int16_t)(xv[q] * 256.0f);
 				s->c0 = sc.c0;
 				s->c1 = sc.c1;
 				s->msel = sc.msel;
 				s->bit = (uint8_t)v;
-				at = next;
 			}
 			p1_ctx_update(c, v);
 		}
