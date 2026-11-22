@@ -203,3 +203,51 @@ muon_060_lowfin	muon	muon W1 .06->1.2e-3 (1/50); W2 .003->1.5e-4	text1m	1	179758
 muon_060_lowfin	muon	muon W1 .06->1.2e-3 (1/50); W2 .003->1.5e-4	text1m	5	178006	0.976	1
 muon_060_lowfin	muon	muon W1 .06->1.2e-3 (1/50); W2 .003->1.5e-4	libc1m	1	371883	1.046	1
 muon_060_lowfin	muon	muon W1 .06->1.2e-3 (1/50); W2 .003->1.5e-4	libc1m	5	367149	1.055	1
+malt_b090_e8	adam	malt b2=.90 eps=1e-8 lr .055->.0011	text1m	1	179542	1.886	1
+malt_b090_e8	adam	malt b2=.90 eps=1e-8 lr .055->.0011	text1m	5	178181	1.512	1
+malt_b090_e8	adam	malt b2=.90 eps=1e-8 lr .055->.0011	libc1m	1	371105	1.862	1
+malt_b090_e8	adam	malt b2=.90 eps=1e-8 lr .055->.0011	libc1m	5	368413	1.784	1
+malt_b099_e4	adam	malt b2=.99 eps=1e-4 lr .055->.0011	text1m	1	179137	1.596	1
+malt_b099_e4	adam	malt b2=.99 eps=1e-4 lr .055->.0011	text1m	5	178130	1.503	1
+malt_b099_e4	adam	malt b2=.99 eps=1e-4 lr .055->.0011	libc1m	1	371644	1.554	1
+malt_b099_e4	adam	malt b2=.99 eps=1e-4 lr .055->.0011	libc1m	5	368632	1.611	1
+malt_b090_e5_l065	adam	malt b2=.90 eps=1e-5 lr .065->.0013	text1m	1	179659	1.435	1
+malt_b090_e5_l065	adam	malt b2=.90 eps=1e-5 lr .065->.0013	text1m	5	178321	1.459	1
+malt_b090_e5_l065	adam	malt b2=.90 eps=1e-5 lr .065->.0013	libc1m	1	371021	1.405	1
+malt_b090_e5_l065	adam	malt b2=.90 eps=1e-5 lr .065->.0013	libc1m	5	368396	1.540	1
+malter_050	adam	malter b2=.99 eps=1e-4 lr .5->.005	text1m	1	179083	1.403	1
+malter_050	adam	malter b2=.99 eps=1e-4 lr .5->.005	text1m	5	178150	1.411	1
+malter_050	adam	malter b2=.99 eps=1e-4 lr .5->.005	libc1m	1	370805	1.526	1
+malter_050	adam	malter b2=.99 eps=1e-4 lr .5->.005	libc1m	5	368857	1.541	1
+malter_040	adam	malter b2=.99 eps=1e-4 lr .4->.008	text1m	1	178983	1.410	1
+malter_040	adam	malter b2=.99 eps=1e-4 lr .4->.008	text1m	5	178010	1.375	1
+malter_040	adam	malter b2=.99 eps=1e-4 lr .4->.008	libc1m	1	370933	1.488	1
+malter_040	adam	malter b2=.99 eps=1e-4 lr .4->.008	libc1m	5	369212	1.626	1
+malter_030	adam	malter b2=.99 eps=1e-4 lr .3->.006	text1m	1	178438	1.588	1
+malter_030	adam	malter b2=.99 eps=1e-4 lr .3->.006	text1m	5	178364	1.561	1
+malter_030	adam	malter b2=.99 eps=1e-4 lr .3->.006	libc1m	1	371540	1.640	1
+malter_030	adam	malter b2=.99 eps=1e-4 lr .3->.006	libc1m	5	368922	1.470	1
+malter_020_e8	adam	malter b2=.99 eps=1e-8 lr .2->.004	text1m	1	178712	1.733	1
+malter_020_e8	adam	malter b2=.99 eps=1e-8 lr .2->.004	text1m	5	178471	1.397	1
+malter_020_e8	adam	malter b2=.99 eps=1e-8 lr .2->.004	libc1m	1	371495	1.179	1
+malter_020_e8	adam	malter b2=.99 eps=1e-8 lr .2->.004	libc1m	5	368641	1.376	1
+malt_w2_b090_e8	adam	malt b2=.9 eps=1e-8 lr .055->.0011; W2 .003->.00015	text1m	1	179635	0.991	1
+malt_w2_b090_e8	adam	malt b2=.9 eps=1e-8 lr .055->.0011; W2 .003->.00015	text1m	5	177804	1.045	1
+malt_w2_b090_e8	adam	malt b2=.9 eps=1e-8 lr .055->.0011; W2 .003->.00015	libc1m	1	371743	1.123	1
+malt_w2_b090_e8	adam	malt b2=.9 eps=1e-8 lr .055->.0011; W2 .003->.00015	libc1m	5	366329	1.018	1
+malt_w2_b099_e4	adam	malt b2=.99 eps=1e-4 lr .055->.0011; W2 .003->.00015	text1m	1	179575	0.975	1
+malt_w2_b099_e4	adam	malt b2=.99 eps=1e-4 lr .055->.0011; W2 .003->.00015	text1m	5	177785	1.268	1
+malt_w2_b099_e4	adam	malt b2=.99 eps=1e-4 lr .055->.0011; W2 .003->.00015	libc1m	1	371532	1.267	1
+malt_w2_b099_e4	adam	malt b2=.99 eps=1e-4 lr .055->.0011; W2 .003->.00015	libc1m	5	367066	1.238	1
+malter_w2_050	adam	malter b2=.99 eps=1e-4 lr .5->.005; W2 .003->.00015	text1m	1	179668	1.150	1
+malter_w2_050	adam	malter b2=.99 eps=1e-4 lr .5->.005; W2 .003->.00015	text1m	5	177497	1.011	1
+malter_w2_050	adam	malter b2=.99 eps=1e-4 lr .5->.005; W2 .003->.00015	libc1m	1	371321	1.082	1
+malter_w2_050	adam	malter b2=.99 eps=1e-4 lr .5->.005; W2 .003->.00015	libc1m	5	366923	1.091	1
+malter_w2_030	adam	malter b2=.99 eps=1e-4 lr .3->.006; W2 .003->.00015	text1m	1	179020	0.992	1
+malter_w2_030	adam	malter b2=.99 eps=1e-4 lr .3->.006; W2 .003->.00015	text1m	5	177397	0.962	1
+malter_w2_030	adam	malter b2=.99 eps=1e-4 lr .3->.006; W2 .003->.00015	libc1m	1	371844	1.067	1
+malter_w2_030	adam	malter b2=.99 eps=1e-4 lr .3->.006; W2 .003->.00015	libc1m	5	367077	1.201	1
+malter_winner	adam	MALTER W1 .28->.0056 b2=.9 eps=1e-8; W2 .003->.00015	text1m	1	179405	0.943	1
+malter_winner	adam	MALTER W1 .28->.0056 b2=.9 eps=1e-8; W2 .003->.00015	text1m	5	177138	0.927	1
+malter_winner	adam	MALTER W1 .28->.0056 b2=.9 eps=1e-8; W2 .003->.00015	libc1m	1	370898	0.995	1
+malter_winner	adam	MALTER W1 .28->.0056 b2=.9 eps=1e-8; W2 .003->.00015	libc1m	5	366504	0.998	1
