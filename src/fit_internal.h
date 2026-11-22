@@ -31,6 +31,9 @@ typedef struct {
 	 * but allocated unconditionally so the shipped fitter is untouched. */
 	float *malt_l, *malt_r;    /* [s1*H], [s1*P1_F] */
 	float *malt_nu;            /* [s1] */
+	/* NAMO / NAMO-D W1 state: scalar second moment per set, column second
+	 * moments per set, and the C3 sign EMA per W1 weight. */
+	float *v2s, *v2c, *sig1;   /* [s1], [s1*P1_HMAX], [n1] */
 	uint8_t *touched1, *touched2;
 	bool tied; /* warm-up: every sample uses set 0 */
 	uint32_t *list1, *list2;

@@ -271,6 +271,9 @@ static void tnet_free(tnet *t)
 	free(t->malt_l);
 	free(t->malt_r);
 	free(t->malt_nu);
+	free(t->v2s);
+	free(t->v2c);
+	free(t->sig1);
 	free(t->touched1);
 	free(t->touched2);
 	free(t->list1);
@@ -301,6 +304,9 @@ static taw_status tnet_init(tnet *t, const p1_shape *s, uint64_t seed)
 	t->malt_l = calloc(t->s1 * H + 1, sizeof(float));
 	t->malt_r = calloc(t->s1 * P1_F + 1, sizeof(float));
 	t->malt_nu = calloc(t->s1 + 1, sizeof(float));
+	t->v2s = calloc(t->s1 ? t->s1 : 1, sizeof(float));
+	t->v2c = calloc(t->n1 ? t->s1 * P1_HMAX : 1, sizeof(float));
+	t->sig1 = calloc(t->n1 ? t->n1 : 1, sizeof(float));
 	t->touched1 = calloc(t->s1 + 1, 1);
 	t->touched2 = calloc(t->s2, 1);
 	t->list1 = malloc((t->s1 + 1) * sizeof(uint32_t));
@@ -309,6 +315,7 @@ static taw_status tnet_init(tnet *t, const p1_shape *s, uint64_t seed)
 	t->route1 = calloc(t->s1 ? t->s1 : 1, 1);
 	if (!t->w || !t->m || !t->v || !t->g || !t->m1 || !t->v1 ||
 	    !t->malt_l || !t->malt_r || !t->malt_nu ||
+	    !t->v2s || !t->v2c || !t->sig1 ||
 	    !t->touched1 || !t->touched2 || !t->list1 || !t->list2 ||
 	    !t->cnt1 || !t->route1) {
 		tnet_free(t);
@@ -419,6 +426,13 @@ static void tnet_untie(tnet *t)
 		    P1_F * sizeof(float));
 		t->malt_nu[set] = t->malt_nu[0];
 	}
+	/* NAMO / NAMO-D second moments and the C3 sign EMA are W1-only state. */
+	for (size_t set = 1; set < t->s1; set++) {
+		t->v2s[set] = t->v2s[0];
+		memcpy(t->v2c + set * P1_HMAX, t->v2c, P1_HMAX * sizeof(float));
+		memcpy(t->sig1 + set * t->row1, t->sig1,
+		    t->row1 * sizeof(float));
+	}
 	t->tied = false;
 }
 
@@ -441,7 +455,9 @@ typedef enum {
 	HYB_ALT,      /* W1: alternate Muon / AdamW by step or by half */
 	HYB_ROUTE,    /* W1: Muon for hot sets, AdamW for cold sets */
 	HYB_MALT,     /* W1: MALT (two-sided diagonal preconditioned Muon) */
-	HYB_MALTER    /* W1: MALTER (MALT + adaptive step-size rescaling) */
+	HYB_MALTER,   /* W1: MALTER (MALT + adaptive step-size rescaling) */
+	HYB_NAMO,     /* W1: NAMO (scalar adaptive scale on Orth(M)) */
+	HYB_NAMOD     /* W1: NAMO-D (clamped diagonal right-multiplication) */
 } hyb_mode;
 
 /* Norm-grafting source for the MALT update magnitude. */
@@ -450,16 +466,19 @@ enum { GRAFT_O = 0, /* paper: ||Orth(M~)||_F */
        GRAFT_M = 2 /*||M~||_F */ };
 
 typedef struct {
-	float lr, lrvec, lr1;  /* current LRs: Muon W1, Adam W2, Adam W1 */
+	float lr, lrvec, lr1;  /* current LRs: Muon/NAMO W1, Adam W2, Adam W1 */
 	float wd, vecwd, wd1;  /* decoupled weight decay */
 	float b1, b2, eps;     /* Adam */
 	float mom, gain;       /* Muon */
 	float b1t, b2t;        /* b1^t, b2^t */
 	float malt_b2, malt_eps;   /* diagonal-preconditioner EMA / damping */
 	float malt_b1t, malt_b2t;  /* momentum^t, malt_b2^t (MALTER bias correction) */
+	float n1t, n2t;        /* mu1^t, mu2^t for NAMO / NAMO-D */
+	float nb2, nscale, nclamp; /* NAMO: mu2, step scale, NAMO-D clamp c */
+	float ngbeta, ngp;     /* C3 sign-EMA gate on W1 */
 	unsigned ns_steps;
 	int graft;             /* MALT graft mode */
-	bool nesterov;
+	bool nesterov, gate_c3, drow;
 } optcfg;
 
 /* Tuning hooks (encoder-only; unset = shipped behaviour). */
@@ -483,10 +502,22 @@ static unsigned fit_env_uint(const char *name, unsigned def)
 	return end != s ? (unsigned)v : def;
 }
 
+/* C3 shrink gate (as in exp/eps-gate): a per-weight sign EMA whose magnitude
+ * |s|^p scales the coordinate step. sig == NULL means the gate is off. */
+static inline float c3_gate(float *sig, size_t k, float gk, const optcfg *o)
+{
+	float s = o->ngbeta * sig[k] + (1.0f - o->ngbeta) *
+	    (gk > 0.0f ? 1.0f : gk < 0.0f ? -1.0f : 0.0f);
+	sig[k] = s;
+	float a = s < 0.0f ? -s : s;
+	return o->ngp == 2.0f ? a * a : a;
+}
+
 /* AdamW on a flat vector. `mix` scales the whole update (1 for plain AdamW,
- * 1-alpha for the Adam half of a blend). Gradients are cleared by caller. */
+ * 1-alpha for the Adam half of a blend). Gradients are cleared by caller.
+ * `sig`, when non-NULL, applies the optional C3 gate to the W1 update. */
 static void adam_rows(optcfg *o, float *w, float *m, float *v, const float *g,
-    size_t len, float scale, float lr, float wd, float mix)
+    float *sig, size_t len, float scale, float lr, float wd, float mix)
 {
 	const float c1 = 1.0f / (1.0f - o->b1t), c2 = 1.0f / (1.0f - o->b2t);
 	for (size_t k = 0; k < len; k++) {
@@ -494,14 +525,19 @@ static void adam_rows(optcfg *o, float *w, float *m, float *v, const float *g,
 		m[k] = o->b1 * m[k] + (1.0f - o->b1) * gk;
 		v[k] = o->b2 * v[k] + (1.0f - o->b2) * gk * gk;
 		float mh = m[k] * c1, vh = v[k] * c2;
-		w[k] -= mix * lr * (mh / (fsqrt(vh) + o->eps) + wd * w[k]);
+		if (sig)
+			w[k] -= mix * lr * (mh / (fsqrt(vh) + o->eps) +
+			    wd * w[k]) * c3_gate(sig, k, gk, o);
+		else
+			w[k] -= mix * lr * (mh / (fsqrt(vh) + o->eps) + wd * w[k]);
 	}
 }
 
 /* Muon on a row-major rows x cols matrix. Largest shape here is
  * P1_HMAX x P1_F = 32 x 26, so scratch fits on the stack. */
 static void muon_rows(const optcfg *o, float *w, float *m, const float *g,
-    size_t rows, size_t cols, float scale, float lr, float wd, float mix)
+    float *sig, size_t rows, size_t cols, float scale, float lr, float wd,
+    float mix)
 {
 	float x[MUON_MAXEL], a[MUON_MAXEL], b[MUON_MAXEL], y[MUON_MAXEL];
 	const bool tr = rows > cols; /* work with the shorter dimension first */
@@ -552,7 +588,116 @@ static void muon_rows(const optcfg *o, float *w, float *m, const float *g,
 	const float factor = mix * lr * o->gain * fsqrt((float)dmax);
 	for (size_t i = 0; i < rows * cols; i++) {
 		size_t at = tr ? (i % cols) * mc + i / cols : i;
-		w[i] -= factor * x[at] + mix * lr * wd * w[i];
+		if (sig)
+			w[i] -= (factor * x[at] + mix * lr * wd * w[i]) *
+			    c3_gate(sig, i, g[i] * scale, o);
+		else
+			w[i] -= factor * x[at] + mix * lr * wd * w[i];
+	}
+}
+
+/* NAMO / NAMO-D (arXiv:2602.17080v2, Algorithms 1 and 2) on a row-major
+ * rows x cols W1 matrix. The first moment m[] is the usual Muon momentum
+ * (m = mu1*m + g, with g already divided by the batch size), i.e. the paper's
+ * biased M_t / (1-mu1). Orthogonalization is scale invariant, so O_t is the
+ * paper's Orth(M_t) up to that constant; the bias-corrected scale mu1^t and
+ * eps_t are folded into the adaptive scale below. NAMO uses one scalar
+ * alpha_t; NAMO-D uses column norms and a clamped right-diagonal D_t. The
+ * adaptive scale also multiplies decoupled weight decay, as in the paper's
+ * GPT-2 experiments. */
+static void namo_rows(const optcfg *o, float *w, float *m, const float *g,
+    float *vs, float *vc, float *sig, size_t set, size_t rows, size_t cols,
+    float scale, float lr, float wd, bool diag)
+{
+	float x[MUON_MAXEL], a[MUON_MAXEL], b[MUON_MAXEL], y[MUON_MAXEL];
+	float mn[MUON_MAXDIM], gn[MUON_MAXDIM], d[MUON_MAXDIM];
+	const bool tr = rows > cols;
+	const size_t mr = tr ? cols : rows, mc = tr ? rows : cols;
+	if (rows * cols > MUON_MAXEL || mr == 0 || mc == 0 ||
+	    cols > MUON_MAXDIM || rows > MUON_MAXDIM)
+		return;
+	const bool arow = diag && o->drow; /* ablation: scale rows, not columns */
+	const size_t nd = arow ? rows : cols;
+	const float mu1 = o->mom, mu2 = o->nb2;
+	float mm = 0.0f, gg = 0.0f;
+	for (size_t j = 0; j < nd; j++)
+		mn[j] = gn[j] = 0.0f;
+	for (size_t i = 0; i < rows * cols; i++) {
+		float gi = g[i] * scale;
+		m[i] = mu1 * m[i] + gi;
+		mm += m[i] * m[i];
+		gg += gi * gi;
+		size_t jd = arow ? i / cols : i % cols;
+		mn[jd] += m[i] * m[i];
+		gn[jd] += gi * gi;
+		float u = o->nesterov ? mu1 * m[i] + gi : m[i];
+		size_t at = tr ? (i % cols) * mc + i / cols : i;
+		x[at] = u;
+	}
+	vs[set] = mu2 * vs[set] + (1.0f - mu2) * gg;
+	/* mscale * ||m|| / (sqrt(v) + eps) == ||Mhat|| / (sqrt(vhat)+eps_t) */
+	const float mscale = (1.0f - mu1) / (1.0f - o->n1t) *
+	    fsqrt(1.0f - o->n2t);
+	float alpha = mscale * fsqrt(mm) / (fsqrt(vs[set]) + o->eps);
+	if (diag) {
+		float dbar = 0.0f;
+		for (size_t j = 0; j < nd; j++) {
+			size_t vi = set * P1_HMAX + j;
+			vc[vi] = mu2 * vc[vi] + (1.0f - mu2) * gn[j];
+			d[j] = mscale * fsqrt(mn[j]) /
+			    (fsqrt(vc[vi]) + o->eps);
+			dbar += d[j];
+		}
+		dbar /= (float)nd;
+		if (o->nclamp > 0.0f) {
+			const float lo = o->nclamp * dbar, hi = dbar / o->nclamp;
+			for (size_t j = 0; j < nd; j++)
+				d[j] = d[j] < lo ? lo : d[j] > hi ? hi : d[j];
+		}
+	}
+	/* Newton-Schulz orthogonalization of the (Nesterov-extrapolated)
+	 * momentum, identical to muon_rows so the direction matches Muon. */
+	float ss = 0.0f;
+	for (size_t i = 0; i < mr * mc; i++)
+		ss += x[i] * x[i];
+	float norm = fsqrt(ss);
+	if (!(norm > 1e-12f))
+		return;
+	for (size_t i = 0; i < mr * mc; i++)
+		x[i] *= 1.0f / norm;
+	for (unsigned it = 0; it < o->ns_steps; it++) {
+		for (size_t i = 0; i < mr; i++)
+			for (size_t j = 0; j < mr; j++) {
+				float s = 0.0f;
+				for (size_t k = 0; k < mc; k++)
+					s += x[i * mc + k] * x[j * mc + k];
+				a[i * mr + j] = s;
+			}
+		for (size_t i = 0; i < mr; i++)
+			for (size_t j = 0; j < mr; j++) {
+				float s = 0.0f;
+				for (size_t k = 0; k < mr; k++)
+					s += a[i * mr + k] * a[k * mr + j];
+				b[i * mr + j] = -4.7750f * a[i * mr + j] + 2.0315f * s;
+			}
+		for (size_t i = 0; i < mr; i++)
+			for (size_t k = 0; k < mc; k++) {
+				float s = 0.0f;
+				for (size_t j = 0; j < mr; j++)
+					s += b[i * mr + j] * x[j * mc + k];
+				y[i * mc + k] = s;
+			}
+		for (size_t i = 0; i < mr * mc; i++)
+			x[i] = 3.4445f * x[i] + y[i];
+	}
+	const float step = lr * o->nscale;
+	for (size_t i = 0; i < rows * cols; i++) {
+		size_t at = tr ? (i % cols) * mc + i / cols : i;
+		float upd = x[at] + wd * w[i];
+		if (sig)
+			upd *= c3_gate(sig, i, g[i] * scale, o);
+		w[i] -= step * (diag ? d[arow ? i / cols : i % cols] : alpha) *
+		    upd;
 	}
 }
 
@@ -715,6 +860,10 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 		mode = HYB_ALT;
 	else if (!strcmp(hs, "route"))
 		mode = HYB_ROUTE;
+	else if (!strcmp(hs, "namo"))
+		mode = HYB_NAMO;
+	else if (!strcmp(hs, "namod") || !strcmp(hs, "namo-d"))
+		mode = HYB_NAMOD;
 	/* MALT is a separate opt-in: unset (or "off"/"0") keeps every shipped
 	 * path bit-identical. "1"/"on"/"malt" = MALT, "malter" = adaptive. */
 	const char *ms = fit_env_str("TAW_MALT", "off");
@@ -738,14 +887,24 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 	/* MALT/MALTER W1 LR endpoints default to the tuned Muon schedule. */
 	const float malt_lr0 = fit_env_float("TAW_MALT_LR0", 0.055f);
 	const float malt_lr1 = fit_env_float("TAW_MALT_LR1", 0.0011f);
+	const bool is_namo = mode == HYB_NAMO || mode == HYB_NAMOD;
 	optcfg o = {.b1 = fit_env_float("TAW_B1", 0.9f),
 		.b2 = fit_env_float("TAW_B2", 0.999f),
 		.eps = 1e-6f,
 		.mom = fit_env_float("TAW_MUON_MOM", 0.95f),
 		.gain = fit_env_float("TAW_MUON_GAIN", 0.2f),
 		.b1t = 1.0f, .b2t = 1.0f,
+		.n1t = 1.0f, .n2t = 1.0f,
+		.nb2 = fit_env_float("TAW_NAMO_BETA", 0.99f),
+		.nscale = fit_env_float("TAW_NAMO_SCALE", 1.0f),
+		.nclamp = fit_env_float("TAW_NAMO_CLAMP", 0.1f),
+		.ngbeta = fit_env_float("TAW_NAMO_GATE_BETA", 0.9f),
+		.ngp = fit_env_float("TAW_NAMO_GATE_P", 1.0f),
 		.ns_steps = fit_env_uint("TAW_MUON_NS", 5),
-		.nesterov = fit_env_uint("TAW_MUON_NEST", 1) != 0};
+		/* paper NAMO uses the un-extrapolated momentum M_t */
+		.nesterov = fit_env_uint("TAW_MUON_NEST", is_namo ? 0 : 1) != 0,
+		.gate_c3 = !strcmp(fit_env_str("TAW_NAMO_GATE", "none"), "c3"),
+		.drow = !strcmp(fit_env_str("TAW_NAMO_D_AXIS", "col"), "row")};
 	/* Diagonal preconditioner: l/r EMA decay and damping (paper eps). */
 	o.malt_b2 = fit_env_float("TAW_MALT_B2", 0.999f);
 	o.malt_eps = fit_env_float("TAW_MALT_EPS", 1e-8f);
@@ -756,6 +915,8 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 		: !strcmp(gs, "m") ? GRAFT_M : GRAFT_O;
 	o.vecwd = fit_env_float("TAW_WD", 1e-5f);
 	o.wd = fit_env_float("TAW_MUON_WD", mode == HYB_ADAM ? o.vecwd : 1e-3f);
+	if (is_namo)
+		o.wd = fit_env_float("TAW_NAMO_WD", o.wd);
 	o.wd1 = fit_env_float("TAW_ADAM1_WD", o.vecwd);
 	const float alpha = fit_env_float("TAW_ALPHA", 0.5f);
 	const bool warm_adam = !strcmp(fit_env_str("TAW_WARM", "muon"), "adam");
@@ -850,6 +1011,8 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 			o.b2t *= o.b2;
 			o.malt_b1t *= o.mom;
 			o.malt_b2t *= o.malt_b2;
+			o.n1t *= o.mom;
+			o.n2t *= o.nb2;
 			bool alt_muon = alt_step ? (step & 1) == 1
 						 : (frac < 0.5f);
 			if (!alt_first_muon)
@@ -857,6 +1020,7 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 			const float scale = 1.0f / (float)nb;
 			for (size_t k = 0; k < n1; k++) {
 				size_t set = t->list1[k], off = set * t->row1;
+				float *sig = o.gate_c3 ? t->sig1 + off : nullptr;
 				bool muon = mode == HYB_MUON ||
 				    (mode == HYB_ALT && alt_muon) ||
 				    (mode == HYB_ROUTE && t->route1[set]);
@@ -865,7 +1029,7 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 				if (mode == HYB_ADAM) {
 					/* The shipped path, using the original m/v. */
 					adam_rows(&o, t->w + off, t->m + off,
-					    t->v + off, t->g + off, t->row1,
+					    t->v + off, t->g + off, sig, t->row1,
 					    scale, o.lrvec, o.vecwd, 1.0f);
 				} else if (malty && !(t->tied && warm_adam)) {
 					malt_rows(&o, t->w + off, t->m + off,
@@ -874,28 +1038,34 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 					    t->malt_nu + set, t->g + off,
 					    H, P1_F, scale, o.lr, o.wd, 1.0f,
 					    mode == HYB_MALTER);
+				} else if (is_namo) {
+					namo_rows(&o, t->w + off, t->m + off,
+					    t->g + off, t->v2s, t->v2c, sig, set,
+					    H, P1_F, scale, o.lr, o.wd,
+					    mode == HYB_NAMOD);
 				} else if (mode == HYB_BLEND) {
 					adam_rows(&o, t->w + off, t->m1 + off,
-					    t->v1 + off, t->g + off, t->row1,
-					    scale, o.lr1, o.wd1, 1.0f - alpha);
+					    t->v1 + off, t->g + off, nullptr,
+					    t->row1, scale, o.lr1, o.wd1,
+					    1.0f - alpha);
 					muon_rows(&o, t->w + off, t->m + off,
-					    t->g + off, H, P1_F, scale, o.lr,
-					    o.wd, alpha);
+					    t->g + off, sig, H, P1_F, scale,
+					    o.lr, o.wd, alpha);
 				} else if (muon) {
 					muon_rows(&o, t->w + off, t->m + off,
-					    t->g + off, H, P1_F, scale, o.lr,
+					    t->g + off, sig, H, P1_F, scale, o.lr,
 					    o.wd, 1.0f);
 				} else {
 					adam_rows(&o, t->w + off, t->m1 + off,
-					    t->v1 + off, t->g + off, t->row1,
-					    scale, o.lr1, o.wd1, 1.0f);
+					    t->v1 + off, t->g + off, sig,
+					    t->row1, scale, o.lr1, o.wd1, 1.0f);
 				}
 				t->touched1[set] = 0;
 			}
 			for (size_t k = 0; k < n2; k++) {
 				size_t off = t->n1 + t->list2[k] * t->row2;
 				adam_rows(&o, t->w + off, t->m + off, t->v + off,
-				    t->g + off, t->row2, scale, o.lrvec,
+				    t->g + off, nullptr, t->row2, scale, o.lrvec,
 				    o.vecwd, 1.0f);
 				t->touched2[t->list2[k]] = 0;
 			}
