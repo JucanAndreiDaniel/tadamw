@@ -22,6 +22,87 @@
 #include "quant.h"
 #include "taw_internal.h"
 
+/* ---- weight averaging (encoder-only fitting experiment) --------------------
+ * The fitted weights are frozen into the archive, so averaging is done after
+ * AdamW has run and before quantization; the decoder and the archive format
+ * are untouched.  A/B selection via TAW_FIT_AVG: off, swa, ema9, ema99,
+ * swa_all, ema95, ema999, late (also 0..7). TAW_FIT_AVG_DEFAULT is the
+ * compile-time default that ships. The default is "late": EMA(0.999) only
+ * for runs with >= 6 epochs (levels 3+); short runs (levels 1-2) keep the
+ * last iterate. LR A/B uses upstream's TAW_LR0/TAW_LR1 knobs. See
+ * RESULTS_EMA.md for benchmark numbers and the control. */
+enum { TAW_AVG_OFF = 0, TAW_AVG_SWA = 1, TAW_AVG_EMA9 = 2,
+	TAW_AVG_EMA99 = 3, TAW_AVG_SWA_ALL = 4, TAW_AVG_EMA95 = 5,
+	TAW_AVG_EMA999 = 6, TAW_AVG_LATE = 7 };
+#ifndef TAW_FIT_AVG_DEFAULT
+#define TAW_FIT_AVG_DEFAULT TAW_AVG_LATE
+#endif
+
+static int parse_avg_mode(const char *s)
+{
+	if (!s || !*s)
+		return TAW_FIT_AVG_DEFAULT;
+	if (!strcmp(s, "0") || !strcmp(s, "off"))
+		return TAW_AVG_OFF;
+	if (!strcmp(s, "1") || !strcmp(s, "swa"))
+		return TAW_AVG_SWA;
+	if (!strcmp(s, "2") || !strcmp(s, "ema9") || !strcmp(s, "ema09"))
+		return TAW_AVG_EMA9;
+	if (!strcmp(s, "3") || !strcmp(s, "ema99"))
+		return TAW_AVG_EMA99;
+	if (!strcmp(s, "4") || !strcmp(s, "swa_all"))
+		return TAW_AVG_SWA_ALL;
+	if (!strcmp(s, "5") || !strcmp(s, "ema95"))
+		return TAW_AVG_EMA95;
+	if (!strcmp(s, "6") || !strcmp(s, "ema999"))
+		return TAW_AVG_EMA999;
+	if (!strcmp(s, "7") || !strcmp(s, "late") || !strcmp(s, "auto"))
+		return TAW_AVG_LATE;
+	return TAW_FIT_AVG_DEFAULT;
+}
+
+/* Resolve the gated default: averaging needs a long enough training run.
+ * Levels 1-2 have 3-4 epochs and are slightly hurt by EMA; levels 3+ have
+ * 6-12 epochs and benefit consistently. */
+static int resolve_avg_mode(int mode, int epochs)
+{
+	if (mode == TAW_AVG_LATE)
+		return epochs >= 6 ? TAW_AVG_EMA999 : TAW_AVG_OFF;
+	return mode;
+}
+
+static bool mode_is_ema(int m)
+{
+	return m == TAW_AVG_EMA9 || m == TAW_AVG_EMA95 || m == TAW_AVG_EMA99 ||
+	       m == TAW_AVG_EMA999;
+}
+
+static float mode_ema_decay(int m)
+{
+	switch (m) {
+	case TAW_AVG_EMA9:  return 0.9f;
+	case TAW_AVG_EMA95: return 0.95f;
+	case TAW_AVG_EMA99: return 0.99f;
+	default:            return 0.999f;
+	}
+}
+
+/* d2[k] = decay^(2^k) for a float decay; binary exponentiation of the number
+ * of optimizer steps since a weight set was last folded into the EMA.  No
+ * libm, no fast-math, no SIMD divergence. */
+static inline float ema_pow(const float d2[64], uint64_t gap)
+{
+	float f = 1.0f;
+	int k = 0;
+	while (gap) {
+		if (gap & 1u)
+			f *= d2[k];
+		gap >>= 1;
+		k++;
+	}
+	return f;
+}
+
 /* ---- small math without libm ---------------------------------------------- */
 
 static float fsqrt(float x)
@@ -277,10 +358,14 @@ static void tnet_free(tnet *t)
 	free(t->list2);
 	free(t->cnt1);
 	free(t->route1);
+	free(t->wa);
+	free(t->last1);
+	free(t->last2);
 	memset(t, 0, sizeof *t);
 }
 
-static taw_status tnet_init(tnet *t, const p1_shape *s, uint64_t seed)
+static taw_status tnet_init(tnet *t, const p1_shape *s, uint64_t seed,
+    int avg_mode)
 {
 	memset(t, 0, sizeof *t);
 	t->s = *s;
@@ -307,10 +392,19 @@ static taw_status tnet_init(tnet *t, const p1_shape *s, uint64_t seed)
 	t->list2 = malloc(t->s2 * sizeof(uint32_t));
 	t->cnt1 = calloc(t->s1 ? t->s1 : 1, sizeof(uint32_t));
 	t->route1 = calloc(t->s1 ? t->s1 : 1, 1);
+	bool is_ema = mode_is_ema(avg_mode);
+	if (avg_mode != TAW_AVG_OFF)
+		t->wa = calloc(np, sizeof(float));
+	if (is_ema) {
+		t->last1 = calloc(t->s1 + 1, sizeof(uint64_t));
+		t->last2 = calloc(t->s2, sizeof(uint64_t));
+	}
 	if (!t->w || !t->m || !t->v || !t->g || !t->m1 || !t->v1 ||
 	    !t->malt_l || !t->malt_r || !t->malt_nu ||
 	    !t->touched1 || !t->touched2 || !t->list1 || !t->list2 ||
-	    !t->cnt1 || !t->route1) {
+	    !t->cnt1 || !t->route1 ||
+	    (avg_mode != TAW_AVG_OFF && !t->wa) ||
+	    (is_ema && (!t->last1 || !t->last2))) {
 		tnet_free(t);
 		return TAW_E_NOMEM;
 	}
@@ -700,9 +794,14 @@ static const char *fit_env_str(const char *name, const char *def)
 
 /* Train on samples for the given epochs. Batches touch few weight sets, so
  * only those rows are updated ("lazy" optimizer state). With no environment
- * overrides this is the shipped AdamW fitter, bit for bit. */
+ * overrides this is the shipped AdamW fitter, bit for bit.  Weight averaging
+ * is layered on top of the untouched optimizer trajectory: SWA sums a full
+ * snapshot at each epoch of the second half; EMA folds in only the touched
+ * sets, decaying each one by decay^(steps since it was last folded in) so
+ * that untouched rows (a full snapshot is not needed) get the same
+ * time-weighted average. */
 static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
-    uint64_t seed)
+    uint64_t seed, int avg_mode)
 {
 	enum { BATCH = FIT_BATCH };
 	const char *hs = fit_env_str("TAW_HYBRID", "adam");
@@ -809,10 +908,46 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 	uint64_t rs = seed;
 	const unsigned H = t->s.hidden;
 	const int warm = fit_warm_epochs(epochs);
+	const bool ema = mode_is_ema(avg_mode);
+	const bool swa = avg_mode == TAW_AVG_SWA || avg_mode == TAW_AVG_SWA_ALL;
+	const size_t np = t->n1 + t->n2;
+	float d2[64];
+	if (ema) {
+		const float decay = mode_ema_decay(avg_mode);
+		d2[0] = decay;
+		for (int k = 1; k < 64; k++)
+			d2[k] = d2[k - 1] * d2[k - 1];
+	}
+	uint64_t nswa = 0;
+	bool avg_live = false;
+	if (swa)
+		memset(t->wa, 0, np * sizeof(float));
 	t->tied = t->s1 > 1 || t->s2 > 1;
+	if (ema && !t->tied) {
+		memcpy(t->wa, t->w, np * sizeof(float));
+		for (size_t k = 0; k < t->s1 + 1; k++)
+			t->last1[k] = step;
+		for (size_t k = 0; k < t->s2; k++)
+			t->last2[k] = step;
+		avg_live = true;
+	}
 	for (int ep = 0; ep < epochs; ep++) {
-		if (t->tied && ep >= warm)
+		if (t->tied && ep >= warm) {
 			tnet_untie(t);
+			/* The old tied weights are gone: start averaging now. */
+			if (ema) {
+				memcpy(t->wa, t->w, np * sizeof(float));
+				for (size_t k = 0; k < t->s1 + 1; k++)
+					t->last1[k] = step;
+				for (size_t k = 0; k < t->s2; k++)
+					t->last2[k] = step;
+				avg_live = true;
+			}
+			if (swa) {
+				memset(t->wa, 0, np * sizeof(float));
+				nswa = 0;
+			}
+		}
 		const uint64_t stride = fit_stride(ns);
 		uint64_t pos = rng_next(&rs) % (ns ? ns : 1);
 		for (size_t done = 0; done < ns;) {
@@ -890,17 +1025,47 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 					    t->v1 + off, t->g + off, t->row1,
 					    scale, o.lr1, o.wd1, 1.0f);
 				}
+				if (ema && avg_live) {
+					float d = ema_pow(d2, step - t->last1[set]);
+					float *a = t->wa + off, *w = t->w + off;
+					for (size_t i = 0; i < t->row1; i++)
+						a[i] = d * a[i] + (1.0f - d) * w[i];
+					t->last1[set] = step;
+				}
 				t->touched1[set] = 0;
 			}
 			for (size_t k = 0; k < n2; k++) {
-				size_t off = t->n1 + t->list2[k] * t->row2;
+				uint32_t set = t->list2[k];
+				size_t off = t->n1 + set * t->row2;
 				adam_rows(&o, t->w + off, t->m + off, t->v + off,
 				    t->g + off, t->row2, scale, o.lrvec,
 				    o.vecwd, 1.0f);
+				if (ema && avg_live) {
+					float d = ema_pow(d2, step - t->last2[set]);
+					float *a = t->wa + off, *w = t->w + off;
+					for (size_t i = 0; i < t->row2; i++)
+						a[i] = d * a[i] + (1.0f - d) * w[i];
+					t->last2[set] = step;
+				}
 				t->touched2[t->list2[k]] = 0;
 			}
 			memset(t->g, 0, (t->n1 + t->n2) * sizeof(float));
 		}
+		/* SWA: one snapshot of every weight at each epoch boundary in
+		 * the second half of training (all sets exist, touched or not).
+		 * swa_all starts right after the tied warm-up instead. */
+		if (swa && (avg_mode == TAW_AVG_SWA_ALL || ep >= epochs / 2)) {
+			for (size_t i = 0; i < np; i++)
+				t->wa[i] += t->w[i];
+			nswa++;
+		}
+	}
+	if (swa && nswa) {
+		float inv = 1.0f / (float)nswa;
+		for (size_t i = 0; i < np; i++)
+			t->w[i] = t->wa[i] * inv;
+	} else if (ema && avg_live) {
+		memcpy(t->w, t->wa, np * sizeof(float));
 	}
 	if ((mode == HYB_MALT || mode == HYB_MALTER) && getenv("TAW_MALT_DEBUG")) {
 		float lmin = 1e30f, lmax = 0.0f, lsum = 0.0f;
@@ -1096,6 +1261,7 @@ typedef struct {
 	const sample *sm;
 	size_t ns;
 	int epochs;
+	int avg_mode;
 	uint64_t n;
 	taw_buf *model; /* [tries] */
 	double *est, *bpb;
@@ -1108,12 +1274,15 @@ static void fit_one(void *arg, size_t ci, unsigned w)
 	(void)w;
 	fit_job *F = arg;
 	tnet t;
+	const int mode = resolve_avg_mode(F->avg_mode, F->epochs);
 	taw_status st = TAW_OK;
 	if (F->pre && F->pre[ci].w) {
+		/* GPU-trained: no CPU trajectory to average, keep last iterate. */
 		t = F->pre[ci];
 		F->pre[ci] = (tnet){0};
-	} else if ((st = tnet_init(&t, &F->cs[ci].s, 0x7A57A11ull + ci)) == TAW_OK) {
-		tnet_train(&t, F->sm, F->ns, F->epochs, 0xC0FFEEull + ci);
+	} else if ((st = tnet_init(&t, &F->cs[ci].s, 0x7A57A11ull + ci,
+		      mode)) == TAW_OK) {
+		tnet_train(&t, F->sm, F->ns, F->epochs, 0xC0FFEEull + ci, mode);
 	}
 	if (st == TAW_OK) {
 		st = serialize(&t, F->cs[ci].quant, &F->model[ci]);
@@ -1208,7 +1377,9 @@ static taw_status fit_all(fit_job *F, size_t tries, unsigned threads,
 	if (ng && (!nets || !seeds || !F->pre))
 		st = TAW_E_NOMEM;
 	for (size_t j = 0; j < ng && st == TAW_OK; j++) {
-		st = tnet_init(&nets[j], &F->cs[gi[j]].s, 0x7A57A11ull + gi[j]);
+		/* GPU nets have no CPU trajectory to average; keep last iterate. */
+		st = tnet_init(&nets[j], &F->cs[gi[j]].s, 0x7A57A11ull + gi[j],
+		    TAW_AVG_OFF);
 		seeds[j] = 0xC0FFEEull + gi[j];
 	}
 	gpu_job J = {.g = g, .nets = nets, .k = ng, .epochs = F->epochs,
@@ -1304,7 +1475,7 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 		tries = ncand;
 
 	fit_job F = {.cs = cs, .sm = sm, .ns = ns, .epochs = effort[lv].epochs,
-		.n = n};
+		.avg_mode = parse_avg_mode(getenv("TAW_FIT_AVG")), .n = n};
 	F.model = calloc(tries, sizeof *F.model);
 	F.est = calloc(tries, sizeof *F.est);
 	F.bpb = calloc(tries, sizeof *F.bpb);

@@ -36,6 +36,10 @@ typedef struct {
 	uint32_t *list1, *list2;
 	uint32_t *cnt1;            /* [s1] samples per W1 set, for routing */
 	uint8_t *route1;           /* [s1] 1 = Muon, 0 = AdamW */
+	/* Averaging scratch (CPU fitter only): wa is the SWA sum or the live
+	 * EMA; last1/last2 record the global step each set joined the EMA. */
+	float *wa;
+	uint64_t *last1, *last2;
 } tnet;
 
 /* ---- deterministic PRNG ------------------------------------------------------ */

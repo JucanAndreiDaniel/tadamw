@@ -1,0 +1,5 @@
+mode	corpus	level	enc_s	dec_s_best	size	model
+late	text1m	1	13.63	6.921	181557	608
+late	text1m	5	47.04	6.802	178993	608
+late	libc1m	1	15.47	7.100	379197	608
+late	libc1m	5	45.56	7.699	375127	608

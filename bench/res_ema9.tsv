@@ -1,0 +1,5 @@
+mode	corpus	level	enc_s	dec_s_best	size	model
+ema9	text1m	1	9.23	4.664	181637	608
+ema9	text1m	5	29.68	4.966	179155	608
+ema9	libc1m	1	10.20	5.015	379218	608
+ema9	libc1m	5	25.29	3.335	375289	608

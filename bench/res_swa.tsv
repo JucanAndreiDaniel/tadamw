@@ -1,0 +1,5 @@
+mode	corpus	level	enc_s	dec_s_best	size	model
+swa	text1m	1	5.43	2.689	182131	608
+swa	text1m	5	22.11	3.089	179651	608
+swa	libc1m	1	6.58	3.424	379399	608
+swa	libc1m	5	24.95	4.984	375751	608
