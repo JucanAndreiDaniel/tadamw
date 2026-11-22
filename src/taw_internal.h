@@ -54,6 +54,9 @@ static inline void taw_wr64(uint8_t *p, uint64_t v)
 
 /* Continue a CRC-32C; start with crc = 0. */
 uint32_t taw_crc32c(uint32_t crc, const void *data, size_t n);
+/* The two implementations over the raw (inverted) state, for tests. */
+uint32_t taw_crc32c_table(uint32_t c, const uint8_t *p, size_t n);
+uint32_t taw_crc32c_sse42(uint32_t c, const uint8_t *p, size_t n);
 
 /* ---- binary range coder (docs/format.md §4) ----------------------------- */
 

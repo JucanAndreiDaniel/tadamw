@@ -20,9 +20,10 @@ target_include_directories(taw
 # x86 SIMD kernels are compiled with their own ISA flags and picked at run
 # time by CPUID; everything else stays baseline.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-  target_sources(taw PRIVATE p1_avx2.c p1_avx512.c)
+  target_sources(taw PRIVATE p1_avx2.c p1_avx512.c crc32c_sse42.c)
   set_source_files_properties(p1_avx2.c PROPERTIES COMPILE_OPTIONS "-mavx2;-mf16c")
   set_source_files_properties(p1_avx512.c PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx2;-mf16c")
+  set_source_files_properties(crc32c_sse42.c PROPERTIES COMPILE_OPTIONS "-msse4.2")
   target_compile_definitions(taw PRIVATE TAW_X86_SIMD=1)
 else()
   target_compile_definitions(taw PRIVATE TAW_X86_SIMD=0)
