@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* taw: command-line front end for the tar_aw archive format. */
 #define _POSIX_C_SOURCE 200809L
 

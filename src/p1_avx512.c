@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Profile 1 mixer for AVX-512F. Built with -mavx512f; only called after a
  * CPUID check. Same per-lane operation order as the scalar reference. */
 #include <immintrin.h>

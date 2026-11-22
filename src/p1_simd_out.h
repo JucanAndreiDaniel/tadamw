@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Shared AVX2 pieces of the profile 1 mixer, included by p1_avx2.c and
  * p1_avx512.c (each compiled with its own -m flags). */
 #ifndef TAW_P1_SIMD_OUT_H

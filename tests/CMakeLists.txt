@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Each test_<name>.c is a standalone executable registered with CTest.
 function(taw_test name)
   add_executable(test_${name} test_${name}.c)

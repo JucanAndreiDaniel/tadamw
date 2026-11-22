@@ -36,3 +36,9 @@ taw i archive                          # header info
 ```
 
 Requires a C23 compiler (clang >= 18 or gcc >= 14) and CMake >= 3.25.
+
+## License
+
+GPL-3.0-or-later ([LICENSE](LICENSE)). `tools/hactool` is a copy of SciresM's
+hactool (ISC) as ScarletNX carries it, with ScarletNX's and tadamw's changes
+under GPL-3.0-or-later; see `tools/hactool/README.md`.

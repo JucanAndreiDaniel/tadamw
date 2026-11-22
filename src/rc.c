@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Binary range coder; the per-bit steps are inline in taw_internal.h. */
 #include "taw_internal.h"
 

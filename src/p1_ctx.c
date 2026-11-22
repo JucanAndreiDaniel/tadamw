@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Profile 1 context models and the integer squash/stretch (format.md §5.1). */
 #include <stdatomic.h>
 #include <stdlib.h>

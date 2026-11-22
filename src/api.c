@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Public entry points: dispatch on variant, own the output buffers. */
 #include <stdlib.h>
 

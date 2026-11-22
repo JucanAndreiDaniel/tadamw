@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Range coder + profile 0 predictor: roundtrip and sanity of compression. */
 #include <stdlib.h>
 #include <string.h>

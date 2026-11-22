@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* On-disk constants (docs/format.md). */
 #ifndef TAW_FORMAT_H
 #define TAW_FORMAT_H

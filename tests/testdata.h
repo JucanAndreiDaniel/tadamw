@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Deterministic test inputs. */
 #ifndef TAW_TESTS_TESTDATA_H
 #define TAW_TESTS_TESTDATA_H

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* CRC-32C (Castagnoli), slicing-by-1 table. */
 #include "taw_internal.h"
 

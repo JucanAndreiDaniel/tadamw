@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* IEEE binary16 <-> binary32 without libm. */
 #ifndef TAW_HALF_H
 #define TAW_HALF_H

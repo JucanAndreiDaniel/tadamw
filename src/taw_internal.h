@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Internal interfaces shared by the libtaw sources and the unit tests. */
 #ifndef TAW_INTERNAL_H
 #define TAW_INTERNAL_H

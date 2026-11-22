@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* .aw stream variant. */
 #ifndef TAW_AW_H
 #define TAW_AW_H

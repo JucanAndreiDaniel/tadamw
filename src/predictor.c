@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Arithmetic profiles: 0 = INT_ORDER0 (placeholder), 1 = F32_STRICT_MIX. */
 #include <stdlib.h>
 #include <string.h>

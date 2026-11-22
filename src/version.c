@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "taw/taw.h"
 
 #define TAW_STR2(x) #x

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Profile 1 kernels for AVX2 + F16C. Built with -mavx2 -mf16c; only called
  * after a CPUID check. Each lane does the scalar reference's operations
  * (dot4 in p1_net.c) in the same order, so the results are identical. */

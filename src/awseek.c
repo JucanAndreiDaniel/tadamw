@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* .awseek seekable variant (docs/format.md §7). */
 #include <stdlib.h>
 #include <string.h>

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Encoder: choose a profile, fit the profile 1 mixer with AdamW, quantize.
  *
  * Fitting may be sloppy (it is encoder-only and need not be reproducible);

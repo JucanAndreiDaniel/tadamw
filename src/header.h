@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* File header (docs/format.md §1). */
 #ifndef TAW_HEADER_H
 #define TAW_HEADER_H

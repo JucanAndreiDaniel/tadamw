@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* .aw stream variant (docs/format.md §6). */
 #include <stdlib.h>
 #include <string.h>

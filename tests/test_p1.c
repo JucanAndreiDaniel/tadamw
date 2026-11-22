@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Profile 1 (F32_STRICT_MIX): integer tables, F16, ISA parity, model
  * validation, and a golden vector that pins the arithmetic. */
 #include <stdlib.h>

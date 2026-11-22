@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* .aw stream: roundtrip, header fields, and refusal of corrupt input. */
 #include <stdlib.h>
 #include <string.h>

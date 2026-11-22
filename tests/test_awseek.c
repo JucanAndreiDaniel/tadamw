@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* .awseek: roundtrip, random access, I/O locality, corruption isolation. */
 #include <stdlib.h>
 #include <string.h>

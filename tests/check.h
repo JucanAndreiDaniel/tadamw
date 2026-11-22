@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Minimal test assertions. */
 #ifndef TAW_TESTS_CHECK_H
 #define TAW_TESTS_CHECK_H

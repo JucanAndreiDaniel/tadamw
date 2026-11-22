@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Arithmetic profile 1, F32_STRICT_MIX (docs/format.md §2.2, §5.1).
  *
  * Adaptive integer context models produce stretched bit probabilities; a

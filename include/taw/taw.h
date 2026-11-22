@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* tar_aw public API. */
 #ifndef TAW_TAW_H
 #define TAW_TAW_H

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Profile 1 model section: parsing, dequantization, inference. */
 #include <stdlib.h>
 #include <string.h>

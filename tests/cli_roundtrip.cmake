@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # CLI roundtrip: cmake -DTAW=<taw> -DSOURCES=<f1|f2|...> -DWORK=<dir> -P cli_roundtrip.cmake
 file(REMOVE_RECURSE "${WORK}")
 file(MAKE_DIRECTORY "${WORK}")
