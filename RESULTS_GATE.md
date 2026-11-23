@@ -1,17 +1,20 @@
 # Experiment: entropy-adaptive confidence gating (arithmetic profile 11)
 
-Branch `exp/entropygate`, rebased onto `origin/main` at `e64cc83` (previous
-base `a427e7f`; old numbers below are explicitly stale). Reference:
-StateSMix (arXiv:2605.02904), whose *entropy-adaptive scaling* modulates the
-contribution of n-gram statistics by the neural model's predictive confidence
-so that an already-calibrated model is not over-corrected.
+Branch `exp/entropygate`, rebased onto `origin/main` at `1aa3dd7` (through
+`e64cc83`; older bases `a427e7f` and the first rebase are stale). This file is
+the gate report: upstream now owns `RESULTS.md` for the MALT/MALTER work.
+Reference: StateSMix (arXiv:2605.02904), whose *entropy-adaptive scaling*
+modulates the contribution of n-gram statistics by the neural model's
+predictive confidence so that an already-calibrated model is not
+over-corrected.
 
-> **Stale-numbers note.** The earlier results on the `a427e7f` base (text L1
-> 190610 -> 188538, L5 187956 -> 186820; libc L1 388792 -> 386533, L5
-> 385741 -> 382941) are invalid. Upstream then landed bit-position sampling,
-> new weight formats, a fused AVX2 decoder, parallel awseek decode and GPU
-> fitting, which changed both the baseline and the fitted gate. Only the
-> table below, measured after the rebase, is current.
+> **Stale-numbers note.** Results on the `a427e7f` base (text L1 190610 ->
+> 188538, L5 187956 -> 186820; libc L1 388792 -> 386533, L5 385741 ->
+> 382941) are invalid: upstream then landed bit-position sampling, new weight
+> formats, a fused AVX2 decoder, parallel awseek decode and GPU fitting. The
+> `e64cc83` numbers below were re-verified byte-for-byte after rebasing onto
+> `1aa3dd7`: MALT/MALTER and Muon are opt-in, so the default `mix` baseline
+> and the fitted gate are unchanged.
 
 ## Design
 
@@ -60,7 +63,7 @@ and finds `a, b` by a coarse grid plus local refinement on the exact integer
 cost. `-p gate` (`TAW_PREDICTOR_GATE`) forces profile 11 for benchmarking;
 `auto` and `mix` are deliberately unchanged so the baseline is untouched.
 
-## Results (post-rebase)
+## Results (post-rebase, re-verified on `1aa3dd7`)
 
 Archives were rebuilt with the same binary; corpora in
 `/tmp/opencode/tadamw-bench` were read only. Archive size is the primary
@@ -73,11 +76,13 @@ signal. Contemporaneous `mix` runs matched the supplied new baseline exactly.
 | libc1m | 1 | 379197 | 378070 | -1127 | -0.297% | 608 → 612 | 224, -56 |
 | libc1m | 5 | 375291 | 374705 | -586  | -0.156% | 608 → 612 | 258, -64 |
 
-All four gated archives were decompressed and byte-compared with their
-sources. Full `ctest` passes (12/12), including profile-11 golden vectors for
-F16 and Q8 over scalar and AVX2 ISAs, gate validation, zero-gate identity,
-an end-to-end encoder/header/decoder test, an awseek roundtrip, and all new
-upstream tests (quant, GPU, parallel awseek).
+All eight archives (four `mix`, four `gate`) were decompressed and
+byte-compared with their sources after the second rebase. Profile-1 and
+profile-11 golden CRCs are unchanged from the previous base. Full `ctest`
+passes (12/12), including profile-11 golden vectors for F16 and Q8 over scalar
+and AVX2 ISAs, gate validation, zero-gate identity, an end-to-end
+encoder/header/decoder test, an awseek roundtrip, and all upstream tests
+(quant, GPU, parallel awseek, MALT/Muon).
 
 Timings (single noisy run, many agents sharing 12 cores, best of 3 decodes;
 treat as indicative only):
