@@ -23,9 +23,19 @@ typedef struct {
 	size_t s1, s2, row1, row2; /* sets, params per set */
 	size_t n1, n2;             /* params per layer */
 	float *w, *m, *v, *g;      /* [n1 + n2] each */
+	/* Hybrid W1 state: AdamW moments for the W1 rows live separately from
+	 * the Muon momentum in m[] (W1 and W2 never overlap in m/v). */
+	float *m1, *v1;            /* [n1] */
+	/* MALT/MALTER W1 state: row/column diagonal preconditioner EMAs and the
+	 * scalar (MALTER) second moment. Only touched when TAW_MALT is enabled,
+	 * but allocated unconditionally so the shipped fitter is untouched. */
+	float *malt_l, *malt_r;    /* [s1*H], [s1*P1_F] */
+	float *malt_nu;            /* [s1] */
 	uint8_t *touched1, *touched2;
 	bool tied; /* warm-up: every sample uses set 0 */
 	uint32_t *list1, *list2;
+	uint32_t *cnt1;            /* [s1] samples per W1 set, for routing */
+	uint8_t *route1;           /* [s1] 1 = Muon, 0 = AdamW */
 } tnet;
 
 /* ---- deterministic PRNG ------------------------------------------------------ */
